@@ -40,6 +40,34 @@ st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 # those is a separate change to risk.py, not just this constant.
 STRIP_MONTHS = 36
 
+# Label -> model.strip() column, for the Forward-strip page's "any line
+# item across all months" chart. Grouped by basin; a few (proc, HH, TTF,
+# FX, jkm_star, gap) are shared/market-level rather than basin-specific.
+STRIP_METRIC_OPTIONS = {
+    "Europe: Margin ($/MMBtu)": "eu_margin",
+    "Asia: Margin ($/MMBtu)": "asia_margin",
+    "Europe: Revenue, TTF ($/MMBtu)": "ttf_usd",
+    "Asia: Revenue, JKM(L+1) ($/MMBtu)": "JKM",
+    "Procurement, both routes ($/MMBtu)": "proc",
+    "Europe: Charter ($/MMBtu)": "eu_charter_cost",
+    "Asia: Charter ($/MMBtu)": "asia_charter_cost",
+    "Europe: Bunkers ($/MMBtu)": "eu_bunker_cost",
+    "Asia: Bunkers ($/MMBtu)": "asia_bunker_cost",
+    "Europe: Boil-off cost ($/MMBtu)": "eu_boiloff_cost",
+    "Asia: Boil-off cost ($/MMBtu)": "asia_boiloff_cost",
+    "Asia: Canal ($/MMBtu)": "asia_canal_cost",
+    "Europe: ETS ($/MMBtu)": "ets",
+    "Europe: $/vessel-day": "eu_day",
+    "Asia: $/vessel-day": "asia_day",
+    "Europe: Total cargo value ($)": "eu_cargo",
+    "Asia: Total cargo value ($)": "asia_cargo",
+    "HH ($/MMBtu)": "HH",
+    "TTF (EUR/MWh)": "TTF",
+    "FX (EUR/USD)": "fx",
+    "JKM* breakeven ($/MMBtu)": "jkm_star",
+    "Gap: JKM - JKM* ($/MMBtu)": "gap",
+}
+
 # ===========================================================================
 # Waterfall / flow chart builders (pure Plotly; read model.waterfall_
 # breakdown() output only -- no recalculation here). This is the netback
@@ -613,6 +641,67 @@ if PAGE == "0 Decision":
                 "in the table above (subject to rounding)."
             )
 
+            st.subheader(f"Programme value across all {len(programme_strip)} start months")
+            show_sweep = st.checkbox(
+                f"Re-run the optimiser for every possible start month (up to {len(programme_strip)}x "
+                "the work of the single result above)",
+                key="programme_sweep_toggle",
+            )
+            if show_sweep:
+                sweep_metric = st.selectbox(
+                    "Metric",
+                    ["Programme value ($)", "Advantage vs next best ($)", "Used vessel-days"],
+                    key="programme_sweep_metric",
+                )
+                with st.spinner(f"Computing the best programme for each of {len(programme_strip)} start months..."):
+                    sweep_rows = []
+                    for i in range(len(programme_strip)):
+                        row = {
+                            "load_month": programme_strip.iloc[i]["load_month"],
+                            "month_label": programme_strip.iloc[i]["month_label"],
+                        }
+                        try:
+                            r = decision.optimise_programme(
+                                programme_strip, programme_params, horizon_days=float(horizon),
+                                current_month_index=i,
+                                current_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+                                max_additional_cargoes=int(max_additional),
+                                residual_value_per_day=float(residual_value),
+                            )
+                        except ValueError:
+                            row.update(sequence="(infeasible)", programme_value=None,
+                                       advantage=None, used_days=None)
+                        else:
+                            row.update(sequence=r.best.sequence, programme_value=r.best.total_value,
+                                       advantage=r.advantage, used_days=r.best.used_days)
+                        sweep_rows.append(row)
+                sweep_df = pd.DataFrame(sweep_rows)
+                metric_col = {
+                    "Programme value ($)": "programme_value",
+                    "Advantage vs next best ($)": "advantage",
+                    "Used vessel-days": "used_days",
+                }[sweep_metric]
+                st.line_chart(
+                    sweep_df.set_index("load_month")[[metric_col]].rename(columns={metric_col: sweep_metric})
+                )
+                st.dataframe(
+                    sweep_df.drop(columns=["load_month"]).rename(columns={
+                        "month_label": "Start month", "sequence": "Best sequence",
+                        "programme_value": "Programme value", "advantage": "Advantage vs next best",
+                        "used_days": "Used vessel-days",
+                    }).style.format({
+                        "Programme value": "${:,.0f}", "Advantage vs next best": "${:,.0f}",
+                        "Used vessel-days": "{:,.4f}",
+                    }, na_rep="(infeasible)"),
+                    width="stretch", hide_index=True,
+                )
+                st.caption(
+                    "Re-runs the programme optimiser once per possible start month, holding the "
+                    "horizon, additional-cargo, residual-value and Asia-case settings above fixed. "
+                    "\"(infeasible)\" means no route fits the current cargo within the horizon "
+                    "starting that month."
+                )
+
     _fx_warning(strip_df)
 
 elif PAGE == "1 Forward strip":
@@ -664,14 +753,37 @@ elif PAGE == "1 Forward strip":
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("JKM vs JKM* (breakeven)")
-        chart_df = strip_df.set_index("month_label")[["JKM", "jkm_star"]].rename(
+        # Indexed on load_month (a real Timestamp), not month_label -- a
+        # plain "Aug-26" string sorts alphabetically ("Apr-27" < "Aug-26"),
+        # which silently scrambles chronological order once the strip runs
+        # past 12 months and month names repeat across years.
+        chart_df = strip_df.set_index("load_month")[["JKM", "jkm_star"]].rename(
             columns={"JKM": "JKM (L+1)", "jkm_star": "JKM* (breakeven)"})
         st.line_chart(chart_df)
     with col2:
         st.subheader("Margin per vessel-day")
-        chart_df2 = strip_df.set_index("month_label")[["eu_day", "asia_day"]].rename(
+        chart_df2 = strip_df.set_index("load_month")[["eu_day", "asia_day"]].rename(
             columns={"eu_day": "Europe $/day", "asia_day": "Asia $/day"})
         st.bar_chart(chart_df2)
+
+    st.subheader(f"Any line item across all {len(strip_df)} months")
+    metric_labels = st.multiselect(
+        "Lines to plot",
+        options=list(STRIP_METRIC_OPTIONS),
+        default=["Europe: Margin ($/MMBtu)", "Asia: Margin ($/MMBtu)"],
+    )
+    if metric_labels:
+        metric_cols = {label: STRIP_METRIC_OPTIONS[label] for label in metric_labels}
+        metric_df = strip_df.set_index("load_month")[list(metric_cols.values())]
+        metric_df.columns = list(metric_cols.keys())
+        st.line_chart(metric_df)
+        if len({c.split("(")[-1] for c in metric_labels}) > 1:
+            st.caption(
+                "Selected lines don't all share the same unit (e.g. $/MMBtu vs total $) -- "
+                "one may render as a flat line at this scale."
+            )
+    else:
+        st.caption("Pick at least one line to plot.")
 
     st.subheader("Waterfall & flows (single load month)")
     wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(len(strip_df))),
