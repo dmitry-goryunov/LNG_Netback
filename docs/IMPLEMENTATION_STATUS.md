@@ -209,3 +209,17 @@ engine work specifically.
   19 tests (112 total), full pytest suite and legacy 64/64 both green;
   verified live in-browser in both vol/correlation modes, matching a
   standalone reference computation exactly.
+
+- **Live production crash fixed**: Streamlit Cloud reported a redacted
+  `TypeError` at `app.py`'s `spread_option.intrinsic_extrinsic_strip(...,
+  window_days=int(window_days))` call. Root cause: `st.number_input()`
+  returns `None` (not the widget's `value=` default) while its field is
+  momentarily empty mid-edit -- `int(None)` raises exactly a `TypeError`
+  at exactly that line. Fixed with an explicit `None` guard falling back
+  to `spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS`, plus the
+  `intrinsic_extrinsic_strip()`/`month_spread_option()` calls now wrapped
+  in a try/except that shows a warning and skips just that section
+  instead of crashing the page (the same fail-safe pattern `_safe_strip()`
+  already uses elsewhere on this page). `tests/app_smoke_check.py` now
+  also navigates to the Forward-strip page (previously untested by the
+  smoke check entirely) and asserts it loads clean.

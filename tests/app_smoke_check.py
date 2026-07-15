@@ -37,3 +37,16 @@ assert not app.exception, [e.message for e in app.exception]
 roll = next(box for box in app.checkbox if "roll-aligned" in box.label)
 assert roll.value is True
 print("PASS risk page: roll-aligned scenarios default on")
+
+# Re-fetch the widget: AppTest element references go stale after app.run()
+# rebuilds its internal tree, so reusing the `page` object from above would
+# silently no-op (and did, the first time this was written -- caught by the
+# subheader assertion below actually failing against the *previous* page's
+# content instead of raising).
+page = next(widget for widget in app.sidebar.radio if widget.label == "Page")
+page.set_value("1 Forward strip")
+app.run(timeout=60)
+assert not app.exception, [e.message for e in app.exception]
+assert any("Intrinsic / extrinsic value" in h.value for h in app.subheader), \
+    "Forward-strip page should render the JKM-vs-TTF diversion option section"
+print("PASS forward-strip page: loads clean, intrinsic/extrinsic section present")

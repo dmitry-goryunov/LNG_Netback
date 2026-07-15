@@ -938,6 +938,12 @@ elif PAGE == "1 Forward strip":
             "Historical window (calendar days)", min_value=10, max_value=1000,
             value=spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS, step=10, key="vol_window_days",
         )
+        if window_days is None:
+            # st.number_input returns None (not the widget default) while the
+            # field is momentarily empty mid-edit -- a real Streamlit Cloud
+            # crash this session (int(None) -> TypeError right at this call
+            # site). Fall back rather than let one keystroke break the page.
+            window_days = spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS
     elif tables.vol is None:
         st.warning(
             "This workbook has no 'volatilities' sheet -- switch to Historical, or add one "
@@ -945,39 +951,53 @@ elif PAGE == "1 Forward strip":
             "and 'Correlation TTF/JKM' headers)."
         )
 
-    ie_df = spread_option.intrinsic_extrinsic_strip(strip_df, tables, D, vol_source, window_days=int(window_days))
-    ie_display = ie_df[["month_label", "intrinsic", "extrinsic"]].copy()
-    ie_display.columns = ["Month", "Intrinsic", "Extrinsic"]
-    st.dataframe(
-        ie_display.style.format({"Intrinsic": "{:.3f}", "Extrinsic": "{:.3f}"}, na_rep="N/A"),
-        width="stretch", hide_index=True,
-    )
-    if ie_df["extrinsic"].isna().any():
-        st.caption(
-            "Extrinsic is N/A for one or more months: the selected source could not supply "
-            "complete volatility/correlation inputs for that tenor -- see the detail expander "
-            "below for the specific reason."
+    try:
+        ie_df = spread_option.intrinsic_extrinsic_strip(
+            strip_df, tables, D, vol_source, window_days=int(window_days)
         )
-    ie_chart_df = ie_df.set_index("load_month")[["intrinsic", "extrinsic"]].rename(
-        columns={"intrinsic": "Intrinsic", "extrinsic": "Extrinsic"}
-    )
-    st.line_chart(ie_chart_df)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: a bad/unusual workbook must not crash the page
+        st.warning(f"Could not compute intrinsic/extrinsic value ({type(exc).__name__}: {exc}); skipping this section.")
+        ie_df = None
 
-    with st.expander("How intrinsic/extrinsic is calculated (one month)"):
-        ie_mi = st.selectbox(
-            "Load month", options=list(range(len(strip_df))),
-            format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
-            key="ie_detail_month",
+    if ie_df is not None:
+        ie_display = ie_df[["month_label", "intrinsic", "extrinsic"]].copy()
+        ie_display.columns = ["Month", "Intrinsic", "Extrinsic"]
+        st.dataframe(
+            ie_display.style.format({"Intrinsic": "{:.3f}", "Extrinsic": "{:.3f}"}, na_rep="N/A"),
+            width="stretch", hide_index=True,
         )
-        ie_result = spread_option.month_spread_option(
-            strip_df.iloc[ie_mi], tables, D, vol_source, window_days=int(window_days),
+        if ie_df["extrinsic"].isna().any():
+            st.caption(
+                "Extrinsic is N/A for one or more months: the selected source could not supply "
+                "complete volatility/correlation inputs for that tenor -- see the detail expander "
+                "below for the specific reason."
+            )
+        ie_chart_df = ie_df.set_index("load_month")[["intrinsic", "extrinsic"]].rename(
+            columns={"intrinsic": "Intrinsic", "extrinsic": "Extrinsic"}
         )
-        dcol1, dcol2, dcol3, dcol4 = st.columns(4)
-        dcol1.metric("JKM / TTF", f"{ie_result.jkm_0:.3f} / {ie_result.ttf_0:.3f} $/MMBtu")
-        dcol2.metric("Intrinsic", f"{ie_result.intrinsic:.3f} $/MMBtu")
-        dcol3.metric("Option value", "N/A" if ie_result.option_value is None else f"{ie_result.option_value:.3f} $/MMBtu")
-        dcol4.metric("Extrinsic", "N/A" if ie_result.extrinsic is None else f"{ie_result.extrinsic:.3f} $/MMBtu")
-        st.caption(f"Time to expiry: {ie_result.time_to_expiry_years:.3f} years. Source: {ie_result.detail}")
+        st.line_chart(ie_chart_df)
+
+        with st.expander("How intrinsic/extrinsic is calculated (one month)"):
+            ie_mi = st.selectbox(
+                "Load month", options=list(range(len(strip_df))),
+                format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
+                key="ie_detail_month",
+            )
+            try:
+                ie_result = spread_option.month_spread_option(
+                    strip_df.iloc[ie_mi], tables, D, vol_source, window_days=int(window_days),
+                )
+            except Exception as exc:  # noqa: BLE001 -- same rationale as above
+                st.warning(f"Could not compute this month's detail ({type(exc).__name__}: {exc}).")
+            else:
+                dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+                dcol1.metric("JKM / TTF", f"{ie_result.jkm_0:.3f} / {ie_result.ttf_0:.3f} $/MMBtu")
+                dcol2.metric("Intrinsic", f"{ie_result.intrinsic:.3f} $/MMBtu")
+                dcol3.metric(
+                    "Option value", "N/A" if ie_result.option_value is None else f"{ie_result.option_value:.3f} $/MMBtu"
+                )
+                dcol4.metric("Extrinsic", "N/A" if ie_result.extrinsic is None else f"{ie_result.extrinsic:.3f} $/MMBtu")
+                st.caption(f"Time to expiry: {ie_result.time_to_expiry_years:.3f} years. Source: {ie_result.detail}")
 
     st.subheader("Waterfall & flows (single load month)")
     wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(len(strip_df))),
