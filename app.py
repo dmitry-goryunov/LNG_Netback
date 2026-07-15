@@ -1,0 +1,513 @@
+"""
+app.py -- Streamlit UI (spec Section 4).
+
+Pages: 1 Netback, 2 Sensitivities, 3 Hedging, 4 VaR & stress. The sidebar
+holds the curve-date picker (restricted to the master date list) and every
+Section 2 Step 5 cost parameter, flowing into every page via
+st.session_state. model.py and risk.py stay pure (no Streamlit import);
+this is the only file that imports streamlit.
+
+Run:  streamlit run app.py
+Data: set LNG_HISTORY_XLSX to the workbook path, or upload it in the
+      sidebar when the env var / conventional paths aren't found.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import data
+import model
+import risk
+
+st.set_page_config(page_title="LNG Forward Netback", layout="wide")
+
+# ===========================================================================
+# Data loading (spec 1.7: env var path, cached on path+mtime; else
+# file_uploader fallback so the app runs without the Drive path mounted)
+# ===========================================================================
+
+
+@st.cache_data(show_spinner="Loading LNG history.xlsx ...")
+def _load_from_path(path: str, mtime: float):
+    return data.load_all(path, source_label=path)
+
+
+def get_tables():
+    path = os.environ.get(data.ENV_VAR_NAME) or data.default_data_path()
+    if path:
+        try:
+            return _load_from_path(path, os.path.getmtime(path))
+        except Exception as e:
+            st.sidebar.error(f"Failed to load {path}: {e}")
+
+    st.sidebar.info(
+        f"LNG history.xlsx not found (checked ${data.ENV_VAR_NAME} and conventional paths). "
+        "Upload it below."
+    )
+    uploaded = st.sidebar.file_uploader("LNG history.xlsx", type=["xlsx"])
+    if uploaded is None:
+        st.title("LNG Forward Netback")
+        st.warning(
+            f"Waiting for LNG history.xlsx -- set the {data.ENV_VAR_NAME} environment variable "
+            "to its path, or upload the file in the sidebar."
+        )
+        st.stop()
+    return data.load_all_from_upload(uploaded)
+
+
+tables = get_tables()
+for w in tables.warnings:
+    st.sidebar.warning(w)
+
+# ===========================================================================
+# Sidebar: curve date + Section 2 Step 5 parameters
+# ===========================================================================
+
+st.sidebar.header("Curve date")
+master_desc = list(pd.DatetimeIndex(tables.master_dates).sort_values(ascending=False))
+date_labels = [d.strftime("%Y-%m-%d (%a)") for d in master_desc]
+sel_label = st.sidebar.selectbox(
+    "Date (latest first, master list only)", date_labels, index=0,
+    help="Restricted to the master date list (TTF dates >= first complete date of every other table).",
+)
+D = master_desc[date_labels.index(sel_label)]
+
+if "params" not in st.session_state:
+    st.session_state.params = model.Params()
+p = st.session_state.params
+
+st.sidebar.header("Cost parameters (Step 5)")
+
+with st.sidebar.expander("Cargo / boil-off"):
+    p.cargo_size = st.number_input("Cargo size (MMBtu)", value=float(p.cargo_size), step=50_000.0, format="%.0f")
+    p.boil_off_rate = st.number_input("Boil-off rate (fraction/day)", value=float(p.boil_off_rate),
+                                       step=0.0001, format="%.4f")
+
+with st.sidebar.expander("Europe route"):
+    p.europe_laden_days = st.number_input("Europe laden days", value=float(p.europe_laden_days), step=1.0)
+    p.europe_ballast_days = st.number_input("Europe ballast days", value=float(p.europe_ballast_days), step=1.0)
+    p.europe_port_days = st.number_input("Europe port days", value=float(p.europe_port_days), step=1.0)
+    st.caption(f"Europe RT = {p.europe_laden_days + p.europe_ballast_days + p.europe_port_days:.0f} d")
+    p.loading = st.number_input("Loading ($/MMBtu)", value=float(p.loading), step=0.01, format="%.2f")
+    p.eu_regas_port = st.number_input("EU regas + port ($/MMBtu)", value=float(p.eu_regas_port), step=0.01, format="%.2f")
+    p.other_cost = st.number_input("Other: insurance/LC/brokerage ($/MMBtu)", value=float(p.other_cost),
+                                    step=0.01, format="%.2f")
+
+with st.sidebar.expander("Asia route"):
+    rt_options = ["Base (46.7d)", "Congestion (54.7d)", "Custom"]
+    rt_default = (0 if abs(p.asia_rt_days - model.ASIA_RT_BASE) < 0.01
+                  else (1 if abs(p.asia_rt_days - model.ASIA_RT_CONG) < 0.01 else 2))
+    rt_choice = st.radio("Asia RT", rt_options, index=rt_default, horizontal=True)
+    if rt_choice == "Base (46.7d)":
+        p.asia_rt_days = model.ASIA_RT_BASE
+    elif rt_choice == "Congestion (54.7d)":
+        p.asia_rt_days = model.ASIA_RT_CONG
+    else:
+        p.asia_rt_days = st.number_input("Asia RT custom (days)", value=float(p.asia_rt_days), step=1.0)
+    p.asia_port_days = st.number_input("Asia port days", value=float(p.asia_port_days), step=1.0)
+    st.caption(f"Symmetric legs (workbook parity): laden = ballast = "
+               f"{p.asia_laden_days:.1f} d. Congestion lengthens both legs "
+               f"(more boil-off and laden fuel).")
+    if st.checkbox("Override laden days (model waiting as ballast/idle)", value=False):
+        p.asia_laden_days_override = st.number_input(
+            "Asia laden days (pinned)", value=float(p.asia_laden_days), step=1.0)
+    else:
+        p.asia_laden_days_override = None
+    p.asia_port_cost = st.number_input("Asia port, DES no regas ($/MMBtu)", value=float(p.asia_port_cost),
+                                        step=0.01, format="%.2f")
+    p.panama_toll_roundtrip = st.number_input("Panama toll x2 ($)", value=float(p.panama_toll_roundtrip),
+                                               step=50_000.0, format="%.0f")
+
+with st.sidebar.expander("Fuel"):
+    p.laden_fuel_requirement = st.number_input("Laden fuel requirement (t/d, reference)",
+                                                value=float(p.laden_fuel_requirement), step=1.0)
+    p.natural_bog_offset_t = st.number_input("Natural BOG offset (t/d VLSFO-eq, reference)",
+                                              value=float(p.natural_bog_offset_t), step=0.1)
+    p.residual_laden_vlsfo = st.number_input("Residual laden VLSFO (t/d, used in ship cost)",
+                                              value=float(p.residual_laden_vlsfo), step=0.1)
+    p.ballast_fuel = st.number_input("Ballast fuel (t/d, used in ship cost)", value=float(p.ballast_fuel), step=1.0)
+    p.port_fuel_rate = st.number_input("Port fuel (t/d, used in ship cost)", value=float(p.port_fuel_rate), step=1.0)
+    p.vlsfo_price = st.number_input("VLSFO ($/t, static for ALL dates)", value=float(p.vlsfo_price), step=5.0)
+
+with st.sidebar.expander("Gas cost chain"):
+    p.hh_grossup = st.number_input("HH gross-up", value=float(p.hh_grossup), step=0.01, format="%.2f")
+    p.liquefaction_toll = st.number_input("Liquefaction toll ($/MMBtu)", value=float(p.liquefaction_toll),
+                                           step=0.05, format="%.2f")
+    p.pipeline = st.number_input("Pipeline ($/MMBtu)", value=float(p.pipeline), step=0.01, format="%.2f")
+
+with st.sidebar.expander("EU ETS"):
+    p.eua_price = st.number_input("EUA price (EUR/t, static, unverified)", value=float(p.eua_price), step=5.0)
+    p.co2_eu_ets_tonnes = st.number_input("CO2 in ETS scope per EU RT (t)", value=float(p.co2_eu_ets_tonnes), step=10.0)
+    snap_L = model.contract_calendar(D)[0]
+    st.caption(f"Phase factor for {snap_L.strftime('%b-%y')} (M1): {model.phase_for_year(snap_L.year)}  "
+               "(0 before 2024, 0.4 in 2024, 0.7 in 2025, 1.0 from 2026)")
+
+with st.sidebar.expander("Charter", expanded=True):
+    snap_ch = model.snap(tables.charter, D)
+    st.caption(f"Snapped charter (174k 2-stroke) at {snap_ch['date'].date()}: ${snap_ch['rate174']:,.0f}/day")
+    override_on = st.checkbox("Override charter rate", value=p.charter_override is not None)
+    if override_on:
+        default_val = p.charter_override if p.charter_override is not None else float(snap_ch["rate174"])
+        p.charter_override = st.number_input("Charter override ($/day)", value=float(default_val),
+                                              step=5_000.0, format="%.0f")
+    else:
+        p.charter_override = None
+
+if st.sidebar.button("Reset parameters to spec defaults"):
+    st.session_state.params = model.Params()
+    st.rerun()
+
+params = st.session_state.params
+st.sidebar.caption(f"Data source: {tables.source or '(uploaded file)'}")
+
+# ===========================================================================
+# Page routing
+# ===========================================================================
+
+PAGE = st.sidebar.radio("Page", ["1 Netback", "2 Sensitivities", "3 Hedging", "4 VaR & stress"])
+
+CAVEATS = (
+    "Caveats (LNG_Diversion_Logic.md v2): 47d Asia RT assumes ~19.5 kn and 1-day canal transit "
+    "(55d = congestion case); FuelEU, CH4 slip, heel, demurrage, backhaul are not modelled; VLSFO "
+    "and EUA are static for all dates including historical ones; margin/day comparison assumes the "
+    "vessel is the binding constraint."
+)
+
+# ===========================================================================
+# Page 1 -- Netback
+# ===========================================================================
+
+if PAGE == "1 Netback":
+    st.title("LNG Forward Netback")
+    strip_df = model.strip(D, tables, params)
+    snap_info = strip_df.attrs["snap"]
+
+    st.caption(
+        f"Curve date D = **{D.date()}**  |  Snapped -- HH: {snap_info.hh_date.date()}, "
+        f"TTF: {snap_info.ttf_date.date()}, JKM: {snap_info.jkm_date.date()}, "
+        f"FX: {snap_info.fx_date.date()}, Charter: {snap_info.charter_date.date()} "
+        f"(${snap_info.charter_rate:,.0f}/day" + (", overridden" if snap_info.charter_overridden else "") + ")  |  "
+        f"Front month F = **{snap_info.F.strftime('%b-%y')}**, JKM roll shift s = **{snap_info.s}**"
+    )
+
+    display = strip_df[["month_label", "HH", "TTF", "ttf_usd", "JKM", "eu_day", "asia_day",
+                         "jkm_star", "gap", "verdict"]].copy()
+    display.columns = ["Month", "HH $/MMBtu", "TTF EUR/MWh", "TTF $/MMBtu", "JKM(L+1) $/MMBtu",
+                        "EU $/day", "Asia $/day", "JKM* $/MMBtu", "Gap $/MMBtu", "Verdict"]
+    display.attrs = {}  # drop the attached SnapInfo (not JSON-serialisable, harmless but noisy)
+
+    def _verdict_color(row):
+        color = "#d6f5d6" if row["Verdict"] == "Asia" else "#dbe9fa"
+        return [f"background-color: {color}; font-weight: 600" if col == "Verdict" else "" for col in row.index]
+
+    styled = display.style.apply(_verdict_color, axis=1).format({
+        "HH $/MMBtu": "{:.3f}", "TTF EUR/MWh": "{:.3f}", "TTF $/MMBtu": "{:.3f}",
+        "JKM(L+1) $/MMBtu": "{:.3f}", "EU $/day": "{:,.0f}", "Asia $/day": "{:,.0f}",
+        "JKM* $/MMBtu": "{:.3f}", "Gap $/MMBtu": "{:+.3f}",
+    })
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    both_neg = strip_df[(strip_df["eu_day"] < 0) & (strip_df["asia_day"] < 0)]
+    if not both_neg.empty:
+        st.warning(
+            "Both routes lose money in: " + ", ".join(both_neg["month_label"]) + ". "
+            "The verdict is RELATIVE only (least-bad destination conditional on lifting). "
+            "Evaluate lift vs do-not-lift (cancellation value, FOB resale, slot release) "
+            "before acting -- this model does not price that decision."
+        )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("JKM vs JKM* (breakeven)")
+        chart_df = strip_df.set_index("month_label")[["JKM", "jkm_star"]].rename(
+            columns={"JKM": "JKM (L+1)", "jkm_star": "JKM* (breakeven)"})
+        st.line_chart(chart_df)
+    with col2:
+        st.subheader("Margin per vessel-day")
+        chart_df2 = strip_df.set_index("month_label")[["eu_day", "asia_day"]].rename(
+            columns={"eu_day": "Europe $/day", "asia_day": "Asia $/day"})
+        st.bar_chart(chart_df2)
+
+    st.caption(CAVEATS)
+
+# ===========================================================================
+# Page 2 -- Sensitivities
+# ===========================================================================
+
+elif PAGE == "2 Sensitivities":
+    st.title("Sensitivities")
+    strip_df = model.strip(D, tables, params)
+    months = list(strip_df["month_label"])
+    mi = st.selectbox("Load month", options=list(range(12)), format_func=lambda i: f"M{i + 1} = {months[i]}")
+
+    st.subheader("Tornado: per-cargo P&L delta (Section 6)")
+    tdf = risk.tornado_data(D, tables, params, month_index=mi)
+    if not tdf.empty:
+        chart = alt.Chart(tdf).mark_bar().encode(
+            x=alt.X("cargo_pnl:Q", title="Cargo P&L delta ($)"),
+            y=alt.Y("shock:N", sort="-x", title=None),
+            color=alt.Color("basin:N", scale=alt.Scale(domain=["Europe", "Asia"], range=["#3b82c4", "#2ca85a"])),
+            tooltip=["shock", "basin", alt.Tooltip("cargo_pnl:Q", format=",.0f")],
+        ).properties(height=320)
+        st.altair_chart(chart, width="stretch")
+
+    with st.expander("Analytic vs finite-difference cross-check"):
+        an = risk.analytic_deltas(D, tables, params, month_index=mi)
+        fd = risk.finite_difference_deltas(D, tables, params, month_index=mi)
+        rows = [dict(shock=a.name, eu_analytic=a.eu_cargo_delta, eu_finite_diff=f.eu_cargo_delta,
+                      asia_analytic=a.asia_cargo_delta, asia_finite_diff=f.asia_cargo_delta, note=a.note)
+                for a, f in zip(an, fd)]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.subheader("Asia RT breakeven")
+    rt_df = risk.asia_rt_breakeven(D, tables, params, month_index=mi,
+                                    rt_values=(model.ASIA_RT_BASE, model.ASIA_RT_BASE + 4, model.ASIA_RT_CONG))
+    st.dataframe(rt_df, width="stretch", hide_index=True)
+
+    st.subheader("TTF shock x Asia-RT breakeven grid (Gap = JKM - JKM*)")
+    grid = risk.ttf_x_asiart_grid(D, tables, params, month_index=mi)
+    pivot = grid.pivot(index="asia_rt_days", columns="ttf_shock", values="gap")
+
+    def _gap_color(v):
+        if pd.isna(v):
+            return ""
+        return f"background-color: {'#d6f5d6' if v >= 0 else '#f8d7da'}"
+
+    st.dataframe(pivot.style.map(_gap_color).format("{:+.2f}"), width="stretch")
+    st.caption("Green = Asia verdict (Gap >= 0) at that TTF shock x Asia-RT combination; red = Europe verdict.")
+
+    st.subheader("What-if sliders (live recompute, this load month)")
+    c1, c2, c3 = st.columns(3)
+    ttf_shock = c1.slider("TTF shock (EUR/MWh)", -20.0, 20.0, 0.0, 0.5)
+    jkm_shock = c1.slider("JKM shock ($/MMBtu)", -5.0, 5.0, 0.0, 0.1)
+    hh_shock = c2.slider("HH shock ($/MMBtu)", -3.0, 3.0, 0.0, 0.1)
+    fx_shock = c2.slider("EURUSD shock, parallel", -0.10, 0.10, 0.0, 0.005)
+    charter_shock = c3.slider("Charter shock ($/day)", -50_000.0, 50_000.0, 0.0, 5_000.0)
+    vlsfo_shock = c3.slider("VLSFO shock ($/t)", -200.0, 200.0, 0.0, 10.0)
+
+    t2 = copy.deepcopy(tables)
+    p2 = copy.deepcopy(params)
+    if ttf_shock:
+        t2.ttf = t2.ttf.copy()
+        row = model.snap(t2.ttf, D)
+        t2.ttf.loc[t2.ttf["date"] == row["date"], f"c{mi + 1}"] += ttf_shock
+    if jkm_shock:
+        t2.jkm = t2.jkm.copy()
+        row = model.snap(t2.jkm, D)
+        _, s_ = model.contract_calendar(D)
+        jkm_idx = mi + 2 - s_
+        t2.jkm.loc[t2.jkm["date"] == row["date"], f"c{jkm_idx}"] += jkm_shock
+    if hh_shock:
+        t2.hh = t2.hh.copy()
+        row = model.snap(t2.hh, D)
+        t2.hh.loc[t2.hh["date"] == row["date"], f"c{mi + 1}"] += hh_shock
+    if fx_shock:
+        t2.fx = t2.fx.copy()
+        row = model.snap(t2.fx, D)
+        mask = t2.fx["date"] == row["date"]
+        t2.fx.loc[mask, "spot"] += fx_shock
+        t2.fx.loc[mask, "o6"] += fx_shock
+        t2.fx.loc[mask, "o1"] += fx_shock
+    if charter_shock:
+        base_charter = p2.charter_override if p2.charter_override is not None else float(model.snap(tables.charter, D)["rate174"])
+        p2.charter_override = base_charter + charter_shock
+    if vlsfo_shock:
+        p2.vlsfo_price += vlsfo_shock
+
+    base_row = strip_df.iloc[mi]
+    shocked_row = model.strip(D, t2, p2).iloc[mi]
+    wc1, wc2, wc3, wc4 = st.columns(4)
+    wc1.metric("EU $/day", f"${shocked_row['eu_day']:,.0f}", f"{shocked_row['eu_day'] - base_row['eu_day']:+,.0f}")
+    wc2.metric("Asia $/day", f"${shocked_row['asia_day']:,.0f}", f"{shocked_row['asia_day'] - base_row['asia_day']:+,.0f}")
+    wc3.metric("JKM*", f"{shocked_row['jkm_star']:.2f}", f"{shocked_row['jkm_star'] - base_row['jkm_star']:+.2f}")
+    wc4.metric("Verdict", shocked_row["verdict"],
+               "flipped" if shocked_row["verdict"] != base_row["verdict"] else "unchanged")
+
+    st.subheader("Scenario presets")
+    presets = risk.scenario_presets()
+    preset_name = st.selectbox("Preset", list(presets.keys()))
+    if preset_name != "Base case":
+        D_p, t_p, p_p = risk.apply_preset(D, tables, params, presets[preset_name])
+        strip_p = model.strip(D_p, t_p, p_p)
+        preset_display = strip_p[["month_label", "eu_day", "asia_day", "jkm_star", "gap", "verdict"]].copy()
+        preset_display.attrs = {}
+        st.caption(f"Preset '{preset_name}' -- curve date used: {D_p.date()}")
+        st.dataframe(preset_display, width="stretch", hide_index=True)
+
+    st.caption(CAVEATS)
+
+# ===========================================================================
+# Page 3 -- Hedging
+# ===========================================================================
+
+elif PAGE == "3 Hedging":
+    st.title("Hedging")
+    strip_df = model.strip(D, tables, params)
+    months = list(strip_df["month_label"])
+
+    spec_lines = []
+    for k, v in risk.CONTRACT_SPECS.items():
+        size_txt = f" = {v['size']}" if v["size"] is not None else " (no fixed lot; OTC notional)"
+        spec_lines.append(f"- **{k}**: {v['unit']}{size_txt}")
+    st.warning(
+        "**Contract sizes are as understood at spec-write time and have NOT been verified against "
+        "current exchange specs -- verify before go-live:**\n\n" + "\n".join(spec_lines)
+    )
+
+    basin = st.radio("Basin", ["Europe", "Asia"], horizontal=True)
+    mi = st.selectbox("Load month", options=list(range(12)), format_func=lambda i: f"M{i + 1} = {months[i]}")
+
+    if basin == "Europe":
+        legs = risk.europe_hedge_legs(D, tables, params, month_index=mi)
+    else:
+        legs = risk.asia_hedge_legs(D, tables, params, month_index=mi)
+
+    display_legs = legs.copy()
+    display_legs.attrs = {}  # drop the attached SnapInfo (not JSON-serialisable, harmless but noisy)
+    display_legs["volume"] = display_legs["volume"].map(lambda v: f"{v:,.1f}" if pd.notna(v) else "-")
+    display_legs["lots"] = display_legs["lots"].map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
+    st.dataframe(display_legs, width="stretch", hide_index=True)
+
+    st.subheader("Hedge effectiveness (500-scenario historical VaR)")
+    lookback = st.select_slider("Lookback (business days)", options=[250, 500, 750], value=500)
+    scen = risk.build_scenarios(tables, D, lookback=lookback, method="naive")
+    r_un = risk.historical_var(D, tables, params, portfolio="single", month_index=mi, basin=basin, scen=scen)
+    r_hd = risk.historical_var(D, tables, params, portfolio="hedged", month_index=mi, basin=basin, scen=scen)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**{basin} M{mi + 1} unhedged**")
+        st.metric("VaR 95% (1d)", f"${r_un.var95:,.0f}")
+        st.metric("VaR 99% (1d)", f"${r_un.var99:,.0f}")
+        st.metric("Daily sd", f"${r_un.sd:,.0f}")
+    with c2:
+        st.markdown(f"**{basin} M{mi + 1} hedged (mechanical legs above)**")
+        st.metric("VaR 95% (1d)", f"${r_hd.var95:,.0f}")
+        st.metric("VaR 99% (1d)", f"${r_hd.var99:,.0f}")
+        st.metric("Daily sd", f"${r_hd.sd:,.0f}")
+
+    ratio = abs(r_hd.var95) / max(abs(r_un.var95), 1.0)
+    if ratio > 0.01:
+        st.error(f"Hedged residual VaR95 is {ratio:.2%} of unhedged -- above the ~1% ratio-bug threshold "
+                 "the spec flags; check hedge ratios.")
+    else:
+        st.success(f"Hedged residual VaR95 is {ratio:.2%} of unhedged -- residual is boil-off / ETS / "
+                   "second-order FX cross-term risk only, as expected (Section 7).")
+    st.caption(
+        "This effectiveness is MODEL-INTERNAL: hedge and cargo are revalued off the same index "
+        "curves, so it mainly proves the ratios invert the model's own formula. Physical basis "
+        "(NWE DES-TTF, JKM index vs physical, USGC terminal basis to HH), pricing-window "
+        "mismatch, lot rounding and transaction costs are not modelled; real residuals are larger."
+    )
+
+    st.caption(CAVEATS)
+
+# ===========================================================================
+# Page 4 -- VaR & stress
+# ===========================================================================
+
+else:
+    st.title("VaR & stress")
+    strip_df = model.strip(D, tables, params)
+    months = list(strip_df["month_label"])
+
+    PORTFOLIO_MAP = {
+        "Single cargo - Europe": ("single", "Europe"),
+        "Single cargo - Asia": ("single", "Asia"),
+        "Hedged residual - Europe": ("hedged", "Europe"),
+        "Hedged residual - Asia": ("hedged", "Asia"),
+        "12-cargo strip (verdict-optimal)": ("12cargo", "Europe"),
+        "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
+    }
+    portfolio_choice = st.selectbox("Portfolio", list(PORTFOLIO_MAP.keys()))
+    portfolio_kind, basin_kind = PORTFOLIO_MAP[portfolio_choice]
+
+    mi = 0
+    if portfolio_kind in ("single", "hedged", "spread"):
+        mi = st.selectbox("Load month", options=list(range(12)), format_func=lambda i: f"M{i + 1} = {months[i]}")
+
+    c1, c2 = st.columns(2)
+    lookback = c1.select_slider("Lookback (business days)", options=[250, 500, 750], value=500)
+    roll_on = c2.checkbox("Delivery-month roll-aligned returns (Section 8 refinement, default off)", value=False)
+    method = "roll_aligned" if roll_on else "naive"
+
+    scen = risk.build_scenarios(tables, D, lookback=lookback, method=method)
+    r = risk.historical_var(D, tables, params, portfolio=portfolio_kind, month_index=mi,
+                             basin=basin_kind, scen=scen)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("VaR 95% (1d)", f"${r.var95:,.0f}")
+    m2.metric("VaR 99% (1d)", f"${r.var99:,.0f}")
+    m3.metric("Expected shortfall 95%", f"${r.es95:,.0f}")
+    m4.metric("Expected shortfall 99%", f"${r.es99:,.0f}")
+    st.caption(f"Daily sd: ${r.sd:,.0f}  |  n={r.n} scenarios  |  window {scen.dates[0].date()} to "
+               f"{scen.dates[-1].date()}  |  method={method}")
+
+    st.subheader("P&L histogram")
+    hist_df = pd.DataFrame({"pnl": r.pnl})
+    base_chart = alt.Chart(hist_df).mark_bar(opacity=0.85).encode(
+        x=alt.X("pnl:Q", bin=alt.Bin(maxbins=40), title="1-day P&L ($)"),
+        y=alt.Y("count()", title="Scenarios"),
+    )
+    rule95 = alt.Chart(pd.DataFrame({"x": [r.var95], "label": ["VaR95"]})).mark_rule(
+        color="#e67e22", strokeDash=[5, 3], size=2).encode(x="x:Q")
+    rule99 = alt.Chart(pd.DataFrame({"x": [r.var99], "label": ["VaR99"]})).mark_rule(
+        color="#c0392b", strokeDash=[5, 3], size=2).encode(x="x:Q")
+    st.altair_chart((base_chart + rule95 + rule99).properties(height=320), width="stretch")
+
+    st.subheader("10-day horizon")
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        var10_sqrt = risk.scale_to_horizon(r.var95, days=10, method="sqrt")
+        st.metric("VaR95 (10d, sqrt-scaled)", f"${var10_sqrt:,.0f}")
+        st.caption("Caveat: sqrt(10) scaling assumes iid daily returns; gas/LNG curve moves are "
+                   "fat-tailed and cluster around events, so this is approximate.")
+    with hc2:
+        if st.checkbox("Compute overlapping 10-day VaR (slower, rebuilds scenario set)"):
+            with st.spinner("Rebuilding overlapping 10-day scenarios..."):
+                var10_ov = risk.scale_to_horizon(r.var95, days=10, method="overlapping", tables=tables, D=D,
+                                                  params=params, portfolio=portfolio_kind, month_index=mi,
+                                                  basin=basin_kind)
+            st.metric("VaR95 (10d, overlapping returns)", f"${var10_ov:,.0f}")
+            st.caption("No iid assumption, but overlapping windows are autocorrelated by construction.")
+
+    st.subheader("Stress tests (deterministic replays, Section 8)")
+    with st.spinner("Running stress tests..."):
+        stress_df = risk.run_stress_tests(D, tables, params)
+    st.dataframe(
+        stress_df.style.format({"pnl_12cargo": "{:+,.0f}", "pnl_m1_spread": "{:+,.0f}"}),
+        width="stretch", hide_index=True,
+    )
+    st.caption("Historical replays apply that date's actual single-day curve move onto today's curve; "
+               "Panama/JKM/EUA rows apply a permanent parameter shift and reprice the full strip.")
+
+    with st.expander("Backtest: rolling 1-day VaR vs realised P&L (Kupiec traffic light)"):
+        window_days = st.slider("Backtest window (business days)", 20, 150, 60, 10)
+        st.caption("Each day in the window recomputes a full 500-scenario VaR, so this can take a while.")
+        if st.button("Run backtest"):
+            with st.spinner(f"Running rolling backtest over {window_days} days..."):
+                bt = risk.backtest_var(tables, params, portfolio="12cargo", lookback=lookback,
+                                        window_days=window_days)
+            if bt.empty:
+                st.warning("No backtest rows produced (window too small relative to lookback).")
+            else:
+                st.line_chart(bt.set_index("date")[["var", "realised_pnl"]])
+                n_exceptions = int(bt["exception"].sum())
+                kt = risk.kupiec_test(n_exceptions, len(bt))
+                st.write(f"Exceptions: {n_exceptions} / {len(bt)} ({kt['rate']:.1%} vs 5% expected)  |  "
+                         f"Kupiec traffic light: **{kt['light'].upper()}**  |  LR stat={kt['lr_stat']:.2f}, "
+                         f"p={kt['p_value']:.3f}")
+                st.dataframe(bt, width="stretch", hide_index=True)
+
+    st.caption(CAVEATS)
+    st.caption(
+        "Known exclusions from this VaR: charter (weekly data -- cover via the Section 6 charter delta "
+        "times an assumed weekly move), VLSFO and EUA (static inputs, stress-tested only above), FuelEU."
+    )
