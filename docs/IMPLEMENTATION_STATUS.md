@@ -84,28 +84,32 @@ engine work specifically.
   reproduced inside the new engine. Fixed with
   `physical.vessel_performance_from_params()`.
 
-  **Two real, quantified findings, not implementation detail:**
+  **Two real, quantified findings, both since resolved:**
   1. The legacy `co2_eu_ets_tonnes` constant used a uniform 50% ETS-scope
      factor where the actual EU ETS Directive requires 100% for time at
      berth -- correcting this raises EU-bound ETS cost by ~4.45% (~5.09%
      with methane slip included) once wired into route valuation (step 8,
-     not yet done).
+     not yet done). Not a bug to fix, a documented, intentional divergence.
   2. **Larger finding, from step 6 (queue separation):** splitting Asia's
      congestion allowance into proper queue segments revealed that, at
-     zero reliquefaction capacity (today's default), the laden queue's
-     boil-off exceeds its (lower) demand and the surplus is vented
-     outright -- ~148.7 t LNG-equivalent per congested round trip, which
-     if counted as raw methane (GWP 25) is **~3,717 t CO2e, larger than
-     the rest of that route's combustion emissions combined**.
-     `emissions.py`'s "vented gas isn't counted" limitation, previously
-     theoretical, is now demonstrably load-bearing. `docs/PHASE2_PLAN.md`
-     Section 10 escalates both the vented-methane accounting gap and the
-     zero-reliquefaction-capacity default to blocking items, ahead of
-     step 8.
+     zero reliquefaction capacity (the engine's original default), the
+     laden queue's boil-off exceeds its (lower) demand and the surplus is
+     vented outright -- ~148.7 t LNG-equivalent per congested round trip,
+     ~3,717 t CO2e as raw methane, larger than the rest of that route's
+     combustion emissions combined. Two things closed this the same day:
+     `emissions.py` now counts vented gas as raw CH4 (previously silently
+     zero); and, after asking directly rather than guessing, confirmed
+     this vessel class does carry reliquefaction capacity and set an
+     informed-estimate default (`physical.
+     DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY = 3500` MMBtu/day, ~72 t
+     LNG/day) that fully absorbs the congested queue's surplus -- verified
+     live, zero vented at the new default. The zero-reliq finding stays
+     independently reproducible via an explicit test fixture, not deleted.
 
-  62 tests through step 4, growing to 73 through step 6, across four files
-  (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`,
-  `test_emissions.py`, and the extended-strip suite), all passing alongside
-  an unaffected legacy 64/64 and the unmodified 10/10 programme benchmark
-  suite (`tests/test_decision_programme.py`, confirming duration-only
+  62 tests through step 4, growing to 77 through the reliq-capacity fix,
+  across four files (`test_physical_engine.py`,
+  `test_physical_legacy_equivalence.py`, `test_emissions.py`, and the
+  extended-strip suite), all passing alongside an unaffected legacy 64/64
+  and the unmodified 10/10 programme benchmark suite
+  (`tests/test_decision_programme.py`, confirming duration-only
   arithmetic is untouched by queue separation).

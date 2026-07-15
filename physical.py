@@ -93,6 +93,27 @@ def _default_bor_table() -> dict:
     }
 
 
+# Informed estimate, not a verified spec sheet for this specific vessel --
+# docs/PHASE2_PLAN.md Section 10 item 2. Modern large LNG carriers (~170-
+# 180k m3, 2-stroke dual-fuel, matching the charter sheet's "174k
+# 2-stroke") commonly carry a Partial Reliquefaction System (PRS) sized to
+# absorb the vessel's own natural boil-off at rest -- precisely the
+# idle/port/queue condition where the main engine's gas consumption drops
+# below natural BOG generation, per this engine's own step-6 finding.
+# Two independent estimates converge here: (a) sizing to fully absorb this
+# model's own natural BOG rate at rest (cargo_size * boil_off_rate =
+# 3,500,000 * 0.0010 = 3500 MMBtu/day, already the model's pre-existing
+# natural_bog_offset_mmbtu reference constant) and (b) a generally-recalled
+# real-world PRS capacity range for this vessel size, ~3-6 t LNG/hour
+# (~3,499-6,998 MMBtu/day at 48.6 MMBtu/t). 3500 MMBtu/day sits at the
+# conservative (low) end of that range, not the generous end -- deliberate,
+# so this default doesn't overstate the fix. Used only by
+# vessel_performance_from_params() below, not VesselPerformance's own
+# dataclass default (which stays 0.0, "no reliquefaction assumed", for
+# synthetic/isolated tests that want that baseline explicitly).
+DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY = 3500.0
+
+
 @dataclass(frozen=True)
 class VesselPerformance:
     """User-editable, one instance per vessel class.
@@ -408,6 +429,12 @@ def vessel_performance_from_params(params: model.Params) -> VesselPerformance:
     demand rates from _default_demand_table(), since Params has no
     equivalent fields for them yet and no route builder uses those states
     until step 6 (queue separation).
+
+    reliq_capacity_mmbtu_per_day uses DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY
+    (an informed estimate, not a verified spec -- see that constant's own
+    comment), not model.Params.boil_off_rate or any other Params field,
+    since Params has no reliquefaction-capacity concept at all (it is
+    entirely new to this engine, not a legacy value being re-derived).
     """
     f = 40.5093
     placeholders = _default_demand_table()
@@ -425,4 +452,7 @@ def vessel_performance_from_params(params: model.Params) -> VesselPerformance:
         state: (0.0 if state in (OperatingState.LOADING, OperatingState.DISCHARGE) else params.boil_off_rate)
         for state in OperatingState
     }
-    return VesselPerformance(energy_factor_mmbtu_per_t=f, demand_mmbtu_per_day=demand, bor_fraction_per_day=bor)
+    return VesselPerformance(
+        energy_factor_mmbtu_per_t=f, demand_mmbtu_per_day=demand, bor_fraction_per_day=bor,
+        reliq_capacity_mmbtu_per_day=DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY,
+    )

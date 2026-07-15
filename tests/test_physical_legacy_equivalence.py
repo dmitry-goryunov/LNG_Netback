@@ -195,16 +195,46 @@ class TestAsiaRouteEquivalence:
         assert laden_queue.segment.duration_days == pytest.approx(4.0)
         assert ballast_queue.segment.duration_days == pytest.approx(4.0)
 
-    def test_congested_laden_queue_vents_instead_of_needing_liquid_fuel(self):
-        """The central finding of step 6, pinned precisely: natural BOG
-        during the laden queue (from the still-full cargo inventory)
-        exceeds the queue's own lower demand, so the entire surplus is
-        vented -- zero liquid fuel needed for this segment at all, the
-        opposite regime from every other laden segment in this suite."""
+    def test_congested_laden_queue_surplus_is_reliquefied_not_vented_at_the_default_reliq_capacity(self):
+        """The central finding of step 6, now resolved rather than merely
+        documented: natural BOG during the laden queue (from the
+        still-full cargo inventory) exceeds the queue's own lower demand
+        -- zero liquid fuel needed for this segment, the opposite regime
+        from every other laden segment in this suite -- but
+        vessel_performance_from_params()'s reliq_capacity_mmbtu_per_day
+        default (physical.DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY = 3500,
+        an informed PRS-sizing estimate, not a verified spec -- see that
+        constant's own comment and docs/PHASE2_PLAN.md Section 10 item 2)
+        is large enough to fully absorb the ~1,806.6 MMBtu/day surplus.
+        Zero vented. test_congested_laden_queue_vents_without_
+        reliquefaction below shows what happens at the older, zero-reliq
+        assumption, so this fix stays a verified, not assumed, resolution
+        -- not the disappearance of a finding that's no longer tested."""
         _, ledger = self._ledger_for(model.ASIA_RT_CONG)
         laden_queue = next(r for r in ledger.segments if r.segment.name == "laden_queue")
         assert laden_queue.shortfall_mmbtu == pytest.approx(0.0)
         assert laden_queue.shortfall_liquid_fuel_tonnes == pytest.approx(0.0)
+        assert laden_queue.surplus_mmbtu == pytest.approx(7226.3, abs=1.0)
+        assert laden_queue.reliquefied_mmbtu == pytest.approx(7226.3, abs=1.0)
+        assert laden_queue.vented_mmbtu == pytest.approx(0.0)
+        assert ledger.vented_mmbtu == pytest.approx(0.0)
+
+    def test_congested_laden_queue_vents_without_reliquefaction(self):
+        """Same route and surplus as the test above, but with an explicit
+        zero-reliq vessel (physical.VesselPerformance()'s own dataclass
+        default, not vessel_performance_from_params()'s) to keep the
+        original, larger finding verified and reproducible: without a
+        reliquefaction plant, this exact surplus is what gets vented,
+        ~148.7 t LNG-equivalent -- ~3,717 t CO2e if this were the vessel's
+        actual configuration."""
+        params = model.Params(asia_rt_days=model.ASIA_RT_CONG)
+        vessel = physical.VesselPerformance(
+            demand_mmbtu_per_day=physical.vessel_performance_from_params(params).demand_mmbtu_per_day,
+            bor_fraction_per_day=physical.vessel_performance_from_params(params).bor_fraction_per_day,
+        )  # reliq_capacity_mmbtu_per_day left at the class default, 0.0
+        ledger = physical.run_voyage(physical.asia_route_segments(params), vessel, loaded_mmbtu=params.cargo_size)
+        laden_queue = next(r for r in ledger.segments if r.segment.name == "laden_queue")
+
         assert laden_queue.vented_mmbtu == pytest.approx(7226.3, abs=1.0)
         assert ledger.vented_mmbtu / emissions.LNG_MMBTU_PER_T == pytest.approx(148.7, abs=0.5)
 

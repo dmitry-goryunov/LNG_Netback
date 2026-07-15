@@ -366,3 +366,17 @@ def test_vessel_performance_from_params_discharge_and_loading_still_zero_bor():
     assert vessel.bor_for(OperatingState.LOADING) == 0.0
     assert vessel.bor_for(OperatingState.DISCHARGE) == 0.0
     assert vessel.bor_for(OperatingState.LADEN_SEA) == pytest.approx(0.05)
+
+
+def test_vessel_performance_from_params_uses_the_default_reliq_capacity():
+    """vessel_performance_from_params() -- the constructor route builders
+    actually use -- sets a nonzero reliquefaction capacity
+    (physical.DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY, an informed PRS-sizing
+    estimate; docs/PHASE2_PLAN.md Section 10 item 2), unlike
+    VesselPerformance()'s own bare dataclass default (0.0, "no
+    reliquefaction assumed"), which stays available for tests that want
+    that baseline explicitly."""
+    import model
+    vessel = physical.vessel_performance_from_params(model.Params())
+    assert vessel.reliq_capacity_mmbtu_per_day == pytest.approx(physical.DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY)
+    assert physical.VesselPerformance().reliq_capacity_mmbtu_per_day == 0.0
