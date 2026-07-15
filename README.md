@@ -4,16 +4,26 @@ Streamlit implementation of `LNG_Netback_Streamlit_Spec.md`: a per-load-month
 netback / diversion model (Europe vs Asia) built on `LNG history.xlsx`, plus
 sensitivities, hedging and historical-simulation VaR modules.
 
+**Current build: v2.3-phase1.** This build preserves the frozen v2.2
+renewal-rate model (tagged `v2.2-renewal-rate`, see `docs/BASELINE_RECORD.md`)
+and adds explicit decision modes plus a provisional discrete one-vessel
+programme optimiser, per `docs/IMPROVEMENT_PLAN.md` Phase 0 / Increment A+B.
+See `docs/IMPLEMENTATION_STATUS.md` for exactly what is and is not
+implemented, and `docs/MODEL_ASSUMPTIONS.md` for the assumptions behind it.
+
 ## Layout
 
 ```
-lng_netback_app/
-  app.py             page routing, sidebar (date picker + Step 5 parameter editor)
-  data.py            Section 1 loader + validation (Streamlit only in the cached wrapper)
-  model.py           Sections 2-3 as pure functions: strip(D, tables, params) -> DataFrame
-  risk.py            Sections 6-8: sensitivities, hedging, VaR, stress, backtest
-  tests/test_model.py   Section 5/6/7/8 fixtures, plain asserts, pass/fail summary
-  requirements.txt
+app.py                page routing, sidebar (date picker + Step 5 parameter editor)
+data.py                Section 1 loader + validation (Streamlit only in the cached wrapper)
+model.py                Sections 2-3 as pure functions: strip(D, tables, params) -> DataFrame
+decision.py             decision modes, cost-inclusion policy, discrete vessel-programme optimiser
+risk.py                Sections 6-8: sensitivities, hedging, VaR, stress, backtest
+tests/test_model.py           frozen legacy Section 5/6/7/8 fixtures (pass/fail summary, no pytest)
+tests/test_decision_programme.py   decision-mode and programme-optimiser tests (pytest)
+tests/test_risk_containment.py     roll-aligned scenario / backtest containment tests (pytest)
+tests/app_smoke_check.py           headless Streamlit smoke check
+requirements.txt
 ```
 
 `model.py` and `risk.py` have no Streamlit import, so they (and the tests)
@@ -46,13 +56,30 @@ Supply your own via the env var, relative path, or the sidebar uploader.
 
 ## Tests
 
+Frozen legacy suite (no pytest dependency):
+
 ```bash
 export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
 python3 tests/test_model.py
 ```
 
-Runs head-less against the real workbook (no synthetic data, no pytest
-dependency) and prints a PASS/FAIL line per check plus a summary. Encodes:
+New decision-mode, programme-optimiser and risk-containment suites
+(pytest, added in v2.3-phase1):
+
+```bash
+export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
+python -m pytest tests/test_decision_programme.py tests/test_risk_containment.py
+```
+
+Headless Streamlit smoke check:
+
+```bash
+python tests/app_smoke_check.py
+```
+
+`tests/test_model.py` runs head-less against the real workbook (no synthetic
+data, no pytest dependency) and prints a PASS/FAIL line per check plus a
+summary. Encodes:
 
 - Gate 1 -- master date list (2,335 dates, 2017-07-27 to 2026-07-08) and FX x10 correction sanity.
 - Gate 2 -- all four Section 5 regression fixtures (TTF $/MMBtu, EU/Asia $/day, JKM*, gap, verdict), plus the Step 7 structural charter-invariance assertion.
@@ -62,7 +89,43 @@ dependency) and prints a PASS/FAIL line per check plus a summary. Encodes:
 
 As of the 08-Jul-2026 workbook: **64/64 checks pass, zero failures**
 (v2.2 re-baselined build; earlier builds passed their own gates against the
-pre-rebaseline spec).
+pre-rebaseline spec). These 64 checks are frozen exactly as-is under the
+`v2.2-renewal-rate` tag and must remain green throughout the migration
+described in `docs/IMPROVEMENT_PLAN.md`.
+
+## v2.3-phase1: decision modes and vessel programme (15-Jul-2026)
+
+Per `docs/IMPROVEMENT_PLAN.md` Phase 0 ("Increment A: baseline freeze and
+live-defect containment") and the provisional thin slice ("Increment B:
+provisional decision-state thin slice"):
+
+- Added `decision.py` with four `DecisionMode`s (renewal-rate screen,
+  post-lift diversion, pre-lift cargo, vessel programme), an explicit
+  procurement/loading cost-inclusion policy, and a deterministic discrete
+  one-vessel programme optimiser that schedules only whole voyages within a
+  horizon (no fractional cargoes) and prices each later cargo from its own
+  forward-strip month.
+- Added a **Decision** page (now the app's default page) exposing all four
+  modes.
+- Added an explicit FX-tenor warning: any strip row whose representative
+  mid-month lies beyond the 1-year FX outright (`model.fx_extrapolated_rows`)
+  is now surfaced in the UI rather than silently linearly extrapolated.
+- Added a hard c1..c14 completeness guard to `risk.build_scenarios(...,
+  method="roll_aligned")`, and changed the **Streamlit application default**
+  to roll-aligned scenarios. The `risk.py` function default remains `naive`
+  and the frozen 64/64 legacy fixtures still pin `method="naive"` explicitly,
+  so the legacy suite is unaffected.
+- Added an interim backtest containment fix (`risk.backtest_var`) that skips
+  NG/TTF or JKM roll pairs instead of comparing different physical delivery
+  months across a month boundary.
+- Added a UI warning that the legacy 12-cargo VaR/stress/backtest portfolio
+  is not a physically feasible one-vessel programme.
+
+This build's programme optimiser still runs on the legacy monthly-strip
+voyage physics -- it is a scheduling-and-decision-state layer on top of the
+existing model, not the segment-level physical rebuild (`IMPROVEMENT_PLAN.md`
+Phase 2). Its absolute programme values are provisional and will be
+re-derived after that rebuild; see `docs/IMPLEMENTATION_STATUS.md`.
 
 ## v2.2 re-baseline (13-Jul-2026, after the notes.md external review)
 
@@ -146,9 +209,13 @@ refinement before production use": on an NG/TTF month-boundary or a JKM
 15th/16th boundary, contract index *k*'s return compares today's price
 against *yesterday's* index *k+1* (same underlying delivery month) rather
 than yesterday's index *k*. It's wired into the VaR & stress page as a
-checkbox, **default off**. Per the spec, the fixtures in Sections 7/8 are
-reproduced with the naive method first (`method="naive"`, the default) and
-are not gated on the roll-aligned variant. Note the alignment uses calendar
+checkbox, **default on as of v2.3-phase1** (the `risk.py` function default
+and the frozen legacy fixtures remain `naive`; see "v2.3-phase1" above).
+Roll-aligned construction requires complete c1..c14 history and raises
+`ValueError` explicitly rather than propagating NaNs if a lookback window
+hits the 2022-10-31..2023-01-09 JKM `c14` gap. Per the spec, the fixtures in
+Sections 7/8 are reproduced with the naive method (`method="naive"`) and are
+not gated on the roll-aligned variant. Note the alignment uses calendar
 month-boundaries for NG/TTF, consistent with the model's own front-month
 convention; real NG/TTF expiries fall 2-3 business days before month-end, so
 +-2-3 day artefacts around expiry remain even in this mode.

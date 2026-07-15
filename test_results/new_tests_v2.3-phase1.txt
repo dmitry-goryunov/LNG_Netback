@@ -1,0 +1,23 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: H:\My Drive\LNG\LNG_Netback
+plugins: anyio-4.13.0, typeguard-4.5.1
+collecting ... collected 14 items
+
+tests/test_decision_programme.py::test_decision_mode_cost_policy PASSED  [  7%]
+tests/test_decision_programme.py::test_post_lift_adds_back_only_sunk_procurement_and_loading PASSED [ 14%]
+tests/test_decision_programme.py::test_pre_lift_value_remains_full_cargo_margin PASSED [ 21%]
+tests/test_decision_programme.py::test_52_day_base_case_has_two_europe_cycles_and_one_asia_cycle PASSED [ 28%]
+tests/test_decision_programme.py::test_future_cargo_uses_later_forward_month_and_pre_lift_value PASSED [ 35%]
+tests/test_decision_programme.py::test_54_day_congested_asia_is_infeasible PASSED [ 42%]
+tests/test_decision_programme.py::test_55_day_congested_asia_and_two_europe_cycles_both_fit PASSED [ 50%]
+tests/test_decision_programme.py::test_no_fractional_or_partial_voyage_is_scheduled PASSED [ 57%]
+tests/test_decision_programme.py::test_residual_vessel_value_is_added_once PASSED [ 64%]
+tests/test_decision_programme.py::test_fx_extrapolation_is_explicit_on_current_m12 PASSED [ 71%]
+tests/test_risk_containment.py::test_roll_aligned_scenarios_work_for_current_window PASSED [ 78%]
+tests/test_risk_containment.py::test_roll_aligned_nan_guard_is_explicit_but_naive_path_survives PASSED [ 85%]
+tests/test_risk_containment.py::test_interim_backtest_skips_roll_pairs PASSED [ 92%]
+tests/test_risk_containment.py::test_legacy_function_default_remains_naive PASSED [100%]
+
+============================= 14 passed in 23.13s =============================

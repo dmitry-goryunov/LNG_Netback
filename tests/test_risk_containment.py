@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import copy
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import data
+import model
+import risk
+
+
+@pytest.fixture(scope="module")
+def tables():
+    path = os.environ.get(data.ENV_VAR_NAME)
+    if not path:
+        local = Path(__file__).resolve().parents[1] / "LNG history.xlsx"
+        path = str(local) if local.exists() else data.default_data_path()
+    if not path:
+        pytest.skip(f"set {data.ENV_VAR_NAME} to run workbook-backed tests")
+    return data.load_all(str(path))
+
+
+def test_roll_aligned_scenarios_work_for_current_window(tables):
+    scen = risk.build_scenarios(tables, "2026-07-08", lookback=500, method="roll_aligned")
+    assert scen.method == "roll_aligned"
+    assert scen.hh_ret.shape == (500, 13)
+    assert scen.ttf_ret.shape == (500, 13)
+    assert scen.jkm_ret.shape == (500, 13)
+    assert np.isfinite(scen.jkm_ret).all()
+
+
+def test_roll_aligned_nan_guard_is_explicit_but_naive_path_survives(tables):
+    broken = copy.deepcopy(tables)
+    broken.jkm = broken.jkm.copy()
+    target = pd.Timestamp("2026-06-15")
+    idx = broken.jkm.index[broken.jkm["date"] == target]
+    if len(idx) == 0:
+        target = broken.jkm.loc[broken.jkm["date"] <= "2026-07-08", "date"].iloc[-20]
+        idx = broken.jkm.index[broken.jkm["date"] == target]
+    broken.jkm.loc[idx, "c14"] = np.nan
+
+    with pytest.raises(ValueError, match="complete c1..c14 history"):
+        risk.build_scenarios(broken, "2026-07-08", lookback=500, method="roll_aligned")
+
+    naive = risk.build_scenarios(broken, "2026-07-08", lookback=500, method="naive")
+    assert naive.jkm_ret.shape == (500, 13)
+    assert np.isfinite(naive.jkm_ret).all()
+
+
+def test_interim_backtest_skips_roll_pairs(tables):
+    bt = risk.backtest_var(
+        tables, model.Params(), portfolio="single", basin="Europe", month_index=0,
+        lookback=250, window_days=45, method="naive",
+    )
+    assert not bt.empty
+    assert bt.attrs.get("skipped_roll_pairs", 0) >= 1
+    for row in bt.itertuples(index=False):
+        F, s = model.contract_calendar(row.date)
+        Fn, sn = model.contract_calendar(row.next_date)
+        assert F == Fn
+        assert s == sn
+
+
+def test_legacy_function_default_remains_naive(tables):
+    scen = risk.build_scenarios(tables, "2026-07-08", lookback=10)
+    assert scen.method == "naive"

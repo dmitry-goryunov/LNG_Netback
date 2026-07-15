@@ -446,6 +446,24 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
     jkm_px = tables.jkm.set_index("date").loc[scen_dates, hh_cols].to_numpy(dtype=float)
     fx_px = tables.fx.set_index("date").loc[scen_dates, "spot"].to_numpy(dtype=float)
 
+    # Roll alignment requires one additional continuation (c14) so that
+    # today's c13 can be compared with yesterday's c14 on a roll date.
+    # The source workbook has known historical gaps in JKM c14.  Failing
+    # explicitly is safer than propagating NaNs into VaR or silently dropping
+    # scenarios. Legacy naive fixtures are unaffected.
+    if method == "roll_aligned":
+        missing = []
+        for market, values in (("HH", hh_px), ("TTF", ttf_px), ("JKM", jkm_px)):
+            bad_rows = np.flatnonzero(~np.isfinite(values).all(axis=1))
+            if len(bad_rows):
+                sample = ", ".join(str(pd.Timestamp(scen_dates[i]).date()) for i in bad_rows[:5])
+                missing.append(f"{market}: {len(bad_rows)} row(s), e.g. {sample}")
+        if missing:
+            raise ValueError(
+                "roll-aligned scenarios require complete c1..c14 history; "
+                + "; ".join(missing)
+            )
+
     if method == "naive":
         hh_ret = np.diff(np.log(hh_px), axis=0)
         ttf_ret = np.diff(np.log(ttf_px), axis=0)
@@ -693,7 +711,8 @@ def historical_var(D, tables, params: Params, portfolio: str = "12cargo", month_
 
 
 def scale_to_horizon(var_1d: float, days: int = 10, method: str = "sqrt", scen: Optional[ScenarioSet] = None,
-                      tables=None, D=None, params=None, portfolio="12cargo", month_index=0, basin="Europe") -> float:
+                      tables=None, D=None, params=None, portfolio="12cargo", month_index=0, basin="Europe",
+                      scenario_method: str = "naive") -> float:
     """Section 8.3: 10-day figure. method="sqrt" is a caveated
     sqrt(time)-scaling of the 1-day VaR (assumes iid returns -- flagged as
     approximate). method="overlapping" instead rebuilds the scenario set
@@ -704,7 +723,7 @@ def scale_to_horizon(var_1d: float, days: int = 10, method: str = "sqrt", scen: 
         return var_1d * np.sqrt(days)
     if method == "overlapping":
         if scen is None:
-            scen = build_scenarios(tables, D, lookback=500 + days, method="naive")
+            scen = build_scenarios(tables, D, lookback=500 + days, method=scenario_method)
         hh_ret = _rolling_sum(scen.hh_ret, days)
         ttf_ret = _rolling_sum(scen.ttf_ret, days)
         jkm_ret = _rolling_sum(scen.jkm_ret, days)
@@ -811,31 +830,66 @@ def run_stress_tests(D, tables, params: Params) -> pd.DataFrame:
 # ===========================================================================
 
 def backtest_var(tables, params: Params, portfolio: str = "12cargo", lookback: int = 500,
-                  window_days: int = 60, alpha: float = 0.05) -> pd.DataFrame:
-    """Rolling 1-day VaR(alpha) vs realised next-day strip P&L, over the
-    last `window_days` intersection dates. O(window_days x lookback)
-    full-strip repricings -- keep window_days modest (default 60; the UI
-    exposes a slider) since each step is itself a full 500-scenario VaR.
+                  window_days: int = 60, alpha: float = 0.05, method: str = "naive",
+                  month_index: int = 0, basin: str = "Europe") -> pd.DataFrame:
+    """Rolling one-day VaR versus realised next-day P&L.
+
+    Interim roll-safety rule: pairs that cross the NG/TTF calendar roll or the
+    JKM 15th/16th roll are skipped.  This prevents the previous live defect in
+    which row M1 at ``D`` was compared with a different physical delivery month
+    at ``D_next``.  The production replacement is contract-ID backtesting.
+
+    ``method`` controls the historical scenario construction.  The function
+    default remains ``naive`` to preserve the frozen legacy fixture; the
+    Streamlit application defaults to ``roll_aligned``.
     """
+    if portfolio == "hedged":
+        raise ValueError("hedged backtest is not implemented in the interim roll-safe path")
+
     inter = _intersection_dates(tables)
     n = len(inter)
     start = max(lookback + 1, n - window_days)
     rows = []
+    skipped_roll_pairs = 0
+
     for i in range(start, n - 1):
         D = inter[i]
         D_next = inter[i + 1]
-        r = historical_var(D, tables, params, portfolio=portfolio, lookback=lookback)
+        F, s = contract_calendar(D)
+        F_next, s_next = contract_calendar(D_next)
+        if F != F_next or s != s_next:
+            skipped_roll_pairs += 1
+            continue
+
+        r = historical_var(
+            D, tables, params, portfolio=portfolio, lookback=lookback,
+            method=method, month_index=month_index, basin=basin,
+        )
         var_level = r.var95 if abs(alpha - 0.05) < 1e-9 else r.var99
 
         base_D = model.strip(D, tables, params)
-        base_val = np.where(base_D["verdict"] == "Asia", base_D["asia_cargo"], base_D["eu_cargo"]).sum()
         base_Dn = model.strip(D_next, tables, params)
-        # realised P&L: reprice the SAME verdict-selection as of D, one day later, using D_next's curve
-        realised = np.where(base_D["verdict"].to_numpy() == "Asia", base_Dn["asia_cargo"], base_Dn["eu_cargo"]).sum() - base_val
 
+        if portfolio == "12cargo":
+            selection = base_D["verdict"].to_numpy() == "Asia"
+            base_val = np.where(selection, base_D["asia_cargo"], base_D["eu_cargo"]).sum()
+            next_val = np.where(selection, base_Dn["asia_cargo"], base_Dn["eu_cargo"]).sum()
+        elif portfolio == "single":
+            col = "eu_cargo" if basin == "Europe" else "asia_cargo"
+            base_val = float(base_D.iloc[month_index][col])
+            next_val = float(base_Dn.iloc[month_index][col])
+        elif portfolio == "spread":
+            base_val = float(base_D.iloc[month_index]["asia_cargo"] - base_D.iloc[month_index]["eu_cargo"])
+            next_val = float(base_Dn.iloc[month_index]["asia_cargo"] - base_Dn.iloc[month_index]["eu_cargo"])
+        else:
+            raise ValueError(f"backtest portfolio {portfolio!r} is not supported")
+
+        realised = next_val - base_val
         rows.append(dict(date=D, next_date=D_next, var=var_level, realised_pnl=realised,
-                          exception=realised < var_level))
+                         exception=realised < var_level, method=method))
+
     out = pd.DataFrame(rows)
+    out.attrs["skipped_roll_pairs"] = skipped_roll_pairs
     return out
 
 

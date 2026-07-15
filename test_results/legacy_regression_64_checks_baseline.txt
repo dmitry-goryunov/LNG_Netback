@@ -1,0 +1,92 @@
+Using workbook: ../LNG history.xlsx
+
+GATE 1: data.py loader / master date list
+  [PASS] master date count == 2335  -- got 2335
+  [PASS] master min date == 2017-07-27  -- got 2017-07-27
+  [PASS] master max date == 2026-07-08  -- got 2026-07-08
+  [PASS] FX x10 correction applied (o6 within +-5% of spot on 2026-07-08)
+  [PASS] FX corrected o6 sanity (2026-07-08): |o6/spot-1| < 5%  -- dev=0.7657%
+  [PASS] data.py validate() raised no assertion errors (monotonic dates, FX tolerance)  -- 0 soft warning(s): []
+
+GATE 2: model.py Section 5 fixtures
+  [PASS] [2026-07-08 M1=Aug-26] TTF $/MMBtu within 0.01  -- got 15.6098, want 15.61
+  [PASS] [2026-07-08 M1=Aug-26] EU $/day within 0.5%  -- got 927,748, want 927,752
+  [PASS] [2026-07-08 M1=Aug-26] Asia $/day within 0.5%  -- got 550,477, want 550,482
+  [PASS] [2026-07-08 M1=Aug-26] JKM* within 0.01  -- got 22.2460, want 22.25
+  [PASS] [2026-07-08 M1=Aug-26] Gap within 0.01  -- got -5.1460, want -5.15
+  [PASS] [2026-07-08 M1=Aug-26] Verdict == Europe  -- got Europe
+  [PASS] [2026-07-08 M12=Jul-27] TTF $/MMBtu within 0.01  -- got 11.1568, want 11.16
+  [PASS] [2026-07-08 M12=Jul-27] EU $/day within 0.5%  -- got 342,178, want 342,182
+  [PASS] [2026-07-08 M12=Jul-27] Asia $/day within 0.5%  -- got 171,760, want 171,764
+  [PASS] [2026-07-08 M12=Jul-27] JKM* within 0.01  -- got 14.1895, want 14.19
+  [PASS] [2026-07-08 M12=Jul-27] Gap within 0.01  -- got -2.3245, want -2.32
+  [PASS] [2026-07-08 M12=Jul-27] Verdict == Europe  -- got Europe
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] TTF $/MMBtu within 0.01  -- got 99.1664, want 99.17
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] EU $/day within 0.5%  -- got 11,144,021, want 11,144,025
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] Asia $/day within 0.5%  -- got 3,803,981, want 3,803,986
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] JKM* within 0.01  -- got 168.9182, want 168.92
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] Gap within 0.01  -- got -100.1182, want -100.12
+  [PASS] [2022-08-26 M1=Sep-22 (s=1, charter 105k)] Verdict == Europe  -- got Europe
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] TTF $/MMBtu within 0.01  -- got 5.3870, want 5.39
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] EU $/day within 0.5%  -- got -288,599, want -288,595
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] Asia $/day within 0.5%  -- got -158,491, want -158,486
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] JKM* within 0.01  -- got 4.7403, want 4.74
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] Gap within 0.01  -- got 1.7747, want 1.77
+  [PASS] [2019-10-01 M1=Nov-19 (charter 105k, ETS phase 0)] Verdict == Asia  -- got Asia
+  [PASS] 2022-08-26: JKM roll shift s == 1 (day>15)
+  [PASS] 2022-08-26: charter snap == 105,000
+  [PASS] 2019-10-01: charter snap == 105,000
+  [PASS] 2019-10-01: verdict flips to Asia (critical test)
+
+Section 2 Step 7: structural assertions
+  [PASS] JKM* invariant to charter rate (Step 7.1)  -- base=22.245975 bumped=22.245975
+  [PASS] JKM* NOT procurement-invariant: HH +1.00 moves JKM* by hh_grossup*(1-rtA/rtE)/(1-bo*laden) ~ -0.94  -- got -0.9419, analytic -0.9419
+  [PASS] Breakeven equation holds by construction: JKM*(1-asia_bo) - asia_cost_exbo == eu_day*asia_rt/cargo
+
+GATE 3: risk.py Section 6 sensitivities (analytic vs finite-difference)
+  [PASS] [TTF +1 EUR/MWh] EU: analytic vs finite-diff agree to 1e-6 relative  -- analytic=1,160,730.1899 fd=1,160,730.1899 rel=6.62e-15
+    spec comparison [TTF +1 EUR/MWh] EU: analytic=1,160,730 spec=1,160,730   Asia: analytic=0 spec=0
+  [PASS] [JKM +0.10 $/MMBtu] Asia: analytic vs finite-diff agree to 1e-6 relative  -- analytic=342,694.8718 fd=342,694.8718 rel=5.10e-16
+    spec comparison [JKM +0.10 $/MMBtu] EU: analytic=0 spec=0   Asia: analytic=342,695 spec=342,695
+  [PASS] [HH +0.10 $/MMBtu] EU: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-402,500.0000 fd=-402,500.0000 rel=0.00e+00
+  [PASS] [HH +0.10 $/MMBtu] Asia: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-402,500.0000 fd=-402,500.0000 rel=0.00e+00
+    spec comparison [HH +0.10 $/MMBtu] EU: analytic=-402,500 spec=-402,500   Asia: analytic=-402,500 spec=-402,500
+  [PASS] [EURUSD +0.01 (parallel)] EU: analytic vs finite-diff agree to 1e-6 relative  -- analytic=469,672.1178 fd=469,672.1178 rel=5.95e-15
+    spec comparison [EURUSD +0.01 (parallel)] EU: analytic=469,672 spec=469,672   Asia: analytic=0 spec=0
+  [PASS] [Charter +$10k/day] EU: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-259,401.7094 fd=-259,401.7094 rel=5.05e-15
+  [PASS] [Charter +$10k/day] Asia: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-467,435.8974 fd=-467,435.8974 rel=2.86e-15
+    spec comparison [Charter +$10k/day] EU: analytic=-259,402 spec=-259,402   Asia: analytic=-467,436 spec=-467,436
+  [PASS] [VLSFO +$50/t] EU: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-107,600.4274 fd=-107,600.4274 rel=4.03e-14
+  [PASS] [VLSFO +$50/t] Asia: analytic vs finite-diff agree to 1e-6 relative  -- analytic=-208,288.9744 fd=-208,288.9744 rel=7.27e-15
+    spec comparison [VLSFO +$50/t] EU: analytic=-107,600 spec=-107,590   Asia: analytic=-208,289 spec=-208,268
+  [PASS] Charter shock: JKM* unchanged (spec Section 6 note)  -- verified above under Step 7 structural assertions
+    Asia RT base->congestion JKM* (symmetric legs): 22.25 -> 24.84 (delta +2.59)
+  [PASS] Asia RT 46.74->54.74 (symmetric legs): JKM* 22.25 -> 24.84 within 0.01  -- got 22.2460 -> 24.8372
+
+GATE 4a: risk.py Section 7 hedge effectiveness (500 naive scenarios)
+    scenario window: 2024-08-07 00:00:00 .. 2026-07-07 00:00:00  (n=500)
+  [PASS] [M1 EU cargo unhedged] VaR95 within 1%  -- got -3,054,920 want -3,054,920
+  [PASS] [M1 EU cargo unhedged] VaR99 within 1%  -- got -4,951,928 want -4,951,928
+  [PASS] [M1 EU cargo unhedged] sd within 1%  -- got 2,098,680 want 2,098,992
+  [PASS] [M1 EU cargo hedged] VaR95 within 1%  -- got -12,437 want -12,437
+  [PASS] [M1 EU cargo hedged] VaR99 within 1%  -- got -35,599 want -35,599
+  [PASS] [M1 EU cargo hedged] sd within 1%  -- got 13,563 want 13,681
+  [PASS] Hedged residual VaR95 < 1% of unhedged VaR95 (ratio-bug guard, spec Section 7)  -- ratio=0.4071%
+
+GATE 4b: risk.py Section 8 VaR fixtures (500 naive scenarios)
+  [PASS] [12cargo] VaR95 within 1%  -- got -26,093,954 want -26,093,953
+  [PASS] [12cargo] VaR99 within 1%  -- got -47,706,721 want -47,706,721
+  [PASS] [12cargo] sd within 1%  -- got 18,444,684 want 18,447,468
+  [PASS] [spread] VaR95 within 1%  -- got -1,351,610 want -1,351,610
+  [PASS] [spread] VaR99 within 1%  -- got -2,256,879 want -2,256,879
+  [PASS] [spread] sd within 1%  -- got 996,907 want 996,909
+
+Internal consistency: vectorised repricer vs model.strip (zero-shock)
+  [PASS] Zero-shock scenario reprices to ~0 P&L vs model.strip base  -- got -0.000000
+  [PASS] Zero-shock scenario (Asia) reprices to ~0 P&L vs model.strip base  -- got 0.000000
+  [PASS] Zero-shock scenario (12-cargo) reprices to ~0 P&L vs model.strip base  -- got 0.000000
+
+==============================================================================
+SUMMARY: 64/64 checks passed, 0 failed
+ALL GATES GREEN
+==============================================================================

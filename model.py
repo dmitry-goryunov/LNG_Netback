@@ -233,6 +233,9 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         jkm_idx = i + 2 - s
         jkm_l1 = float(jkm_row[f"c{jkm_idx}"])
         fx_l = fxfn(L)
+        fx_mid = pd.Timestamp(year=L.year, month=L.month, day=15)
+        fx_tenor_months = (fx_mid - D).days / 30.44
+        fx_extrapolated = fx_tenor_months > 12.0
 
         proc = hh_l * params.hh_grossup + params.liquefaction_toll + params.pipeline
         ttf_usd = ttf_l * fx_l / 3.412
@@ -291,6 +294,7 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         rows.append(dict(
             load_month=L, month_label=L.strftime("%b-%y"),
             HH=hh_l, TTF=ttf_l, JKM=jkm_l1, fx=fx_l,
+            fx_tenor_months=fx_tenor_months, fx_extrapolated=fx_extrapolated,
             proc=proc, ttf_usd=ttf_usd,
             eu_ship=eu_ship, as_ship=as_ship, ets=ets,
             eu_margin=eu_margin, eu_day=eu_day, eu_cargo=eu_cargo,
@@ -312,6 +316,18 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         charter_overridden=charter_overridden, F=F, s=s,
     )
     return out
+
+
+def fx_extrapolated_rows(strip_df: pd.DataFrame) -> pd.DataFrame:
+    """Rows whose representative mid-month lies beyond the 1Y FX outright.
+
+    The current screening FX curve contains spot, 6M and 1Y only.  Values
+    beyond 12 months are linearly extrapolated by :func:`fx_curve` and must be
+    surfaced as a live model warning rather than silently accepted.
+    """
+    if "fx_extrapolated" not in strip_df.columns:
+        return strip_df.iloc[0:0].copy()
+    return strip_df.loc[strip_df["fx_extrapolated"].astype(bool)].copy()
 
 
 def strip_month(D, tables, params: Params, month_index: int) -> dict:

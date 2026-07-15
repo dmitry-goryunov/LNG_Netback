@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data
+import decision
 import model
 import risk
 
@@ -232,10 +233,26 @@ params = st.session_state.params
 st.sidebar.caption(f"Data source: {tables.source or '(uploaded file)'}")
 
 # ===========================================================================
-# Page routing
+# Decision state and page routing
 # ===========================================================================
 
-PAGE = st.sidebar.radio("Page", ["1 Netback", "2 Sensitivities", "3 Hedging", "4 VaR & stress"])
+MODE_LABELS = {
+    "Vessel programme": decision.DecisionMode.VESSEL_PROGRAMME,
+    "Post-lift diversion": decision.DecisionMode.POST_LIFT_DIVERSION,
+    "Pre-lift cargo": decision.DecisionMode.PRE_LIFT_CARGO,
+    "Renewal-rate screen (legacy)": decision.DecisionMode.RENEWAL_RATE_SCREEN,
+}
+mode_label = st.sidebar.selectbox("Decision mode", list(MODE_LABELS), index=0)
+decision_mode = MODE_LABELS[mode_label]
+st.sidebar.caption(
+    "The decision state controls whether procurement and loading are sunk, "
+    "included, or applied only to later cargoes."
+)
+
+PAGE = st.sidebar.radio(
+    "Page",
+    ["0 Decision", "1 Forward strip", "2 Sensitivities", "3 Hedging", "4 VaR & stress"],
+)
 
 CAVEATS = (
     "Caveats (LNG_Diversion_Logic.md v2): 47d Asia RT assumes ~19.5 kn and 1-day canal transit "
@@ -248,10 +265,147 @@ CAVEATS = (
 # Page 1 -- Netback
 # ===========================================================================
 
-if PAGE == "1 Netback":
+if PAGE == "0 Decision":
+    st.title("LNG cargo and vessel decision")
+    strip_df = model.strip(D, tables, params)
+    snap_info = strip_df.attrs["snap"]
+    months = list(strip_df["month_label"])
+    month_index = st.selectbox(
+        "Current cargo load month",
+        options=list(range(12)),
+        format_func=lambda i: f"M{i + 1} = {months[i]}",
+    )
+
+    if decision_mode == decision.DecisionMode.RENEWAL_RATE_SCREEN:
+        st.info(
+            "This mode preserves the original repeated-deployment screen. "
+            "Its recommendation is based on margin per vessel-day, not a post-lift "
+            "diversion NPV or a discrete cargo programme."
+        )
+        row = strip_df.iloc[month_index]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Renewal-rate result", row["verdict"])
+        c2.metric("Europe value/day", f"${row['eu_day']:,.0f}")
+        c3.metric("Asia value/day", f"${row['asia_day']:,.0f}")
+        st.caption("Use the Forward strip page for the full 12-month legacy analysis.")
+
+    elif decision_mode in {decision.DecisionMode.POST_LIFT_DIVERSION, decision.DecisionMode.PRE_LIFT_CARGO}:
+        values = decision.isolated_route_values(
+            strip_df, params, decision_mode, month_index=month_index
+        )
+        ranked = sorted(values, key=lambda x: x.incremental_value, reverse=True)
+        best = ranked[0]
+        next_best = ranked[1]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Recommended route", best.route)
+        c2.metric("Decision value", f"${best.incremental_value:,.0f}")
+        c3.metric("Advantage versus next best", f"${best.incremental_value-next_best.incremental_value:,.0f}")
+        rows = []
+        for value in ranked:
+            rows.append({
+                "route": value.route,
+                "load_month": value.load_month,
+                "duration_days": value.duration_days,
+                "incremental_value": value.incremental_value,
+                "full_cargo_value": value.full_cargo_value,
+                "procurement": value.procurement_treatment.value,
+                "loading": value.loading_treatment.value,
+            })
+        st.dataframe(
+            pd.DataFrame(rows).style.format({
+                "duration_days": "{:,.4f}",
+                "incremental_value": "${:,.0f}",
+                "full_cargo_value": "${:,.0f}",
+            }),
+            width="stretch", hide_index=True,
+        )
+        if decision_mode == decision.DecisionMode.POST_LIFT_DIVERSION:
+            st.caption(
+                "Procurement and completed loading are sunk in incremental value, "
+                "but remain in full-cargo P&L."
+            )
+
+    else:
+        st.subheader("Discrete one-vessel programme")
+        c1, c2, c3 = st.columns(3)
+        horizon = c1.number_input("Programme horizon (days)", min_value=1.0, value=52.0, step=1.0)
+        max_additional = c2.number_input("Additional cargoes available", min_value=0, max_value=11, value=1, step=1)
+        residual_value = c3.number_input("Residual vessel value ($/day)", value=0.0, step=10_000.0, format="%.0f")
+        asia_case = st.radio(
+            "Asia route case for programme",
+            ["Use sidebar route", "Base 46.7436 days", "Congested 54.7436 days"],
+            horizontal=True,
+        )
+        programme_params = copy.deepcopy(params)
+        if asia_case == "Base 46.7436 days":
+            programme_params.asia_rt_days = model.ASIA_RT_BASE
+        elif asia_case == "Congested 54.7436 days":
+            programme_params.asia_rt_days = model.ASIA_RT_CONG
+        # Rebuild strip because Asia value and laden duration depend on the selected RT.
+        programme_strip = model.strip(D, tables, programme_params)
+        try:
+            result = decision.optimise_programme(
+                programme_strip, programme_params, horizon_days=float(horizon),
+                current_month_index=month_index,
+                current_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+                max_additional_cargoes=int(max_additional),
+                residual_value_per_day=float(residual_value),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            best = result.best
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Best programme", best.sequence)
+            c2.metric("Programme value", f"${best.total_value:,.0f}")
+            c3.metric("Used vessel-days", f"{best.used_days:,.4f}")
+            advantage = result.advantage
+            c4.metric("Advantage versus next best", "n/a" if advantage is None else f"${advantage:,.0f}")
+            st.dataframe(
+                decision.programme_frame(result).style.format({
+                    "used_days": "{:,.4f}",
+                    "residual_days": "{:,.4f}",
+                    "residual_value": "${:,.0f}",
+                    "programme_value": "${:,.0f}",
+                }),
+                width="stretch", hide_index=True,
+            )
+            st.subheader("Best programme schedule")
+            st.dataframe(
+                decision.schedule_frame(best).style.format({
+                    "start_day": "{:,.4f}",
+                    "duration_days": "{:,.4f}",
+                    "end_day": "{:,.4f}",
+                    "value": "${:,.0f}",
+                }),
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "Current cargo is valued post-lift. Every later cargo is valued "
+                "pre-lift using the forward-strip month matching its start date. "
+                "The provisional programme uses legacy voyage physics and must be "
+                "re-baselined after the physical-engine rebuild."
+            )
+
+    fx_rows = model.fx_extrapolated_rows(strip_df)
+    if not fx_rows.empty:
+        labels = ", ".join(fx_rows["month_label"].astype(str))
+        st.warning(
+            f"FX curve warning: {labels} lie beyond the available 1Y outright and "
+            "are linearly extrapolated in the current screening model."
+        )
+
+elif PAGE == "1 Forward strip":
     st.title("LNG Forward Netback")
     strip_df = model.strip(D, tables, params)
     snap_info = strip_df.attrs["snap"]
+    fx_rows = model.fx_extrapolated_rows(strip_df)
+    if not fx_rows.empty:
+        labels = ", ".join(fx_rows["month_label"].astype(str))
+        st.warning(
+            f"FX curve warning: {labels} lie beyond the available 1Y outright and "
+            "are linearly extrapolated in the current screening model."
+        )
 
     st.caption(
         f"Curve date D = **{D.date()}**  |  Snapped -- HH: {snap_info.hh_date.date()}, "
@@ -541,10 +695,20 @@ else:
 
     c1, c2 = st.columns(2)
     lookback = c1.select_slider("Lookback (business days)", options=[250, 500, 750], value=500)
-    roll_on = c2.checkbox("Delivery-month roll-aligned returns (Section 8 refinement, default off)", value=False)
+    roll_on = c2.checkbox("Delivery-month roll-aligned returns (application default on)", value=True)
     method = "roll_aligned" if roll_on else "naive"
 
-    scen = risk.build_scenarios(tables, D, lookback=lookback, method=method)
+    if portfolio_kind == "12cargo":
+        st.warning(
+            "Legacy 12-cargo strip is not a physically time-feasible one-vessel "
+            "portfolio. It is retained only for regression comparison until the "
+            "programme-based risk portfolio is implemented."
+        )
+    try:
+        scen = risk.build_scenarios(tables, D, lookback=lookback, method=method)
+    except ValueError as exc:
+        st.error(f"Cannot build {method} scenarios: {exc}")
+        st.stop()
     r = risk.historical_var(D, tables, params, portfolio=portfolio_kind, month_index=mi,
                              basin=basin_kind, scen=scen)
 
@@ -580,7 +744,7 @@ else:
             with st.spinner("Rebuilding overlapping 10-day scenarios..."):
                 var10_ov = risk.scale_to_horizon(r.var95, days=10, method="overlapping", tables=tables, D=D,
                                                   params=params, portfolio=portfolio_kind, month_index=mi,
-                                                  basin=basin_kind)
+                                                  basin=basin_kind, scenario_method=method)
             st.metric("VaR95 (10d, overlapping returns)", f"${var10_ov:,.0f}")
             st.caption("No iid assumption, but overlapping windows are autocorrelated by construction.")
 
@@ -591,19 +755,29 @@ else:
         stress_df.style.format({"pnl_12cargo": "{:+,.0f}", "pnl_m1_spread": "{:+,.0f}"}),
         width="stretch", hide_index=True,
     )
-    st.caption("Historical replays apply that date's actual single-day curve move onto today's curve; "
-               "Panama/JKM/EUA rows apply a permanent parameter shift and reprice the full strip.")
+    st.caption("Historical replays apply that date's actual single-day curve move onto today's curve. "
+               "The pnl_12cargo column is a legacy regression portfolio and is not a feasible one-vessel programme.")
 
     with st.expander("Backtest: rolling 1-day VaR vs realised P&L (Kupiec traffic light)"):
         window_days = st.slider("Backtest window (business days)", 20, 150, 60, 10)
         st.caption("Each day in the window recomputes a full 500-scenario VaR, so this can take a while.")
-        if st.button("Run backtest"):
+        if portfolio_kind == "hedged":
+            st.info("Interim roll-safe backtesting is not yet available for the hedged residual portfolio.")
+        if st.button("Run backtest", disabled=portfolio_kind == "hedged"):
             with st.spinner(f"Running rolling backtest over {window_days} days..."):
-                bt = risk.backtest_var(tables, params, portfolio="12cargo", lookback=lookback,
-                                        window_days=window_days)
+                bt = risk.backtest_var(
+                    tables, params, portfolio=portfolio_kind, lookback=lookback,
+                    window_days=window_days, method=method, month_index=mi, basin=basin_kind,
+                )
             if bt.empty:
                 st.warning("No backtest rows produced (window too small relative to lookback).")
             else:
+                skipped = int(bt.attrs.get("skipped_roll_pairs", 0))
+                if skipped:
+                    st.caption(
+                        f"Skipped {skipped} month/JKM roll pair(s) to avoid comparing "
+                        "different physical delivery months in the interim backtest."
+                    )
                 st.line_chart(bt.set_index("date")[["var", "realised_pnl"]])
                 n_exceptions = int(bt["exception"].sum())
                 kt = risk.kupiec_test(n_exceptions, len(bt))
