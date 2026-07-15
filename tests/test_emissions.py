@@ -79,15 +79,15 @@ def test_higher_liquid_fuel_burn_increases_co2e():
     )
 
 
-def test_vented_methane_is_not_yet_counted():
-    """Documents the KNOWN LIMITATION in emissions.py's module docstring:
-    a BOR high enough to push natural BOG past demand (here, with
-    reliq_capacity=0, so 100% of the surplus is vented) produces a real,
-    substantial vented_mmbtu on the physical ledger, but today's
-    voyage_emissions() silently ignores it -- CO2e is identical to a
-    lower-BOR case with zero venting. This test exists so fixing the gap
-    requires deliberately changing this assertion, not discovering it by
-    accident."""
+def test_vented_methane_is_counted_as_raw_ch4_not_ignored():
+    """Was test_vented_methane_is_not_yet_counted until the gap it
+    documented was closed (docs/PHASE2_PLAN.md Section 8 step 6 found the
+    congested Asia route already triggers this for real, not just in a
+    synthetic high-BOR case). A BOR high enough to push natural BOG past
+    demand (here, with reliq_capacity=0, so 100% of the surplus is vented)
+    now produces a materially higher total_co2e_tonnes than an equivalent
+    no-venting case, via total_ch4_vented_tonnes -- not silently absorbed
+    into a combustion-only figure."""
     params_no_vent = model.Params(boil_off_rate=0.0015)  # below breakeven, zero venting
     params_with_vent = model.Params(boil_off_rate=0.01)  # well above breakeven, large venting
     ledger_no_vent = _europe_ledger(params_no_vent)
@@ -95,10 +95,16 @@ def test_vented_methane_is_not_yet_counted():
     assert ledger_no_vent.vented_mmbtu == pytest.approx(0.0)
     assert ledger_with_vent.vented_mmbtu > 100_000  # confirms this case genuinely exercises venting
 
-    # Today's (incomplete) behaviour: CO2e does NOT reflect the vented gas.
     voyage_no_vent = emissions.voyage_emissions(ledger_no_vent)
     voyage_with_vent = emissions.voyage_emissions(ledger_with_vent)
-    assert voyage_with_vent.total_co2e_tonnes == pytest.approx(voyage_no_vent.total_co2e_tonnes, rel=0.05)
+    assert voyage_no_vent.total_ch4_vented_tonnes == pytest.approx(0.0)
+    assert voyage_with_vent.total_ch4_vented_tonnes > 0.0
+    assert voyage_with_vent.total_co2e_tonnes > voyage_no_vent.total_co2e_tonnes
+    assert voyage_with_vent.total_co2e_tonnes == pytest.approx(
+        voyage_with_vent.total_co2_tonnes
+        + (voyage_with_vent.total_ch4_slip_tonnes + voyage_with_vent.total_ch4_vented_tonnes) * emissions.GWP_CH4_100YR
+        + voyage_with_vent.total_n2o_tonnes * emissions.GWP_N2O_100YR
+    )
 
 
 def test_methane_slip_contributes_to_co2e_only_when_nonzero():
@@ -169,11 +175,11 @@ def test_ets_cost_rejects_invalid_contractual_share():
         emissions.ets_cost_usd(voyage, eua_price_eur_per_t=70.0, eur_usd_fx=1.10, contractual_share=1.5)
 
 
-def test_queue_state_emissions_below_sea_state_at_equal_duration():
-    """Preview of Improvement 4's acceptance criterion, ahead of step 6's
-    actual queue-segment route builders: at the default demand table, a
-    LADEN_QUEUE segment must produce less CO2e than an equal-duration
-    LADEN_SEA segment, all else equal."""
+def test_queue_state_combustion_co2_below_sea_state_at_equal_duration():
+    """Half of Improvement 4's acceptance criterion: a LADEN_QUEUE segment's
+    own fuel/combustion CO2 (excluding vented gas -- see the next two tests
+    for why that exclusion matters) is lower than an equal-duration
+    LADEN_SEA segment's, matching the lower queue demand rate."""
     vessel = physical.VesselPerformance()
     sea = physical.VoyageSegment("sea", physical.OperatingState.LADEN_SEA, duration_days=5.0)
     queue = physical.VoyageSegment("queue", physical.OperatingState.LADEN_QUEUE, duration_days=5.0)
@@ -182,6 +188,54 @@ def test_queue_state_emissions_below_sea_state_at_equal_duration():
     sea_ledger = physical.run_voyage((sea, discharge), vessel, loaded_mmbtu=3_500_000.0)
     queue_ledger = physical.run_voyage((queue, discharge), vessel, loaded_mmbtu=3_500_000.0)
 
+    assert (
+        emissions.voyage_emissions(queue_ledger).total_co2_tonnes
+        < emissions.voyage_emissions(sea_ledger).total_co2_tonnes
+    )
+
+
+def test_queue_state_total_co2e_can_exceed_sea_state_without_reliquefaction():
+    """The other half of the story, and the reason step 6's finding
+    matters: at zero reliquefaction capacity (the engine's default),
+    natural BOG doesn't slow down just because the vessel is queuing
+    instead of steaming, but the queue's own (lower) demand consumes less
+    of it -- so a queue segment can vent MORE than an equal-duration sea
+    segment burns, and raw vented methane (GWP 25) outweighs the
+    combustion CO2 it saved. Total CO2e for the queue case comes out
+    *higher* than the sea case here, the reverse of the combustion-only
+    comparison above. Do not read Improvement 4's "queue doesn't cost as
+    much fuel as full-speed steaming" as "queue is always the lower-
+    emissions choice" -- it depends entirely on reliquefaction capacity,
+    per the next test."""
+    vessel = physical.VesselPerformance()  # reliq_capacity_mmbtu_per_day=0.0 default
+    sea = physical.VoyageSegment("sea", physical.OperatingState.LADEN_SEA, duration_days=5.0)
+    queue = physical.VoyageSegment("queue", physical.OperatingState.LADEN_QUEUE, duration_days=5.0)
+    discharge = physical.VoyageSegment("discharge", physical.OperatingState.DISCHARGE, duration_days=0.0)
+
+    sea_ledger = physical.run_voyage((sea, discharge), vessel, loaded_mmbtu=3_500_000.0)
+    queue_ledger = physical.run_voyage((queue, discharge), vessel, loaded_mmbtu=3_500_000.0)
+    queue_voyage = emissions.voyage_emissions(queue_ledger)
+
+    assert queue_ledger.vented_mmbtu > 0.0
+    assert queue_voyage.total_co2e_tonnes > emissions.voyage_emissions(sea_ledger).total_co2e_tonnes
+
+
+def test_queue_total_co2e_drops_below_sea_with_adequate_reliquefaction():
+    """Same two segments as the previous test, but with enough
+    reliquefaction capacity to fully absorb the queue's BOG surplus:
+    venting goes to zero and the combustion-only ordering (queue lower
+    than sea) is restored. This is what makes reliq_capacity_mmbtu_per_day
+    a genuinely consequential, not cosmetic, open decision
+    (docs/PHASE2_PLAN.md Section 10 item 2)."""
+    vessel = physical.VesselPerformance(reliq_capacity_mmbtu_per_day=5000.0)
+    sea = physical.VoyageSegment("sea", physical.OperatingState.LADEN_SEA, duration_days=5.0)
+    queue = physical.VoyageSegment("queue", physical.OperatingState.LADEN_QUEUE, duration_days=5.0)
+    discharge = physical.VoyageSegment("discharge", physical.OperatingState.DISCHARGE, duration_days=0.0)
+
+    sea_ledger = physical.run_voyage((sea, discharge), vessel, loaded_mmbtu=3_500_000.0)
+    queue_ledger = physical.run_voyage((queue, discharge), vessel, loaded_mmbtu=3_500_000.0)
+
+    assert queue_ledger.vented_mmbtu == pytest.approx(0.0)
     assert (
         emissions.voyage_emissions(queue_ledger).total_co2e_tonnes
         < emissions.voyage_emissions(sea_ledger).total_co2e_tonnes

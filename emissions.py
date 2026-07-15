@@ -6,18 +6,26 @@ docs/PHASE2_PLAN.md Section 5 and Section 8 step 4).
 Pure functions + dataclasses, no Streamlit import, same style as
 physical.py. Not wired into model.py, decision.py or app.py yet.
 
-KNOWN LIMITATION, not yet handled: physical.SegmentResult.vented_mmbtu
-(surplus natural BOG that exceeds both demand and reliquefaction capacity)
-is not counted as an emission here at all. If genuinely vented to
-atmosphere as raw, uncombusted methane, it should carry a much larger
-CO2e-per-tonne impact than the same mass burned (combustion converts CH4,
-GWP ~25-28, to CO2, GWP 1), not zero. Under every scenario exercised so
-far -- the legacy-equivalence routes at model.Params() defaults --
-vented_mmbtu is exactly 0, so this gap has no effect yet
-(tests/test_emissions.py's test_vented_methane_is_not_yet_counted makes
-this an explicit, tested limitation rather than a silent one). It must be
-closed before this module is trusted for any scenario where a route
-actually vents (e.g. high BOR with reliq_capacity_mmbtu_per_day=0).
+Vented gas (physical.SegmentResult.vented_mmbtu -- surplus natural BOG
+exceeding both demand and reliquefaction capacity) is counted as raw,
+uncombusted methane: the full mass, not a small slip fraction of it, since
+none of it passed through an engine. This was a KNOWN LIMITATION (silently
+zero) until docs/PHASE2_PLAN.md Section 8 step 6 found it was no longer
+hypothetical -- the congested Asia route vents ~148.7 t LNG-equivalent per
+round trip at the engine's default zero reliquefaction capacity, ~3,717 t
+CO2e if left uncounted, larger than the rest of that route's combustion
+emissions combined. ch4_slip_tonnes (from combustion) and ch4_vented_tonnes
+(never combusted) are exposed separately on SegmentEmissions/
+VoyageEmissions specifically so this doesn't get quietly re-buried inside
+one aggregate "ch4_tonnes" figure -- see docs/PHASE2_PLAN.md Section 10
+items 1-2 for the still-open questions this doesn't resolve (what
+reliquefaction capacity a real vessel actually has, and whether vented gas
+is flared rather than released raw in practice).
+
+Simplification, not yet refined: vented mass is converted to tonnes via
+LNG_MMBTU_PER_T and treated as 100% methane by mass. Pipeline-quality LNG
+boil-off is predominantly but not exactly pure methane; no compositional
+breakdown exists anywhere in this codebase to do better than that yet.
 """
 
 from __future__ import annotations
@@ -60,7 +68,9 @@ DEFAULT_N2O_KG_PER_T_LNG = 0.0  # not modelled: no defensible default exists yet
 class SegmentEmissions:
     segment_name: str
     co2_tonnes: float
-    ch4_tonnes: float
+    ch4_slip_tonnes: float
+    ch4_vented_tonnes: float
+    ch4_tonnes: float  # == ch4_slip_tonnes + ch4_vented_tonnes
     n2o_tonnes: float
     co2e_tonnes: float
     ets_scope_fraction: float
@@ -70,6 +80,8 @@ class SegmentEmissions:
 @dataclass(frozen=True)
 class VoyageEmissions:
     total_co2_tonnes: float
+    total_ch4_slip_tonnes: float
+    total_ch4_vented_tonnes: float
     total_ch4_tonnes: float
     total_n2o_tonnes: float
     total_co2e_tonnes: float
@@ -85,26 +97,36 @@ def segment_emissions(
     n2o_kg_per_t_lng: float = DEFAULT_N2O_KG_PER_T_LNG,
 ) -> SegmentEmissions:
     """CO2/CH4/N2O/CO2e for one segment result, derived from actual fuel
-    consumed in that segment -- not a static per-voyage constant.
+    consumed (and gas vented) in that segment -- not a static per-voyage
+    constant.
 
     LNG is only counted as burned in laden-state segments
     (physical.LADEN_STATES): physical.py never burns LNG during ballast,
     only heel BOG, which is either vented or met by liquid fuel under the
-    same shortfall rules as any other segment.
+    same shortfall rules as any other segment. Vented gas is not
+    state-gated the same way: physical.py's own reconciliation only ever
+    produces a nonzero vented_mmbtu on a laden-state segment today (ballast
+    starts at zero/near-zero heel, so has nothing to vent), but this
+    function does not assume that will always hold -- it reads whatever
+    vented_mmbtu the ledger actually reports.
     """
     is_laden = result.segment.state in physical.LADEN_STATES
-    lng_tonnes = (result.bog_burned_mmbtu + result.forced_lng_mmbtu) / LNG_MMBTU_PER_T if is_laden else 0.0
+    lng_burned_tonnes = (result.bog_burned_mmbtu + result.forced_lng_mmbtu) / LNG_MMBTU_PER_T if is_laden else 0.0
     vlsfo_tonnes = result.shortfall_liquid_fuel_tonnes
+    vented_tonnes = result.vented_mmbtu / LNG_MMBTU_PER_T
 
-    co2 = lng_tonnes * CO2_T_PER_T_LNG + vlsfo_tonnes * CO2_T_PER_T_VLSFO
-    ch4 = lng_tonnes * methane_slip_fraction
-    n2o = lng_tonnes * n2o_kg_per_t_lng / 1000.0
-    co2e = co2 + ch4 * GWP_CH4_100YR + n2o * GWP_N2O_100YR
+    co2 = lng_burned_tonnes * CO2_T_PER_T_LNG + vlsfo_tonnes * CO2_T_PER_T_VLSFO
+    ch4_slip = lng_burned_tonnes * methane_slip_fraction
+    ch4_vented = vented_tonnes  # full mass, not a slip fraction -- never combusted at all
+    ch4_total = ch4_slip + ch4_vented
+    n2o = lng_burned_tonnes * n2o_kg_per_t_lng / 1000.0
+    co2e = co2 + ch4_total * GWP_CH4_100YR + n2o * GWP_N2O_100YR
     scope = result.segment.ets_scope_fraction
 
     return SegmentEmissions(
-        segment_name=result.segment.name, co2_tonnes=co2, ch4_tonnes=ch4, n2o_tonnes=n2o,
-        co2e_tonnes=co2e, ets_scope_fraction=scope, ets_covered_co2e_tonnes=co2e * scope,
+        segment_name=result.segment.name, co2_tonnes=co2,
+        ch4_slip_tonnes=ch4_slip, ch4_vented_tonnes=ch4_vented, ch4_tonnes=ch4_total,
+        n2o_tonnes=n2o, co2e_tonnes=co2e, ets_scope_fraction=scope, ets_covered_co2e_tonnes=co2e * scope,
     )
 
 
@@ -128,6 +150,8 @@ def voyage_emissions(
     )
     return VoyageEmissions(
         total_co2_tonnes=sum(s.co2_tonnes for s in segments),
+        total_ch4_slip_tonnes=sum(s.ch4_slip_tonnes for s in segments),
+        total_ch4_vented_tonnes=sum(s.ch4_vented_tonnes for s in segments),
         total_ch4_tonnes=sum(s.ch4_tonnes for s in segments),
         total_n2o_tonnes=sum(s.n2o_tonnes for s in segments),
         total_co2e_tonnes=sum(s.co2e_tonnes for s in segments),

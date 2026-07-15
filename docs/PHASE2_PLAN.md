@@ -498,8 +498,8 @@ with everything else in Sections 3/9.
    silently absent: `vented_mmbtu` (surplus BOG exceeding both demand and
    reliquefaction capacity) is not counted as an emission at all yet. At
    the time step 4 landed this was exactly zero in every scenario
-   exercised -- **step 6 below changed that**, and closing this is now
-   genuinely load-bearing, not a hypothetical.
+   exercised -- **step 6 below changed that, and the gap was closed the
+   same day** (see step 6's writeup and Section 10 item 1).
 5. Physical/emissions invariant tests (Section 7, items 1-10) -- partially
    covered already by `test_emissions.py` (items 7-10) and
    `test_physical_engine.py` (items 2, 4, 6); items 1, 3, 5 remain.
@@ -546,18 +546,20 @@ with everything else in Sections 3/9.
    amount that dwarfs it. Reporting only the fuel-cost effect without the
    venting would be actively misleading.
 
-   **This escalates two of Section 10's open decisions from "needs
+   **This escalated two of Section 10's open decisions from "needs
    sign-off eventually" to "needs sign-off before step 8 (route-valuation
    wiring) or before any congested-Asia number is shown to a real user":**
-   - closing the vented-methane emissions gap (Section 4.4/emissions.py) is
-     no longer optional cleanup;
+   - closing the vented-methane emissions gap (Section 4.4/emissions.py) --
+     **done the same day**, see Section 10 item 1;
    - `reliq_capacity_mmbtu_per_day = 0.0` (no reliquefaction plant at all)
      is the *cause* of the entire vented amount -- real modern LNG
      carriers, especially 2-stroke tonnage, often do carry reliquefaction
      capacity precisely to handle exactly this scenario. Shipping a
      nonzero default without a real spec would be inventing a number; but
      shipping zero without flagging that the zero itself is what's
-     producing a multi-thousand-tonne CO2e result is worse.
+     producing a multi-thousand-tonne CO2e result is worse. **Still open**
+     -- this is a real vessel-spec question, not something further code
+     work resolves (Section 10 item 2).
 7. Reconciliation surface: add a "Physical reconciliation" expander to the
    existing Decision page (`app.py` page `"0 Decision"`) showing the
    `VoyageLedger` for the selected route -- **not** a new top-level page yet
@@ -602,26 +604,33 @@ listed here so scope creep is visible if it happens:
 
 ## 10. Open decisions needing sign-off
 
-Reordered after step 6's finding -- items 1 and 2 are now blocking (needed
-before step 8 wires this into route valuation, or before any congested-Asia
-number reaches a real user), not "eventually."
+Reordered after step 6's finding. Item 1 (the accounting gap) is now
+**closed** -- item 2 (the actual reliq-capacity *value*) is the one still
+blocking step 8, and is a real-world vessel-spec question this plan cannot
+answer by itself.
 
-1. **BLOCKING, escalated by step 6.** Vented methane is not counted as an
-   emission (`emissions.py`'s KNOWN LIMITATION). No longer hypothetical: the
-   congested Asia route already produces ~148.7 t LNG-equivalent vented per
-   round trip, ~3,717 t CO2e if counted as raw methane -- larger than the
-   rest of that route's combustion emissions combined. Needs a
-   vented-gas CO2e treatment before step 8, or an explicit, visible
-   "venting not priced" warning on any congested-Asia output in the
-   interim (mirroring the `NOT_PRICED` FuelEU pattern in item 4 below).
-2. **BLOCKING, escalated by step 6.** `reliq_capacity_mmbtu_per_day = 0.0`
-   (no reliquefaction plant at all) is the direct cause of item 1's vented
-   amount -- real modern LNG carriers, especially 2-stroke tonnage, often
-   carry reliquefaction capacity precisely to handle this. Needs a real
-   vessel spec (does this vessel class have a reliq plant, and what
-   capacity?) or an explicit, visible flag that the zero default is known
-   to be driving a multi-thousand-tonne CO2e result, not a neutral
-   placeholder.
+1. **CLOSED**, same day as escalation. Vented methane is now counted as raw
+   CH4 in `emissions.py` (`ch4_vented_tonnes`, distinct from combustion
+   `ch4_slip_tonnes`, both feeding `total_co2e_tonnes`). Verified: the
+   congested Asia route's ~148.7 t LNG-equivalent vent now contributes
+   ~3,717 t CO2e to that route's total, not zero. A further, related
+   finding while closing this: a queue segment's *combustion-only* CO2 is
+   still lower than an equal-duration sea segment's (Improvement 4 holds
+   for fuel cost), but at zero reliquefaction capacity its *total* CO2e
+   (including the now-counted vent) can come out *higher* than the sea
+   segment's -- "queue costs less fuel" and "queue emits less" are not the
+   same claim once venting is priced, and only converge back with adequate
+   reliquefaction (verified both ways in `tests/test_emissions.py`).
+2. **BLOCKING.** `reliq_capacity_mmbtu_per_day = 0.0` (no reliquefaction
+   plant at all) is the direct cause of item 1's vented amount -- real
+   modern LNG carriers, especially 2-stroke tonnage, often carry
+   reliquefaction capacity precisely to handle this. This is a real vessel
+   spec question (does this vessel class have a reliq plant, and what
+   capacity?) that no amount of further code work resolves -- needs an
+   actual answer, or an explicit, visible flag on any congested-Asia
+   output that the zero default is known to be driving a
+   multi-thousand-tonne CO2e result, not a neutral placeholder, before
+   step 8 or before a real user sees that number.
 3. **Section 3**: confirm `model.strip()` / `RENEWAL_RATE_SCREEN` stays
    permanently on the old formula (recommended), vs. a future phase
    eventually retiring it in favour of the physical engine with
