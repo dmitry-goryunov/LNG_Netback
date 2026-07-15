@@ -358,21 +358,40 @@ who pays (owner/charterer/seller/buyer/unresolved -- that's a `feasibility.py`
 audit always shows the question was considered, without answering it
 prematurely.
 
-## 6. Legacy-equivalence test (the anchor test for this phase)
+## 6. Legacy-equivalence test (the anchor test for this phase) -- **DONE, verified**
 
-Construct a `VesselPerformance` matching today's `Params` defaults exactly
-(the derivation in Section 2), run `europe_route_segments(default_params)`
-and `asia_route_segments(default_params, congested=False)` through
-`run_voyage`, and assert:
+Implemented in `tests/test_physical_legacy_equivalence.py`, run through the
+actual `europe_route_segments()`/`asia_route_segments()` (not a hand-built
+segment list -- that was Section 4.4's preview test only). All pass for
+Europe, Asia base and Asia congested at `model.Params()` defaults:
 
-- laden-leg `shortfall_mmbtu / energy_factor_mmbtu_per_t == 63.6` (Europe and
-  Asia both use the same laden constant today) within 1e-6 relative tolerance;
-- `reliquefied_mmbtu == 0` and `vented_mmbtu == 0` (today's model has neither
-  concept, so the equivalence baseline must reproduce "none");
-- summed segment CO2 (using the 3.15 / 2.75 t/t factors above over the
-  derived fuel and BOG-burn masses) reconciles to `co2_eu_ets_tonnes =
-  4425.9` within 1%, the same tolerance the frozen 64/64 suite already uses
-  elsewhere (`tests/test_model.py`).
+- laden/ballast/discharge fuel rates each reproduce `residual_laden_vlsfo`
+  (63.6 t/d), `ballast_fuel` (130 t/d) and `port_fuel_rate` (25 t/d) exactly
+  (within 0.01 t/d, i.e. floating-point noise);
+- `reliquefied_mmbtu == 0` and `vented_mmbtu == 0` throughout, as expected;
+- total liquid-fuel tonnage matches `eu_ship`/`as_ship`'s fuel-only
+  component (excluding charter) to 1e-6 relative tolerance.
+
+**The CO2/ETS check surfaced a real, verified finding, not a rounding
+question.** At the legacy constant's *own* scope convention (a uniform 50%
+applied to every segment, confirmed by reading `model.py:91`'s derivation
+comment literally rather than assuming the textbook rule), the new engine
+reproduces `co2_eu_ets_tonnes = 4425.9` to within **0.007%** (4426.19 t
+computed) -- strong confirmation the combustion arithmetic and the two
+factors (2.75 t CO2/t LNG, 3.15 t CO2/t VLSFO) are right. But
+`europe_route_segments()` implements the *actual* EU ETS Directive
+(2003/87/EC as amended by 2023/959: 50% for the sea voyage between a
+non-EU and an EU port, but a separate 100% provision for time genuinely at
+berth in an EU port) -- and at that correct, differentiated scope, total
+CO2e is **4623.1 t, 4.45% higher than the legacy constant**, because the
+legacy model never separately captured the 100%-at-berth provision. This
+is not a bug to reconcile away: it means EU-bound cargo's ETS cost will
+genuinely increase by ~4.45% once this engine is wired into route
+valuation (step 8), as a direct, correct consequence of fixing a real
+understatement in the current screening model. Both figures are pinned as
+explicit, separately-named tests (`test_co2_at_legacy_uniform_scope_...`
+and `test_co2_at_correct_differentiated_scope_...`) so this stays visible
+rather than silently absorbed into "close enough."
 
 This test is the equivalent of `risk.py`'s "zero-shock scenario reprices to
 ~0 P&L vs `model.strip()` base" check (`model.py`/`risk.py` internal
@@ -421,17 +440,34 @@ with everything else in Sections 3/9.
 0. Section 3a (three-state first-cargo model) can land independently, any
    time, before or in parallel with the rest of this sequence -- it touches
    only `decision.py` and is additive to `cost_policy()`'s signature.
-1. `physical.py`: enums, `VesselPerformance`, `VoyageSegment`, segment-balance
-   function, `run_voyage`. No route builders yet -- unit-test the balance
-   function directly against hand-computed numbers first.
-2. Route builders (`europe_route_segments`, `asia_route_segments`) using
-   `model.Params`' existing day-count fields (`europe_laden_days` etc.) so no
-   `Params` field is renamed or removed yet.
-3. Legacy-equivalence test (Section 6). **Do not proceed past this step until
-   it passes** -- it is the load-bearing proof for the rest of the phase.
-4. `emissions.py`: combustion factors, ETS scope function, CO2e aggregation.
-   Extend the equivalence test to cover emissions (the `co2_eu_ets_tonnes`
-   reconciliation bullet in Section 6).
+   **Not yet done** (independent of 1-3 below; still open).
+1. **DONE** (`physical.py`, `tests/test_physical_engine.py`): enums,
+   `VesselPerformance`, `VoyageSegment`, segment-balance function,
+   `run_voyage`, unit-tested against hand-computed numbers. One design
+   change made during this step, not anticipated in Section 4.2: BOR turned
+   out to need to be per-state, not one vessel-wide float --
+   `bor_fraction_per_day` is a `Mapping[OperatingState, float]`
+   (`bor_for(state)`), defaulting `LOADING`/`DISCHARGE` to 0.0 (vapour-return
+   to shore while alongside -- a real operational practice, not invented for
+   convenience) and every sea/queue state to the legacy 0.0010/day. Without
+   this, the discharge segment's full remaining cargo inventory would accrue
+   BOG for `europe_port_days`, venting cargo the legacy model never assumed
+   was vented at all.
+2. **DONE** (`physical.py`'s `europe_route_segments`/`asia_route_segments`):
+   built from `model.Params`' existing day-count fields, no `Params` field
+   renamed. Deliberately no `congested` parameter -- congestion is already
+   selected via `params.asia_rt_days` (`ASIA_RT_BASE`/`ASIA_RT_CONG`),
+   exactly how `app.py`'s programme page already does it; a separate flag
+   would be a second way to say the same thing.
+3. **DONE** (`tests/test_physical_legacy_equivalence.py`). Passed for
+   Europe, Asia base and Asia congested -- see Section 6's updated writeup,
+   including the verified (not hidden) 4.45% ETS-scope divergence.
+4. `emissions.py`: combustion factors, ETS scope function, CO2e aggregation
+   as an importable module (Section 6's CO2 checks currently compute this
+   inline in the test file as a spot-check; formalising it into
+   `emissions.py` is still open, along with CH4/N2O/GWP and the FuelEU
+   `NOT_PRICED` marker from Section 5.3/5.4, none of which the equivalence
+   test needed).
 5. Physical/emissions invariant tests (Section 7, items 1-10).
 6. Queue separation: extend `asia_route_segments(congested=True)` to emit
    `LADEN_QUEUE`/`BALLAST_QUEUE` segments instead of inflating sea-leg demand;

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping
 
+import model
+
 ABS_TOL_MMBTU = 1e-6
 
 
@@ -70,6 +72,27 @@ def _default_demand_table() -> dict:
     }
 
 
+def _default_bor_table() -> dict:
+    # Boil-off rate is per-state, not one vessel-wide constant: while
+    # alongside for loading or discharge, an LNGC is connected to the
+    # terminal's vapour-return line, so boil-off is handled shoreside and
+    # does not accrue as ship-retained BOG -- a real, independently
+    # justified operational practice, not just a convenience for matching
+    # the legacy model. Sea/queue states use the legacy boil_off_rate
+    # (0.0010/day) uniformly, matching model.Params.boil_off_rate.
+    rate = 0.0010
+    return {
+        OperatingState.LOADING: 0.0,
+        OperatingState.LADEN_SEA: rate,
+        OperatingState.LADEN_QUEUE: rate,
+        OperatingState.CANAL_TRANSIT: rate,
+        OperatingState.DISCHARGE: 0.0,
+        OperatingState.BALLAST_SEA: rate,
+        OperatingState.BALLAST_QUEUE: rate,
+        OperatingState.PORT: rate,
+    }
+
+
 @dataclass(frozen=True)
 class VesselPerformance:
     """User-editable, one instance per vessel class.
@@ -86,7 +109,7 @@ class VesselPerformance:
 
     energy_factor_mmbtu_per_t: float = 40.5093
     demand_mmbtu_per_day: Mapping[OperatingState, float] = field(default_factory=_default_demand_table)
-    bor_fraction_per_day: float = 0.0010
+    bor_fraction_per_day: Mapping[OperatingState, float] = field(default_factory=_default_bor_table)
     reliq_capacity_mmbtu_per_day: float = 0.0
     shortfall_source: ShortfallSource = ShortfallSource.LIQUID_FUEL
 
@@ -95,6 +118,12 @@ class VesselPerformance:
             return self.demand_mmbtu_per_day[state]
         except KeyError as exc:
             raise ValueError(f"no demand rate configured for operating state {state!r}") from exc
+
+    def bor_for(self, state: OperatingState) -> float:
+        try:
+            return self.bor_fraction_per_day[state]
+        except KeyError as exc:
+            raise ValueError(f"no boil-off rate configured for operating state {state!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -160,7 +189,7 @@ class VoyageLedger:
 def simulate_segment(segment: VoyageSegment, vessel: VesselPerformance, opening_inventory_mmbtu: float) -> SegmentResult:
     """One segment's mass balance (docs/PHASE2_PLAN.md Section 4.4):
 
-        BOG_natural = inventory_in * BOR * days
+        BOG_natural = inventory_in * BOR[state] * days
         Demand      = DemandPerDay[state] * days
         BOG_burn    = min(BOG_natural, Demand)
         Surplus     = max(BOG_natural - Demand, 0)
@@ -175,7 +204,7 @@ def simulate_segment(segment: VoyageSegment, vessel: VesselPerformance, opening_
         raise ValueError(f"segment {segment.name!r}: negative opening inventory {opening_inventory_mmbtu}")
     opening_inventory_mmbtu = max(opening_inventory_mmbtu, 0.0)
 
-    natural_bog = opening_inventory_mmbtu * vessel.bor_fraction_per_day * segment.duration_days
+    natural_bog = opening_inventory_mmbtu * vessel.bor_for(segment.state) * segment.duration_days
     demand = vessel.demand_for(segment.state) * segment.duration_days
     bog_burned = min(natural_bog, demand)
     surplus = max(natural_bog - demand, 0.0)
@@ -280,4 +309,54 @@ def run_voyage(
         other_loss_mmbtu=other_loss_mmbtu, lng_burned_mmbtu=lng_burned, vented_mmbtu=vented,
         reliquefied_mmbtu=reliquefied, total_liquid_fuel_tonnes=liquid_fuel,
         total_days=total_days, segments=tuple(results),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Route builders (docs/PHASE2_PLAN.md Section 8 step 2)
+#
+# These deliberately reproduce today's model.strip() route structure
+# exactly -- one laden-sea leg, one discharge/port call, one ballast-sea
+# leg -- with no separate canal or queue segments yet, because the legacy
+# model doesn't isolate canal transit or congestion time from ordinary
+# laden/ballast sea time either (ASIA_LEG_DAYS already folds in a 1-day
+# canal allowance; ASIA_RT_CONG folds in 4 waiting days per leg, both at
+# the full sea-passage rate). Queue/canal separation is step 6, done only
+# after the legacy-equivalence test below passes -- introducing it now
+# would make this route diverge from the number it needs to reproduce.
+# ---------------------------------------------------------------------------
+
+
+def europe_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
+    """Europe round trip: loading (zero duration -- the legacy model has no
+    separate loading time or loading fuel, only a commercial $/MMBtu
+    loading cost applied elsewhere) -> laden sea -> discharge/port ->
+    ballast sea. Total duration equals params.europe_laden_days +
+    europe_port_days + europe_ballast_days, i.e. model.py's europe_rt."""
+    return (
+        VoyageSegment("loading", OperatingState.LOADING, duration_days=0.0, ets_scope_fraction=0.5),
+        VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=params.europe_laden_days,
+                      ets_scope_fraction=0.5),
+        VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=params.europe_port_days,
+                      ets_scope_fraction=1.0),
+        VoyageSegment("ballast_sea", OperatingState.BALLAST_SEA, duration_days=params.europe_ballast_days,
+                      ets_scope_fraction=0.5),
+    )
+
+
+def asia_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
+    """Asia round trip (base or congested, according to params.asia_rt_days
+    /params.asia_laden_days as already configured on params -- this
+    function does not itself choose between base and congested). Same
+    structural simplification as europe_route_segments: no separate canal
+    or queue segments yet. Every segment is outside EU ETS scope, matching
+    the legacy model's ets line only ever being added to eu_margin."""
+    asia_laden = params.asia_laden_days
+    asia_port = params.asia_port_days
+    asia_ballast = params.asia_rt_days - asia_laden - asia_port
+    return (
+        VoyageSegment("loading", OperatingState.LOADING, duration_days=0.0, ets_scope_fraction=0.0),
+        VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=asia_laden, ets_scope_fraction=0.0),
+        VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=asia_port, ets_scope_fraction=0.0),
+        VoyageSegment("ballast_sea", OperatingState.BALLAST_SEA, duration_days=asia_ballast, ets_scope_fraction=0.0),
     )

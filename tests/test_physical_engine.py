@@ -1,11 +1,11 @@
-"""Unit tests for physical.py's segment-balance primitives (docs/PHASE2_PLAN.md
-Section 8 step 1). No workbook dependency -- physical.py doesn't read
-data.py at all, so these run without LNG_HISTORY_XLSX.
+"""Unit tests for physical.py's segment-balance primitives and route
+builders (docs/PHASE2_PLAN.md Section 8 steps 1-2). No workbook
+dependency -- physical.py only imports model.py for the Params type used
+by the route builders, not data.py, so these run without LNG_HISTORY_XLSX.
 
-Route builders and the legacy-equivalence test against model.py's implicit
-constants are a later increment; test_legacy_laden_leg_shortfall_matches_
-residual_laden_vlsfo below is a preview of that proof using a hand-built
-single-segment voyage, not the full route.
+The full legacy-equivalence test against model.py's implicit constants,
+run through the actual route builders, is in
+tests/test_physical_legacy_equivalence.py (Section 8 step 3).
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def test_shortfall_case_matches_hand_computation():
     shortfall=10 MMBtu met by liquid fuel at the vessel's energy factor."""
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 15.0},
-        bor_fraction_per_day=0.01,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.01},
         energy_factor_mmbtu_per_t=40.0,
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=2.0)
@@ -56,7 +56,7 @@ def test_surplus_with_no_reliquefaction_all_vented():
     """demand below natural BOG, zero reliq capacity -> all surplus vented."""
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 5.0},
-        bor_fraction_per_day=0.01,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.01},
         reliq_capacity_mmbtu_per_day=0.0,
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=2.0)
@@ -75,7 +75,7 @@ def test_surplus_with_no_reliquefaction_all_vented():
 def test_full_reliquefaction_capacity_eliminates_venting():
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 5.0},
-        bor_fraction_per_day=0.01,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.01},
         reliq_capacity_mmbtu_per_day=100.0,  # far more than any plausible surplus
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=2.0)
@@ -91,7 +91,7 @@ def test_full_reliquefaction_capacity_eliminates_venting():
 def test_partial_reliquefaction_capacity_caps_reliquefied_not_vented():
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 5.0},
-        bor_fraction_per_day=0.01,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.01},
         reliq_capacity_mmbtu_per_day=3.0,  # 6 MMBtu over 2 days, less than the 10 MMBtu surplus
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=2.0)
@@ -105,7 +105,7 @@ def test_partial_reliquefaction_capacity_caps_reliquefied_not_vented():
 def test_forced_vaporisation_shortfall_mode_draws_down_inventory_not_liquid_fuel():
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 15.0},
-        bor_fraction_per_day=0.01,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.01},
         shortfall_source=ShortfallSource.FORCED_VAPORISATION,
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=2.0)
@@ -129,12 +129,18 @@ def test_demand_exceeding_available_cargo_raises_rather_than_going_negative():
     """FORCED_VAPORISATION with demand the inventory can never cover."""
     vessel = _vessel(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 1000.0},
-        bor_fraction_per_day=0.0,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.0},
         shortfall_source=ShortfallSource.FORCED_VAPORISATION,
     )
     seg = VoyageSegment("leg", OperatingState.LADEN_SEA, duration_days=5.0)
     with pytest.raises(ValueError, match="closing inventory would go negative"):
         simulate_segment(seg, vessel, opening_inventory_mmbtu=10.0)
+
+
+def test_bor_for_unconfigured_state_raises_clear_error():
+    vessel = _vessel(bor_fraction_per_day={OperatingState.LADEN_SEA: 0.001})
+    with pytest.raises(ValueError, match="no boil-off rate configured"):
+        vessel.bor_for(OperatingState.BALLAST_SEA)
 
 
 # --- VoyageSegment validation ----------------------------------------------
@@ -151,14 +157,20 @@ def test_segment_rejects_out_of_range_ets_scope():
 
 # --- run_voyage: multi-segment chaining and reconciliation -----------------
 
-def _simple_voyage_vessel() -> VesselPerformance:
+def _simple_voyage_vessel(bor: float = 0.01) -> VesselPerformance:
     return VesselPerformance(
         demand_mmbtu_per_day={
             OperatingState.LADEN_SEA: 15.0,
             OperatingState.DISCHARGE: 0.0,
             OperatingState.BALLAST_SEA: 8.0,
         },
-        bor_fraction_per_day=0.01,
+        # DISCHARGE fixed at 0 (vapour-return -- see physical._default_bor_table),
+        # laden/ballast sea share the same rate unless a test varies it.
+        bor_fraction_per_day={
+            OperatingState.LADEN_SEA: bor,
+            OperatingState.DISCHARGE: 0.0,
+            OperatingState.BALLAST_SEA: bor,
+        },
         energy_factor_mmbtu_per_t=40.0,
     )
 
@@ -212,15 +224,8 @@ def test_higher_bor_cannot_increase_delivered_cargo():
         VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=0.5),
         VoyageSegment("ballast", OperatingState.BALLAST_SEA, duration_days=2.0),
     )
-    low_bor = VesselPerformance(
-        demand_mmbtu_per_day={OperatingState.LADEN_SEA: 15.0, OperatingState.DISCHARGE: 0.0,
-                               OperatingState.BALLAST_SEA: 8.0},
-        bor_fraction_per_day=0.001,
-    )
-    high_bor = VesselPerformance(
-        demand_mmbtu_per_day=low_bor.demand_mmbtu_per_day,
-        bor_fraction_per_day=0.05,
-    )
+    low_bor = _simple_voyage_vessel(bor=0.001)
+    high_bor = _simple_voyage_vessel(bor=0.05)
     delivered_low = run_voyage(segments_for(), low_bor, loaded_mmbtu=1000.0).delivered_mmbtu
     delivered_high = run_voyage(segments_for(), high_bor, loaded_mmbtu=1000.0).delivered_mmbtu
 
@@ -243,6 +248,15 @@ def test_queue_demand_below_sea_demand_at_default_rates():
     assert vessel.demand_for(OperatingState.BALLAST_QUEUE) < vessel.demand_for(OperatingState.BALLAST_SEA)
 
 
+def test_loading_and_discharge_default_to_zero_bor():
+    """Vapour-return assumption (physical._default_bor_table): while
+    alongside, boil-off is handled shoreside, not ship-retained."""
+    vessel = VesselPerformance()
+    assert vessel.bor_for(OperatingState.LOADING) == 0.0
+    assert vessel.bor_for(OperatingState.DISCHARGE) == 0.0
+    assert vessel.bor_for(OperatingState.LADEN_SEA) > 0.0
+
+
 # --- Preview of the legacy-equivalence proof (full version needs route builders) --
 
 def test_legacy_laden_leg_shortfall_matches_residual_laden_vlsfo():
@@ -255,7 +269,7 @@ def test_legacy_laden_leg_shortfall_matches_residual_laden_vlsfo():
     eu_laden_days = 4900.0 / (19.5 * 24.0)  # model.EU_LEG_DAYS, duplicated to avoid importing model.py here
     vessel = VesselPerformance(
         demand_mmbtu_per_day={OperatingState.LADEN_SEA: 150.0 * 40.5093, OperatingState.DISCHARGE: 0.0},
-        bor_fraction_per_day=0.0010,
+        bor_fraction_per_day={OperatingState.LADEN_SEA: 0.0010, OperatingState.DISCHARGE: 0.0},
         energy_factor_mmbtu_per_t=40.5093,
         reliq_capacity_mmbtu_per_day=0.0,
     )
@@ -270,3 +284,40 @@ def test_legacy_laden_leg_shortfall_matches_residual_laden_vlsfo():
     assert laden_result.vented_mmbtu == pytest.approx(0.0)
     implied_vlsfo_t_per_day = ledger.total_liquid_fuel_tonnes / eu_laden_days
     assert implied_vlsfo_t_per_day == pytest.approx(63.6, abs=0.01)
+
+
+# --- Route builders (Section 8 step 2) --------------------------------------
+
+def test_europe_route_segments_total_duration_matches_europe_rt():
+    import model
+    params = model.Params()
+    segments = physical.europe_route_segments(params)
+    total = sum(s.duration_days for s in segments)
+    assert total == pytest.approx(params.europe_laden_days + params.europe_port_days + params.europe_ballast_days)
+    assert [s.state for s in segments] == [
+        OperatingState.LOADING, OperatingState.LADEN_SEA, OperatingState.DISCHARGE, OperatingState.BALLAST_SEA,
+    ]
+
+
+def test_asia_route_segments_total_duration_matches_asia_rt_base_and_congested():
+    import model
+    base_params = model.Params(asia_rt_days=model.ASIA_RT_BASE)
+    cong_params = model.Params(asia_rt_days=model.ASIA_RT_CONG)
+    base_total = sum(s.duration_days for s in physical.asia_route_segments(base_params))
+    cong_total = sum(s.duration_days for s in physical.asia_route_segments(cong_params))
+    assert base_total == pytest.approx(model.ASIA_RT_BASE)
+    assert cong_total == pytest.approx(model.ASIA_RT_CONG)
+
+
+def test_asia_route_segments_are_all_outside_ets_scope():
+    import model
+    params = model.Params()
+    assert all(s.ets_scope_fraction == 0.0 for s in physical.asia_route_segments(params))
+
+
+def test_europe_route_segments_discharge_is_full_ets_scope():
+    import model
+    params = model.Params()
+    segments = {s.state: s for s in physical.europe_route_segments(params)}
+    assert segments[OperatingState.DISCHARGE].ets_scope_fraction == 1.0
+    assert segments[OperatingState.LADEN_SEA].ets_scope_fraction == 0.5

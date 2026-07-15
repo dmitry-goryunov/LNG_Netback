@@ -53,3 +53,33 @@ The programme optimiser in this build uses legacy voyage physics and legacy mont
 - Streamlit headless decision and risk-page smoke checks: passed.
 
 See `test_results/` for captured output and hashes.
+
+## Progress since v2.3-phase1
+
+Not part of the build recorded above; listed here so this file stays an
+accurate index rather than going stale. See individual commit messages for
+full detail; `docs/PHASE2_PLAN.md` is the governing plan for the physical
+engine work specifically.
+
+- 36-month forward strip (was 12) on the Decision and Forward-strip pages,
+  with a multi-tenor FX curve replacing linear extrapolation past 1Y.
+  Sensitivities/Hedging/VaR & stress deliberately stay at 12 months.
+- Decision-page waterfalls showing programme value build-up, per-cargo
+  cost breakdowns, and an explicit sunk-cost add-back bar (procurement and
+  loading are shown as real costs, then reversed, not just omitted).
+- Two "all months in one place" graphs (any cost/revenue line across the
+  full strip; programme value across every possible start month), and a
+  fix for a pre-existing alphabetical- vs chronological-sort bug these
+  exposed in the two original forward-strip charts.
+- Phase 2 (`docs/PHASE2_PLAN.md`) steps 1-3 of 9: `physical.py`'s
+  segment-level mass-balance engine and route builders, standalone and not
+  yet wired into `model.py`/`decision.py`/`app.py`. The legacy-equivalence
+  test (`tests/test_physical_legacy_equivalence.py`) passes for Europe and
+  both Asia cases, and surfaced a real, verified finding along the way: the
+  legacy `co2_eu_ets_tonnes` constant used a uniform 50% ETS-scope factor
+  where the actual EU ETS Directive requires 100% for time at berth --
+  correcting this will raise EU-bound ETS cost by ~4.45% once wired into
+  route valuation (step 8, not yet done). 38 new tests across three files
+  (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`, and
+  the extended-strip suite), all passing alongside an unaffected legacy
+  64/64.
