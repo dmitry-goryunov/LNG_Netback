@@ -11,6 +11,7 @@ DataFrame.attrs so the UI can show "snapped-date" captions.
 
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 from dataclasses import dataclass, asdict
 
@@ -175,6 +176,54 @@ def fx_curve(spot: float, o6: float, o1: float, D):
     return fx
 
 
+FX_YEAR_TENORS = (2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+
+def fx_curve_multi(fx_row, D):
+    """Returns fx(m) callable: piecewise-linear interpolation through every
+    real anchor available on fx_row -- spot (t=0), 6M (t=6), 1Y (t=12),
+    then 2Y..10Y (t=24..120) from data.load_fx()'s o_y2..o_y10 columns --
+    extrapolating only beyond the single last available anchor.
+
+    This exists only for strips requested beyond 12 months
+    (strip(..., n_months>12)). fx_curve() above is unchanged and remains
+    what every n_months<=12 call uses, including every frozen legacy
+    fixture, so this function can never affect them.
+
+    Degrades gracefully: any missing o_y* column is skipped, so with only
+    legacy (pre-Improvement-6) data this reduces to the same three anchors
+    as fx_curve() -- but still extrapolates past 1Y rather than 10Y in
+    that case, since there is nothing further to interpolate through. The
+    resulting fx function exposes `.max_anchor_months` (the last anchor's
+    t) so callers can flag rows that fall beyond it as extrapolated,
+    exactly as they already do for the 12-month curve's 1Y boundary.
+    """
+    D = pd.Timestamp(D)
+    anchors: list[tuple[float, float]] = [
+        (0.0, float(fx_row["spot"])),
+        (6.0, float(fx_row["o6"])),
+        (12.0, float(fx_row["o1"])),
+    ]
+    for years in FX_YEAR_TENORS:
+        v = fx_row.get(f"o_y{years}")
+        if v is not None and pd.notna(v):
+            anchors.append((years * 12.0, float(v)))
+    anchors.sort(key=lambda a: a[0])
+    tenors = [a[0] for a in anchors]
+
+    def fx(m: pd.Timestamp) -> float:
+        mid = pd.Timestamp(year=m.year, month=m.month, day=15)
+        t = (mid - D).days / 30.44
+        i = bisect.bisect_right(tenors, t)
+        i = max(1, min(i, len(anchors) - 1))
+        t0, v0 = anchors[i - 1]
+        t1, v1 = anchors[i]
+        return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+
+    fx.max_anchor_months = tenors[-1]
+    return fx
+
+
 # ---------------------------------------------------------------------------
 # Step 6 -- per load month
 # ---------------------------------------------------------------------------
@@ -194,13 +243,24 @@ class SnapInfo:
     s: int
 
 
-def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
-    """Section 2-3 Step 1-6, vectorised over the 12 load months F..F+11.
+def strip(D, tables, params: Params = Params(), n_months: int = 12) -> pd.DataFrame:
+    """Section 2-3 Step 1-6, vectorised over `n_months` load months F..F+n-1.
 
     `tables` is a data.CurveTables (or any object exposing .hh/.ttf/.jkm/
     .fx/.charter DataFrames with the schema produced by data.py's
-    loaders). Returns a 12-row DataFrame; snap/contract-calendar info is
-    attached at df.attrs["snap"] (a SnapInfo).
+    loaders). Returns an n_months-row DataFrame; snap/contract-calendar
+    info is attached at df.attrs["snap"] (a SnapInfo).
+
+    n_months defaults to 12 and, at that default, is byte-identical to
+    every prior version of this function -- it uses fx_curve() exactly as
+    before (spot/6M/1Y, extrapolated past 1Y). This is what the frozen
+    legacy regression suite calls and must never change. n_months>12 uses
+    fx_curve_multi() instead, which interpolates through real 2Y-10Y FX
+    anchors rather than extrapolating past 1Y; it can extend up to
+    whatever HH/TTF/JKM forward columns tables actually has (this real
+    workbook: HH/TTF 64 columns, JKM 44 columns, comfortably covering 36
+    months) and raises ValueError rather than a confusing KeyError if
+    n_months exceeds what's available.
     """
     D = pd.Timestamp(D)
 
@@ -214,9 +274,25 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
     charter = params.charter_override if charter_overridden else float(ch_row["rate174"])
 
     F, s = contract_calendar(D)
-    fxfn = fx_curve(float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"]), D)
 
-    months = load_months(F, 12)
+    max_jkm_idx = n_months + 1 - s
+    hh_cols = sum(1 for c in hh_row.index if c.startswith("c"))
+    ttf_cols = sum(1 for c in ttf_row.index if c.startswith("c"))
+    jkm_cols = sum(1 for c in jkm_row.index if c.startswith("c"))
+    if n_months > hh_cols or n_months > ttf_cols or max_jkm_idx > jkm_cols:
+        raise ValueError(
+            f"n_months={n_months} exceeds available forward columns on {D.date()}: "
+            f"HH has {hh_cols}, TTF has {ttf_cols}, JKM has {jkm_cols} (needs {max_jkm_idx})"
+        )
+
+    if n_months <= 12:
+        fxfn = fx_curve(float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"]), D)
+        fx_extrap_boundary = 12.0
+    else:
+        fxfn = fx_curve_multi(fx_row, D)
+        fx_extrap_boundary = fxfn.max_anchor_months
+
+    months = load_months(F, n_months)
 
     cargo = params.cargo_size
     bo = params.boil_off_rate
@@ -235,7 +311,7 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         fx_l = fxfn(L)
         fx_mid = pd.Timestamp(year=L.year, month=L.month, day=15)
         fx_tenor_months = (fx_mid - D).days / 30.44
-        fx_extrapolated = fx_tenor_months > 12.0
+        fx_extrapolated = fx_tenor_months > fx_extrap_boundary
 
         proc = hh_l * params.hh_grossup + params.liquefaction_toll + params.pipeline
         ttf_usd = ttf_l * fx_l / 3.412
@@ -315,6 +391,7 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         fx_date=fx_row["date"], charter_date=ch_row["date"], charter_rate=charter,
         charter_overridden=charter_overridden, F=F, s=s,
     )
+    out.attrs["fx_extrap_boundary_months"] = fx_extrap_boundary
     return out
 
 

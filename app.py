@@ -30,6 +30,16 @@ import risk
 
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 
+# Decision and Forward-strip pages show this many forward months. HH/TTF
+# have 64 forward columns and JKM 44 in the real workbook (comfortably
+# covers 36); the FX curve now interpolates through real 2Y-10Y anchors
+# instead of extrapolating past 1Y for anything beyond month 12
+# (model.fx_curve_multi). Sensitivities/Hedging/VaR & stress deliberately
+# stay at 12 months -- they call risk.py functions that independently
+# call model.strip() with its 12-month default internally; extending
+# those is a separate change to risk.py, not just this constant.
+STRIP_MONTHS = 36
+
 # ===========================================================================
 # Waterfall / flow chart builders (pure Plotly; read model.waterfall_
 # breakdown() output only -- no recalculation here). This is the netback
@@ -116,6 +126,23 @@ def _decision_waterfall_lines(bd: dict, sunk: bool) -> tuple[list, float]:
     addback = sum(v for n, v in bd["lines"] if n in {"Procurement", "Loading"})
     lines = bd["lines"] + [("Sunk cost add-back", -addback)]
     return lines, bd["margin"] + addback
+
+
+def _fx_warning(strip_df) -> None:
+    """Shows the FX extrapolation warning, if any rows need it, naming the
+    actual anchor boundary used (1Y for a 12-month strip's fx_curve(), or
+    the last real 2Y-10Y anchor for a longer strip's fx_curve_multi()) --
+    not a hardcoded "1Y" that would be wrong once strips can run past it."""
+    fx_rows = model.fx_extrapolated_rows(strip_df)
+    if fx_rows.empty:
+        return
+    boundary = strip_df.attrs.get("fx_extrap_boundary_months", 12.0)
+    boundary_label = "1Y" if boundary <= 12.0 else f"{boundary / 12.0:,.0f}Y"
+    labels = ", ".join(fx_rows["month_label"].astype(str))
+    st.warning(
+        f"FX curve warning: {labels} lie beyond the available {boundary_label} outright and "
+        "are linearly extrapolated in the current screening model."
+    )
 
 
 def _plotly_programme_waterfall(title: str, legs, residual_days: float, residual_value: float,
@@ -319,12 +346,12 @@ CAVEATS = (
 
 if PAGE == "0 Decision":
     st.title("LNG cargo and vessel decision")
-    strip_df = model.strip(D, tables, params)
+    strip_df = model.strip(D, tables, params, n_months=STRIP_MONTHS)
     snap_info = strip_df.attrs["snap"]
     months = list(strip_df["month_label"])
     month_index = st.selectbox(
         "Current cargo load month",
-        options=list(range(12)),
+        options=list(range(len(strip_df))),
         format_func=lambda i: f"M{i + 1} = {months[i]}",
     )
 
@@ -407,7 +434,8 @@ if PAGE == "0 Decision":
         st.subheader("Discrete one-vessel programme")
         c1, c2, c3 = st.columns(3)
         horizon = c1.number_input("Programme horizon (days)", min_value=1.0, value=52.0, step=1.0)
-        max_additional = c2.number_input("Additional cargoes available", min_value=0, max_value=11, value=1, step=1)
+        max_additional = c2.number_input("Additional cargoes available", min_value=0,
+                                          max_value=STRIP_MONTHS - 1, value=1, step=1)
         residual_value = c3.number_input("Residual vessel value ($/day)", value=0.0, step=10_000.0, format="%.0f")
         asia_case = st.radio(
             "Asia route case for programme",
@@ -420,7 +448,7 @@ if PAGE == "0 Decision":
         elif asia_case == "Congested 54.7436 days":
             programme_params.asia_rt_days = model.ASIA_RT_CONG
         # Rebuild strip because Asia value and laden duration depend on the selected RT.
-        programme_strip = model.strip(D, tables, programme_params)
+        programme_strip = model.strip(D, tables, programme_params, n_months=STRIP_MONTHS)
         try:
             result = decision.optimise_programme(
                 programme_strip, programme_params, horizon_days=float(horizon),
@@ -554,25 +582,13 @@ if PAGE == "0 Decision":
                 "in the table above (subject to rounding)."
             )
 
-    fx_rows = model.fx_extrapolated_rows(strip_df)
-    if not fx_rows.empty:
-        labels = ", ".join(fx_rows["month_label"].astype(str))
-        st.warning(
-            f"FX curve warning: {labels} lie beyond the available 1Y outright and "
-            "are linearly extrapolated in the current screening model."
-        )
+    _fx_warning(strip_df)
 
 elif PAGE == "1 Forward strip":
     st.title("LNG Forward Netback")
-    strip_df = model.strip(D, tables, params)
+    strip_df = model.strip(D, tables, params, n_months=STRIP_MONTHS)
     snap_info = strip_df.attrs["snap"]
-    fx_rows = model.fx_extrapolated_rows(strip_df)
-    if not fx_rows.empty:
-        labels = ", ".join(fx_rows["month_label"].astype(str))
-        st.warning(
-            f"FX curve warning: {labels} lie beyond the available 1Y outright and "
-            "are linearly extrapolated in the current screening model."
-        )
+    _fx_warning(strip_df)
 
     st.caption(
         f"Curve date D = **{D.date()}**  |  Snapped -- HH: {snap_info.hh_date.date()}, "
@@ -621,7 +637,7 @@ elif PAGE == "1 Forward strip":
         st.bar_chart(chart_df2)
 
     st.subheader("Waterfall & flows (single load month)")
-    wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(12)),
+    wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(len(strip_df))),
                           format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
                           key="wf_month")
     wf_row = strip_df.iloc[wf_mi].to_dict()

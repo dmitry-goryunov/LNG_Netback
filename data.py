@@ -130,21 +130,35 @@ def load_jkm(path_or_buffer) -> pd.DataFrame:
     return _load_strip_sheet(path_or_buffer, "JKM")
 
 
+_FX_YEAR_TENOR_COLS = {4: "y2", 5: "y3", 6: "y4", 7: "y5", 8: "y6", 9: "y7", 10: "y8", 11: "y9", 12: "y10"}
+
+
 def load_fx(path_or_buffer) -> pd.DataFrame:
-    """FX new layout: col A=date, B=spot (EUR=), C=6M, D=1Y, E..=2Y..10Y
-    (unused). Data DESCENDING; re-sorted ascending here. Applies the x10
-    correction: true outright = spot + (stored - spot) / 10."""
+    """FX new layout: col A=date, B=spot (EUR=), C=6M, D=1Y, E..M=2Y..10Y.
+    Data DESCENDING; re-sorted ascending here. Applies the x10 correction
+    to every tenor, not just 6M/1Y: true outright = spot + (stored -
+    spot) / 10. Verified across the full 2002-2026 history before adding
+    the 2Y-10Y columns here -- the raw (uncorrected) 10Y column ranges
+    0.78x-2.73x spot, which is not a plausible EUR/USD forward under any
+    realistic scenario; corrected, every sampled date produces a smooth,
+    monotonic curve within a few percent of spot, consistent with a real
+    term structure. o6/o1 are unchanged from before (same columns, same
+    formula) so every existing caller sees byte-identical values; o_y2..
+    o_y10 are new."""
     raw = pd.read_excel(path_or_buffer, sheet_name="FX new", header=None, skiprows=3)
-    raw = raw.rename(columns={0: "date", 1: "spot", 2: "m6", 3: "y1"})
+    raw = raw.rename(columns={0: "date", 1: "spot", 2: "m6", 3: "y1", **_FX_YEAR_TENOR_COLS})
     raw["date"] = _parse_date_column(raw["date"])
     raw = raw.dropna(subset=["date"])
-    for c in ("spot", "m6", "y1"):
+    value_cols = ["spot", "m6", "y1"] + list(_FX_YEAR_TENOR_COLS.values())
+    for c in value_cols:
         raw[c] = pd.to_numeric(raw[c], errors="coerce")
-    raw = raw[["date", "spot", "m6", "y1"]]
+    raw = raw[["date"] + value_cols]
     raw = raw.sort_values("date").drop_duplicates(subset="date", keep="last").reset_index(drop=True)
 
     raw["o6"] = raw["spot"] + (raw["m6"] - raw["spot"]) / 10.0
     raw["o1"] = raw["spot"] + (raw["y1"] - raw["spot"]) / 10.0
+    for c in _FX_YEAR_TENOR_COLS.values():
+        raw[f"o_{c}"] = raw["spot"] + (raw[c] - raw["spot"]) / 10.0
     return raw
 
 
@@ -247,6 +261,20 @@ def validate(tables: "CurveTables", today: Optional[dt.date] = None) -> list[str
     dev1 = (complete["o1"] - complete["spot"]) / complete["spot"]
     assert (dev6.abs() <= 0.05).all(), "FX o6 deviates from spot by more than 5% after x10 correction"
     assert (dev1.abs() <= 0.05).all(), "FX o1 deviates from spot by more than 5% after x10 correction"
+
+    # 2Y-10Y tenors: bound grows with tenor (0.05 + 0.03/year), based on the
+    # observed 2002-2026 range (max ~7.2% at 2Y, ~28.5% at 10Y) with headroom.
+    # A hit here means either the workbook's encoding convention changed or a
+    # genuinely bad row -- fail loudly rather than feed an implausible
+    # forward point into a 13-36 month cargo price.
+    for years, col in ((2, "o_y2"), (3, "o_y3"), (4, "o_y4"), (5, "o_y5"),
+                       (6, "o_y6"), (7, "o_y7"), (8, "o_y8"), (9, "o_y9"), (10, "o_y10")):
+        if col not in fx.columns:
+            continue
+        comp = fx.dropna(subset=["spot", col])
+        dev = (comp[col] - comp["spot"]) / comp["spot"]
+        tol = 0.05 + 0.03 * years
+        assert (dev.abs() <= tol).all(), f"FX {col} deviates from spot by more than {tol:.0%} after x10 correction"
 
     warnings_out: list[str] = []
     today = today or dt.date.today()
