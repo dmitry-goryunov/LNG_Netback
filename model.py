@@ -267,6 +267,23 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
         asia_day = asia_margin * cargo / asia_rt
         asia_cargo = asia_margin * cargo
 
+        # --- Waterfall/flow-chart decomposition (additive only: nothing
+        # above this block changes). eu_ship/as_ship/eu_margin/asia_margin
+        # keep their original formulas untouched; these lines just split
+        # the already-correct bundled totals into named sub-costs by
+        # subtraction, so they reconcile to eu_ship/as_ship/the margins
+        # exactly (to floating-point precision), with zero new independent
+        # model logic. Feeds app.py's waterfall_breakdown() UI instead of
+        # porting LNG_Diversion_Waterfall_Flows.html's separate JS model. ---
+        eu_charter_cost = charter * europe_rt / cargo
+        eu_bunker_cost = eu_ship - eu_charter_cost
+        eu_boiloff_cost = eu_bo_frac * ttf_usd
+
+        asia_charter_cost = charter * asia_rt / cargo
+        asia_canal_cost = params.panama_toll_roundtrip / cargo
+        asia_bunker_cost = as_ship - asia_charter_cost - asia_canal_cost
+        asia_boiloff_cost = asia_bo_frac * jkm_l1
+
         jkm_star = (eu_day * asia_rt / cargo + asia_cost_exbo) / (1 - asia_bo_frac)
         gap = jkm_l1 - jkm_star
         verdict = "Asia" if gap >= 0 else "Europe"
@@ -281,6 +298,10 @@ def strip(D, tables, params: Params = Params()) -> pd.DataFrame:
             asia_day=asia_day, asia_cargo=asia_cargo,
             jkm_star=jkm_star, gap=gap, verdict=verdict,
             asia_rt=asia_rt, europe_rt=europe_rt, charter=charter,
+            eu_charter_cost=eu_charter_cost, eu_bunker_cost=eu_bunker_cost,
+            eu_boiloff_cost=eu_boiloff_cost,
+            asia_charter_cost=asia_charter_cost, asia_bunker_cost=asia_bunker_cost,
+            asia_canal_cost=asia_canal_cost, asia_boiloff_cost=asia_boiloff_cost,
         ))
 
     out = pd.DataFrame(rows)
@@ -299,3 +320,44 @@ def strip_month(D, tables, params: Params, month_index: int) -> dict:
     row = df.iloc[month_index].to_dict()
     row["snap"] = df.attrs["snap"]
     return row
+
+
+def waterfall_breakdown(row: dict, params: Params) -> dict:
+    """Ordered cost-line breakdown for one load-month row (a dict from
+    strip_month() or strip_df.iloc[i].to_dict()), for waterfall and flow
+    charts (app.py). Reads already-computed row fields plus the constant
+    Params fields only -- no recomputation of the model. Each basin's
+    lines sum to that basin's existing eu_margin / asia_margin to within
+    floating-point precision:
+
+        revenue - sum(v for _, v in lines) == margin
+
+    This exists so the netback app can show its own live waterfall/flow
+    view instead of relying on the separately-maintained JS model in
+    LNG_Diversion_Waterfall_Flows.html (flagged in LNG_Diversion_Logic_GPT.md
+    as a duplicate-logic risk to regenerate from the production model,
+    not to copy)."""
+    europe_lines = [
+        ("Procurement", row["proc"]),
+        ("Loading", params.loading),
+        ("Charter", row["eu_charter_cost"]),
+        ("Bunkers", row["eu_bunker_cost"]),
+        ("Boil-off", row["eu_boiloff_cost"]),
+        ("Discharge", params.eu_regas_port),
+        ("ETS", row["ets"]),
+        ("Other", params.other_cost),
+    ]
+    asia_lines = [
+        ("Procurement", row["proc"]),
+        ("Loading", params.loading),
+        ("Charter", row["asia_charter_cost"]),
+        ("Bunkers", row["asia_bunker_cost"]),
+        ("Canal", row["asia_canal_cost"]),
+        ("Boil-off", row["asia_boiloff_cost"]),
+        ("Port", params.asia_port_cost),
+        ("Other", params.other_cost),
+    ]
+    return {
+        "Europe": dict(revenue=row["ttf_usd"], lines=europe_lines, margin=row["eu_margin"]),
+        "Asia": dict(revenue=row["JKM"], lines=asia_lines, margin=row["asia_margin"]),
+    }

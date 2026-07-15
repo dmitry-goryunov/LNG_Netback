@@ -20,6 +20,7 @@ import os
 import altair as alt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 import data
@@ -27,6 +28,69 @@ import model
 import risk
 
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
+
+# ===========================================================================
+# Waterfall / flow chart builders (pure Plotly; read model.waterfall_
+# breakdown() output only -- no recalculation here). This is the netback
+# app's own equivalent of LNG_Diversion_Waterfall_Flows.html's waterfall +
+# Sankey view, built from the live model instead of that file's separate,
+# hardcoded JS reimplementation (flagged as a duplicate-logic risk in
+# LNG_Diversion_Logic_GPT.md Sec 19.2 / 20.1).
+# ===========================================================================
+
+
+def _plotly_waterfall(title: str, revenue: float, lines: list, margin: float):
+    names = ["Revenue"] + [n for n, _ in lines] + ["Margin"]
+    measures = ["absolute"] + ["relative"] * len(lines) + ["total"]
+    values = [revenue] + [-v for _, v in lines] + [margin]
+    margin_color = "#3d8a5f" if margin >= 0 else "#b23a3a"
+    fig = go.Figure(go.Waterfall(
+        x=names, measure=measures, y=values,
+        text=[f"{v:,.2f}" for v in ([revenue] + [v for _, v in lines] + [margin])],
+        textposition="outside",
+        increasing={"marker": {"color": "#2f6db3"}},
+        decreasing={"marker": {"color": "#c66b4e"}},
+        totals={"marker": {"color": margin_color}},
+        connector={"line": {"color": "#c9d0d8", "dash": "dot"}},
+    ))
+    fig.update_layout(title=title, showlegend=False, height=380, yaxis_title="$/MMBtu",
+                       margin=dict(t=40, b=10, l=10, r=10))
+    return fig
+
+
+def _flow_buckets(lines: list) -> list:
+    """Groups waterfall_breakdown() line items into 5 display buckets for
+    the Sankey view, mirroring LNG_Diversion_Waterfall_Flows.html's own
+    grouping (Procurement | Shipping | Boil-off | Discharge/Port |
+    Loading+Other+ETS). Returns only non-zero buckets."""
+    d = dict(lines)
+    buckets = [
+        ("Procurement", d.get("Procurement", 0.0), "#c66b4e"),
+        ("Shipping", d.get("Charter", 0.0) + d.get("Bunkers", 0.0) + d.get("Canal", 0.0), "#b3563a"),
+        ("Boil-off", d.get("Boil-off", 0.0), "#d9a05b"),
+        ("Discharge/Port", d.get("Discharge", 0.0) + d.get("Port", 0.0), "#8a6d5c"),
+        ("Loading + Other + ETS", d.get("Loading", 0.0) + d.get("Other", 0.0) + d.get("ETS", 0.0), "#9aa4ae"),
+    ]
+    return [(n, v, c) for n, v, c in buckets if v > 1e-9]
+
+
+def _plotly_flow_sankey(title: str, revenue: float, lines: list, margin: float):
+    buckets = _flow_buckets(lines)
+    labels = ["Revenue"] + [b[0] for b in buckets]
+    colors = ["#2f6db3"] + [b[2] for b in buckets]
+    values = [b[1] for b in buckets]
+    if margin >= 0:
+        labels.append("Margin")
+        colors.append("#3d8a5f")
+        values.append(margin)
+    targets = list(range(1, len(labels)))
+    fig = go.Figure(go.Sankey(
+        node=dict(label=labels, color=colors, pad=18, thickness=16),
+        link=dict(source=[0] * len(targets), target=targets, value=values,
+                  color=[colors[t] for t in targets]),
+    ))
+    fig.update_layout(title=title, height=320, font_size=12, margin=dict(t=40, b=10, l=10, r=10))
+    return fig
 
 # ===========================================================================
 # Data loading (spec 1.7: env var path, cached on path+mtime; else
@@ -234,6 +298,48 @@ if PAGE == "1 Netback":
         chart_df2 = strip_df.set_index("month_label")[["eu_day", "asia_day"]].rename(
             columns={"eu_day": "Europe $/day", "asia_day": "Asia $/day"})
         st.bar_chart(chart_df2)
+
+    st.subheader("Waterfall & flows (single load month)")
+    wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(12)),
+                          format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
+                          key="wf_month")
+    wf_row = strip_df.iloc[wf_mi].to_dict()
+    breakdown = model.waterfall_breakdown(wf_row, params)
+    eu_bd, as_bd = breakdown["Europe"], breakdown["Asia"]
+
+    wcol1, wcol2 = st.columns(2)
+    with wcol1:
+        st.plotly_chart(
+            _plotly_waterfall(f"Europe netback waterfall ({wf_row['month_label']})",
+                               eu_bd["revenue"], eu_bd["lines"], eu_bd["margin"]),
+            width="stretch")
+    with wcol2:
+        st.plotly_chart(
+            _plotly_waterfall(f"Asia netback waterfall ({wf_row['month_label']})",
+                               as_bd["revenue"], as_bd["lines"], as_bd["margin"]),
+            width="stretch")
+
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        st.plotly_chart(
+            _plotly_flow_sankey("Europe: where each revenue dollar goes",
+                                 eu_bd["revenue"], eu_bd["lines"], eu_bd["margin"]),
+            width="stretch")
+        if eu_bd["margin"] < 0:
+            st.caption(f"Costs exceed revenue: Europe margin {eu_bd['margin']:+.2f} $/MMBtu -- no Margin flow shown.")
+    with fcol2:
+        st.plotly_chart(
+            _plotly_flow_sankey("Asia: where each revenue dollar goes",
+                                 as_bd["revenue"], as_bd["lines"], as_bd["margin"]),
+            width="stretch")
+        if as_bd["margin"] < 0:
+            st.caption(f"Costs exceed revenue: Asia margin {as_bd['margin']:+.2f} $/MMBtu -- no Margin flow shown.")
+
+    st.caption(
+        "Waterfall/flow charts read the same model.strip() fields as the table above "
+        "(model.waterfall_breakdown) -- not an independent recalculation, unlike "
+        "LNG_Diversion_Waterfall_Flows.html's standalone JS model."
+    )
 
     st.caption(CAVEATS)
 
