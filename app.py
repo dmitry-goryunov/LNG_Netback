@@ -128,6 +128,24 @@ def _decision_waterfall_lines(bd: dict, sunk: bool) -> tuple[list, float]:
     return lines, bd["margin"] + addback
 
 
+def _safe_strip(D, tables, params, n_months: int):
+    """Try model.strip() at the requested length; on any failure, fall back
+    to the well-tested 12-month default instead of crashing the whole page.
+
+    Extending past 12 months depends on the connected workbook actually
+    having that many forward columns (and, for FX, the 2Y-10Y tenor
+    columns) -- both are properties of *this deployment's* data file, which
+    can differ from whatever was used in development. A hard crash on the
+    Decision or Forward-strip page is worse than silently-narrower coverage,
+    so this always returns something usable and surfaces what happened
+    instead of hiding it.
+    """
+    try:
+        return model.strip(D, tables, params, n_months=n_months), None
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: any failure here must not crash the page
+        return model.strip(D, tables, params, n_months=12), exc
+
+
 def _fx_warning(strip_df) -> None:
     """Shows the FX extrapolation warning, if any rows need it, naming the
     actual anchor boundary used (1Y for a 12-month strip's fx_curve(), or
@@ -346,7 +364,13 @@ CAVEATS = (
 
 if PAGE == "0 Decision":
     st.title("LNG cargo and vessel decision")
-    strip_df = model.strip(D, tables, params, n_months=STRIP_MONTHS)
+    strip_df, strip_fallback_error = _safe_strip(D, tables, params, STRIP_MONTHS)
+    if strip_fallback_error is not None:
+        st.warning(
+            f"Could not build a {STRIP_MONTHS}-month strip from the connected workbook "
+            f"({type(strip_fallback_error).__name__}: {strip_fallback_error}); showing "
+            "the standard 12-month strip instead."
+        )
     snap_info = strip_df.attrs["snap"]
     months = list(strip_df["month_label"])
     month_index = st.selectbox(
@@ -448,7 +472,14 @@ if PAGE == "0 Decision":
         elif asia_case == "Congested 54.7436 days":
             programme_params.asia_rt_days = model.ASIA_RT_CONG
         # Rebuild strip because Asia value and laden duration depend on the selected RT.
-        programme_strip = model.strip(D, tables, programme_params, n_months=STRIP_MONTHS)
+        programme_strip, programme_fallback_error = _safe_strip(D, tables, programme_params, STRIP_MONTHS)
+        if programme_fallback_error is not None:
+            st.warning(
+                f"Could not build a {STRIP_MONTHS}-month strip from the connected workbook "
+                f"({type(programme_fallback_error).__name__}: {programme_fallback_error}); "
+                "showing the standard 12-month strip instead. Additional cargoes and horizons "
+                "beyond ~12 months may not find a matching forward month."
+            )
         try:
             result = decision.optimise_programme(
                 programme_strip, programme_params, horizon_days=float(horizon),
@@ -586,7 +617,13 @@ if PAGE == "0 Decision":
 
 elif PAGE == "1 Forward strip":
     st.title("LNG Forward Netback")
-    strip_df = model.strip(D, tables, params, n_months=STRIP_MONTHS)
+    strip_df, strip_fallback_error = _safe_strip(D, tables, params, STRIP_MONTHS)
+    if strip_fallback_error is not None:
+        st.warning(
+            f"Could not build a {STRIP_MONTHS}-month strip from the connected workbook "
+            f"({type(strip_fallback_error).__name__}: {strip_fallback_error}); showing "
+            "the standard 12-month strip instead."
+        )
     snap_info = strip_df.attrs["snap"]
     _fx_warning(strip_df)
 
