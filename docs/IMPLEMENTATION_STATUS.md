@@ -71,15 +71,22 @@ engine work specifically.
   full strip; programme value across every possible start month), and a
   fix for a pre-existing alphabetical- vs chronological-sort bug these
   exposed in the two original forward-strip charts.
-- Phase 2 (`docs/PHASE2_PLAN.md`) steps 1-3 of 9: `physical.py`'s
-  segment-level mass-balance engine and route builders, standalone and not
-  yet wired into `model.py`/`decision.py`/`app.py`. The legacy-equivalence
-  test (`tests/test_physical_legacy_equivalence.py`) passes for Europe and
-  both Asia cases, and surfaced a real, verified finding along the way: the
-  legacy `co2_eu_ets_tonnes` constant used a uniform 50% ETS-scope factor
-  where the actual EU ETS Directive requires 100% for time at berth --
-  correcting this will raise EU-bound ETS cost by ~4.45% once wired into
-  route valuation (step 8, not yet done). 38 new tests across three files
-  (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`, and
-  the extended-strip suite), all passing alongside an unaffected legacy
-  64/64.
+- Phase 2 (`docs/PHASE2_PLAN.md`) steps 1-4 of 9: `physical.py`'s
+  segment-level mass-balance engine, route builders, and `emissions.py`;
+  standalone and not yet wired into `model.py`/`decision.py`/`app.py`. The
+  legacy-equivalence test (`tests/test_physical_legacy_equivalence.py`)
+  passes for Europe and both Asia cases, and surfaced a real, verified
+  finding along the way: the legacy `co2_eu_ets_tonnes` constant used a
+  uniform 50% ETS-scope factor where the actual EU ETS Directive requires
+  100% for time at berth -- correcting this will raise EU-bound ETS cost by
+  ~4.45% (~5.09% once methane slip is included) once wired into route
+  valuation (step 8, not yet done). Step 4 also caught and fixed a real
+  bug: nothing actually connected `model.Params` to the engine's
+  `VesselPerformance` (a bare `VesselPerformance()`'s defaults only
+  coincidentally matched `model.Params()`'s), so editing boil-off rate or
+  fuel-requirement fields would have silently done nothing -- exactly the
+  Improvement 3 defect, reproduced inside the new engine. Fixed with
+  `physical.vessel_performance_from_params()`. 62 new tests across four
+  files (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`,
+  `test_emissions.py`, and the extended-strip suite), all passing alongside
+  an unaffected legacy 64/64.

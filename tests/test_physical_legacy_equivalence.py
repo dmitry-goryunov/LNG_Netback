@@ -72,7 +72,13 @@ class TestEuropeRouteEquivalence:
     @pytest.fixture(autouse=True)
     def setup(self):
         self.params = model.Params()
-        self.vessel = physical.VesselPerformance()
+        # vessel_performance_from_params(), not bare VesselPerformance():
+        # the latter's defaults only coincidentally match model.Params()'s
+        # defaults with no actual data flow between them -- see
+        # physical.vessel_performance_from_params's docstring. Using the
+        # real wiring here makes this test genuinely exercise the
+        # params -> engine connection, not just matching hardcoded numbers.
+        self.vessel = physical.vessel_performance_from_params(self.params)
         self.segments = physical.europe_route_segments(self.params)
         self.ledger = physical.run_voyage(
             self.segments, self.vessel, loaded_mmbtu=self.params.cargo_size, heel_target_mmbtu=0.0
@@ -130,7 +136,7 @@ class TestAsiaRouteEquivalence:
 
     def _ledger_for(self, asia_rt_days: float) -> tuple:
         params = model.Params(asia_rt_days=asia_rt_days)
-        vessel = physical.VesselPerformance()
+        vessel = physical.vessel_performance_from_params(params)
         segments = physical.asia_route_segments(params)
         ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=params.cargo_size, heel_target_mmbtu=0.0)
         return params, ledger

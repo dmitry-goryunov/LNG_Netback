@@ -321,3 +321,48 @@ def test_europe_route_segments_discharge_is_full_ets_scope():
     segments = {s.state: s for s in physical.europe_route_segments(params)}
     assert segments[OperatingState.DISCHARGE].ets_scope_fraction == 1.0
     assert segments[OperatingState.LADEN_SEA].ets_scope_fraction == 0.5
+
+
+# --- vessel_performance_from_params: the params -> engine data flow --------
+#
+# Caught while building emissions.py tests: a bare VesselPerformance() has
+# its own hardcoded defaults that only *coincidentally* equal
+# model.Params()'s defaults (both 0.0010/day, both 150/130/25 t/d) --
+# nothing actually reads params.boil_off_rate etc. Confirmed live: two
+# europe_route_segments() runs at boil_off_rate=0.0001 vs 0.0015 produced
+# byte-identical total_liquid_fuel_tonnes when vesseled with a bare
+# VesselPerformance(). vessel_performance_from_params() fixes the actual
+# data flow; these tests exist so that connection can never silently break
+# again.
+
+def test_vessel_performance_from_params_reflects_boil_off_rate():
+    import model
+    low = physical.vessel_performance_from_params(model.Params(boil_off_rate=0.0001))
+    high = physical.vessel_performance_from_params(model.Params(boil_off_rate=0.0015))
+    assert low.bor_for(OperatingState.LADEN_SEA) == pytest.approx(0.0001)
+    assert high.bor_for(OperatingState.LADEN_SEA) == pytest.approx(0.0015)
+
+    seg_low = physical.europe_route_segments(model.Params(boil_off_rate=0.0001))
+    seg_high = physical.europe_route_segments(model.Params(boil_off_rate=0.0015))
+    ledger_low = run_voyage(seg_low, low, loaded_mmbtu=3_500_000.0)
+    ledger_high = run_voyage(seg_high, high, loaded_mmbtu=3_500_000.0)
+    assert ledger_low.total_liquid_fuel_tonnes != pytest.approx(ledger_high.total_liquid_fuel_tonnes)
+
+
+def test_vessel_performance_from_params_reflects_fuel_requirement_fields():
+    import model
+    default = physical.vessel_performance_from_params(model.Params())
+    edited = physical.vessel_performance_from_params(
+        model.Params(laden_fuel_requirement=200.0, ballast_fuel=160.0, port_fuel_rate=40.0)
+    )
+    assert edited.demand_for(OperatingState.LADEN_SEA) > default.demand_for(OperatingState.LADEN_SEA)
+    assert edited.demand_for(OperatingState.BALLAST_SEA) > default.demand_for(OperatingState.BALLAST_SEA)
+    assert edited.demand_for(OperatingState.DISCHARGE) > default.demand_for(OperatingState.DISCHARGE)
+
+
+def test_vessel_performance_from_params_discharge_and_loading_still_zero_bor():
+    import model
+    vessel = physical.vessel_performance_from_params(model.Params(boil_off_rate=0.05))
+    assert vessel.bor_for(OperatingState.LOADING) == 0.0
+    assert vessel.bor_for(OperatingState.DISCHARGE) == 0.0
+    assert vessel.bor_for(OperatingState.LADEN_SEA) == pytest.approx(0.05)

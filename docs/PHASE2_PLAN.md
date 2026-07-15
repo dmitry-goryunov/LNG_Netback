@@ -410,19 +410,19 @@ if it's added to `requirements.txt` (optional for this phase; plain
 parametrised cases are sufficient to start and match this repo's existing
 test style, which favours explicit fixtures over property frameworks).
 
-| # | Test | Improvement 14 ref |
-|---|---|---|
-| 1 | `loaded == delivered + burned + vented + other_loss + heel` for Europe, Asia base, Asia congested | §B.1 |
-| 2 | Inventory never goes negative across any segment sequence | §B.2 |
-| 3 | A `LADEN_QUEUE`/`BALLAST_QUEUE` segment's fuel burn uses the queue demand rate, strictly less than the sea-passage rate at the same duration | §B.3, Improvement 4 |
-| 4 | Increasing `bor_fraction_per_day` strictly cannot increase `delivered_mmbtu` | §B.4 |
-| 5 | `reliquefied_mmbtu <= surplus` and `<= reliq_capacity * days` jointly | §B.5 |
-| 6 | Ballast-leg heel shortfall never reduces already-computed laden `delivered_mmbtu` (segments are one-directional) | §B.6 |
-| 7 | Increasing any fuel demand rate strictly increases summed CO2e | §E.1 |
-| 8 | An Asia-route segment always has `ets_scope_fraction == 0`; a Europe at-berth segment always has `1.0` | §E.2 |
-| 9 | CH4/N2O contribute to `co2e` whenever `methane_slip_pct_of_fuel_energy > 0` | §E.3 |
-| 10 | Changing `eua_price` changes only EU-scope segments' cost, never Asia's | §E.4 |
-| 11 | Legacy-equivalence test (Section 6 above) | new, this plan |
+| # | Test | Improvement 14 ref | Status |
+|---|---|---|---|
+| 1 | `loaded == delivered + burned + vented + other_loss + heel` for Europe, Asia base, Asia congested | §B.1 | done as `test_run_voyage_reconciles_exactly` (generic) + the equivalence suite (real routes); not yet a dedicated per-route reconciliation assertion for all three named cases in one place |
+| 2 | Inventory never goes negative across any segment sequence | §B.2 | done (`simulate_segment` raises rather than allowing it; tested) |
+| 3 | A `LADEN_QUEUE`/`BALLAST_QUEUE` segment's fuel burn uses the queue demand rate, strictly less than the sea-passage rate at the same duration | §B.3, Improvement 4 | partially done -- `test_queue_demand_below_sea_demand_at_default_rates` and `test_queue_state_emissions_below_sea_state_at_equal_duration` prove it at the `VesselPerformance` level; no route yet emits a queue segment (step 6) |
+| 4 | Increasing `bor_fraction_per_day` strictly cannot increase `delivered_mmbtu` | §B.4 | done (`test_higher_bor_cannot_increase_delivered_cargo`) |
+| 5 | `reliquefied_mmbtu <= surplus` and `<= reliq_capacity * days` jointly | §B.5 | done (`test_full_/test_partial_reliquefaction_capacity_...`) |
+| 6 | Ballast-leg heel shortfall never reduces already-computed laden `delivered_mmbtu` (segments are one-directional) | §B.6 | done (`test_ballast_consumption_does_not_reduce_delivered_cargo`) |
+| 7 | Increasing any fuel demand rate strictly increases summed CO2e | §E.1 | done (`test_higher_fuel_demand_increases_co2e` -- see step 4's writeup for why this needed a premise fix first) |
+| 8 | An Asia-route segment always has `ets_scope_fraction == 0`; a Europe at-berth segment always has `1.0` | §E.2 | done (`test_asia_route_segments_are_all_outside_ets_scope`, `test_europe_route_segments_discharge_is_full_ets_scope`) |
+| 9 | CH4/N2O contribute to `co2e` whenever `methane_slip_pct_of_fuel_energy > 0` | §E.3 | done (`test_methane_slip_.../test_n2o_contributes_...`) |
+| 10 | Changing `eua_price` changes only EU-scope segments' cost, never Asia's | §E.4 | done (`test_eua_price_change_affects_europe_cost_only`) |
+| 11 | Legacy-equivalence test (Section 6 above) | new, this plan | done -- see Section 6 |
 
 **[v2.4 brief] Mutation check, not committed:** for at least the
 conservation test (#1) and one emissions test (#7), deliberately break the
@@ -462,13 +462,49 @@ with everything else in Sections 3/9.
 3. **DONE** (`tests/test_physical_legacy_equivalence.py`). Passed for
    Europe, Asia base and Asia congested -- see Section 6's updated writeup,
    including the verified (not hidden) 4.45% ETS-scope divergence.
-4. `emissions.py`: combustion factors, ETS scope function, CO2e aggregation
-   as an importable module (Section 6's CO2 checks currently compute this
-   inline in the test file as a spot-check; formalising it into
-   `emissions.py` is still open, along with CH4/N2O/GWP and the FuelEU
-   `NOT_PRICED` marker from Section 5.3/5.4, none of which the equivalence
-   test needed).
-5. Physical/emissions invariant tests (Section 7, items 1-10).
+4. **DONE** (`emissions.py`, `tests/test_emissions.py`, 13 tests): combustion
+   factors, CO2/CH4/N2O/CO2e aggregation, `ets_cost_usd()` with a
+   `contractual_share` input, and the `NOT_PRICED`/`unresolved` FuelEU/
+   payer placeholders from Section 5.3/5.4. ETS scope itself is not a
+   separate function -- it was already fully implemented inline in the
+   route builders back in step 2 (`ets_scope_fraction` on each
+   `VoyageSegment`); `emissions.py` just reads it.
+
+   Two real gaps found and handled while building this, not implementation
+   busywork:
+   - **`vessel_performance_from_params()` didn't exist, and without it
+     `params.boil_off_rate`/`laden_fuel_requirement`/`ballast_fuel`/
+     `port_fuel_rate` had zero effect on the physical engine.** A bare
+     `VesselPerformance()`'s hardcoded defaults only *coincidentally*
+     matched `model.Params()`'s defaults; nothing actually read from
+     `params`. Confirmed live before fixing: two `europe_route_segments()`
+     runs at `boil_off_rate=0.0001` vs `0.0015`, vesseled with a bare
+     `VesselPerformance()`, produced byte-identical fuel tonnage. This
+     reproduced Improvement 3's exact defect *inside the new engine*. Added
+     `physical.vessel_performance_from_params()` and rewired every test
+     (including the already-"passing" step 3 equivalence tests, which had
+     been silently exercising this same coincidence) to use it.
+   - A test asserting "higher LNG burn increases CO2e" failed -- correctly.
+     Total fuel *demand* is fixed regardless of BOR; more boil-off only
+     changes the *source mix* (LNG vs liquid fuel) for that same fixed
+     demand, and LNG has a lower CO2 factor per unit energy than VLSFO in
+     this model's own factors (2.75/48.6 ~= 0.0566 t/MMBtu vs
+     3.15/40.5093 ~= 0.0778 t/MMBtu) -- so more BOG-sourced LNG correctly
+     *reduces* CO2e. The test's premise was wrong, not the code; fixed to
+     test what Improvement 14 section E item 1 actually specifies
+     (increasing a demand *rate*, not shifting source mix).
+
+   One limitation deliberately shipped and explicitly tested rather than
+   silently absent: `vented_mmbtu` (surplus BOG exceeding both demand and
+   reliquefaction capacity) is not counted as an emission at all yet.
+   Under every scenario exercised so far it's exactly zero, so this has no
+   effect today, but a real vent (high BOR, no reliq capacity) would
+   understate CO2e -- raw vented methane should count far more than the
+   same mass combusted. Must be closed before this module is trusted for
+   any scenario where a route actually vents.
+5. Physical/emissions invariant tests (Section 7, items 1-10) -- partially
+   covered already by `test_emissions.py` (items 7-10) and
+   `test_physical_engine.py` (items 2, 4, 6); items 1, 3, 5 remain.
 6. Queue separation: extend `asia_route_segments(congested=True)` to emit
    `LADEN_QUEUE`/`BALLAST_QUEUE` segments instead of inflating sea-leg demand;
    re-run the Phase-3 programme benchmark suite

@@ -360,3 +360,43 @@ def asia_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
         VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=asia_port, ets_scope_fraction=0.0),
         VoyageSegment("ballast_sea", OperatingState.BALLAST_SEA, duration_days=asia_ballast, ets_scope_fraction=0.0),
     )
+
+
+def vessel_performance_from_params(params: model.Params) -> VesselPerformance:
+    """Derives a VesselPerformance from model.Params' legacy fields.
+
+    Without this, VesselPerformance() built with its own bare defaults
+    only *coincidentally* matches model.Params()'s defaults (both happen
+    to be 0.0010/day, 150/130/25 t/d) -- there is no actual data flow
+    between them, so editing params.boil_off_rate, laden_fuel_requirement,
+    ballast_fuel or port_fuel_rate would silently do nothing to the
+    physical simulation, reproducing inside this new engine exactly the
+    disconnect Improvement 3 exists to fix. Always use this function
+    rather than VesselPerformance() directly when a route was built from
+    an actual model.Params instance (europe_route_segments/
+    asia_route_segments both take one).
+
+    energy_factor_mmbtu_per_t stays at the back-solved 40.5093 constant
+    (docs/PHASE2_PLAN.md Section 2) -- it is not itself a Params field.
+    LADEN_QUEUE/CANAL_TRANSIT/BALLAST_QUEUE/PORT keep the placeholder
+    demand rates from _default_demand_table(), since Params has no
+    equivalent fields for them yet and no route builder uses those states
+    until step 6 (queue separation).
+    """
+    f = 40.5093
+    placeholders = _default_demand_table()
+    demand = {
+        OperatingState.LOADING: params.port_fuel_rate * f,
+        OperatingState.LADEN_SEA: params.laden_fuel_requirement * f,
+        OperatingState.LADEN_QUEUE: placeholders[OperatingState.LADEN_QUEUE],
+        OperatingState.CANAL_TRANSIT: placeholders[OperatingState.CANAL_TRANSIT],
+        OperatingState.DISCHARGE: params.port_fuel_rate * f,
+        OperatingState.BALLAST_SEA: params.ballast_fuel * f,
+        OperatingState.BALLAST_QUEUE: placeholders[OperatingState.BALLAST_QUEUE],
+        OperatingState.PORT: params.port_fuel_rate * f,
+    }
+    bor = {
+        state: (0.0 if state in (OperatingState.LOADING, OperatingState.DISCHARGE) else params.boil_off_rate)
+        for state in OperatingState
+    }
+    return VesselPerformance(energy_factor_mmbtu_per_t=f, demand_mmbtu_per_day=demand, bor_fraction_per_day=bor)
