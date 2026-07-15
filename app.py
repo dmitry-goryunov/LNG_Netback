@@ -41,13 +41,19 @@ st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 
 
 def _plotly_waterfall(title: str, revenue: float, lines: list, margin: float):
+    """lines is (name, cost) pairs where a positive cost is subtracted (bar
+    goes down) and a negative cost is a credit added back (bar goes up,
+    e.g. a sunk-cost add-back) -- text always shows the true signed delta
+    (a credit prints as "+x", not the internal "-x" used to flip the bar
+    direction), so it never contradicts which way the bar moved."""
     names = ["Revenue"] + [n for n, _ in lines] + ["Margin"]
     measures = ["absolute"] + ["relative"] * len(lines) + ["total"]
     values = [revenue] + [-v for _, v in lines] + [margin]
+    line_text = [f"{v:,.2f}" if v >= 0 else f"+{-v:,.2f}" for _, v in lines]
     margin_color = "#3d8a5f" if margin >= 0 else "#b23a3a"
     fig = go.Figure(go.Waterfall(
         x=names, measure=measures, y=values,
-        text=[f"{v:,.2f}" for v in ([revenue] + [v for _, v in lines] + [margin])],
+        text=[f"{revenue:,.2f}"] + line_text + [f"{margin:,.2f}"],
         textposition="outside",
         increasing={"marker": {"color": "#2f6db3"}},
         decreasing={"marker": {"color": "#c66b4e"}},
@@ -96,18 +102,20 @@ def _plotly_flow_sankey(title: str, revenue: float, lines: list, margin: float):
 
 def _decision_waterfall_lines(bd: dict, sunk: bool) -> tuple[list, float]:
     """Adapts model.waterfall_breakdown()'s $/MMBtu lines/margin to a
-    decision-state view: when procurement and loading are sunk (an
-    already-loaded current cargo), they are removed from the cost lines --
-    rather than shown as a subtraction -- so the waterfall foots to the
-    *incremental* decision value shown in the metrics above it, not the
-    full-cargo P&L. margin + sum(dropped) == incremental value / cargo_size,
-    matching decision.route_value()'s sunk-cost add-back exactly."""
+    decision-state view. Procurement and loading are always shown as real
+    cost bars -- gas was actually bought and loaded, and hiding that cost
+    reads as a mistake, not a decision-state simplification. When those
+    costs are sunk (an already-loaded current cargo), one extra "Sunk cost
+    add-back" bar is appended that exactly cancels them, so the chart foots
+    to the *incremental* decision value shown in the metrics above it, not
+    the full-cargo P&L, while still showing where that value came from.
+    margin + addback == incremental value / cargo_size, matching
+    decision.route_value()'s sunk-cost add-back exactly."""
     if not sunk:
         return bd["lines"], bd["margin"]
-    dropped = {"Procurement", "Loading"}
-    kept = [(n, v) for n, v in bd["lines"] if n not in dropped]
-    sunk_total = sum(v for n, v in bd["lines"] if n in dropped)
-    return kept, bd["margin"] + sunk_total
+    addback = sum(v for n, v in bd["lines"] if n in {"Procurement", "Loading"})
+    lines = bd["lines"] + [("Sunk cost add-back", -addback)]
+    return lines, bd["margin"] + addback
 
 
 def _plotly_programme_waterfall(title: str, legs, residual_days: float, residual_value: float,
@@ -377,7 +385,7 @@ if PAGE == "0 Decision":
         wf_lines, wf_margin = _decision_waterfall_lines(wf_bd_all[wf_route], wf_sunk)
         st.plotly_chart(
             _plotly_waterfall(
-                f"{wf_route} {'incremental (sunk costs excluded)' if wf_sunk else 'full-cargo'} "
+                f"{wf_route} {'post-lift decision' if wf_sunk else 'full-cargo'} "
                 f"waterfall ({wf_value.load_month.strftime('%b-%y')})",
                 wf_bd_all[wf_route]["revenue"], wf_lines, wf_margin,
             ),
@@ -387,8 +395,10 @@ if PAGE == "0 Decision":
             f"$/MMBtu margin x cargo size ({params.cargo_size:,.0f} MMBtu) = "
             f"${wf_margin * params.cargo_size:,.0f}, matching the decision value above "
             "(subject to rounding)." + (
-                " Procurement and loading are removed from the cost lines here because "
-                "they are sunk -- this is the incremental view, not the full-cargo P&L."
+                " Procurement and loading are shown as real costs (gas was actually bought "
+                "and loaded), then reversed on the Sunk cost add-back bar because they were "
+                "incurred before this decision point -- that is the incremental view, not "
+                "the full-cargo P&L."
                 if wf_sunk else ""
             )
         )
@@ -523,7 +533,7 @@ if PAGE == "0 Decision":
             st.plotly_chart(
                 _plotly_waterfall(
                     f"Cargo {sel_leg.cargo_number}: {sel_leg.route} "
-                    f"{'incremental (sunk costs excluded)' if sel_sunk else 'pre-lift'} "
+                    f"{'post-lift decision' if sel_sunk else 'pre-lift'} "
                     f"waterfall ({sel_leg.load_month.strftime('%b-%y')})",
                     sel_bd_all[sel_leg.route]["revenue"], sel_lines, sel_margin,
                 ),
