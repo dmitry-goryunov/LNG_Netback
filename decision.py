@@ -18,7 +18,9 @@ from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 
+import emissions
 import model
+import physical
 
 
 class DecisionMode(str, Enum):
@@ -155,6 +157,112 @@ def _full_value(row: Mapping, route: str) -> float:
     return float(row["eu_cargo"] if route == "Europe" else row["asia_cargo"])
 
 
+def _physical_route_breakdown(row: Mapping, params: model.Params, route: str) -> dict:
+    """Itemized $/MMBtu cost lines for one route, physical-engine-derived
+    (docs/PHASE2_PLAN.md Section 8 step 8). The single source of truth
+    behind both _physical_route_value() (the scalar route_value() uses)
+    and physical_waterfall_breakdown() (app.py's waterfall/Sankey charts
+    for the three non-screen decision modes) -- computed once so the
+    chart always reconciles to the decision value shown next to it,
+    unlike calling model.waterfall_breakdown() there (which reads static
+    model.strip() columns the non-screen modes no longer use).
+
+    Replaces model.strip()'s static fuel-rate (``residual_laden_vlsfo``/
+    ``ballast_fuel``/``port_fuel_rate`` applied flatly regardless of
+    congestion) and uniform-0.5 ETS-scope constant with
+    physical.run_voyage()'s actual per-segment mass balance and
+    emissions.py's per-segment EU-ETS scope. Market prices (``proc``,
+    ``ttf_usd``/``JKM``), commercial cost lines (loading, regas/port,
+    other_cost, Panama toll) and the snapped/overridden charter day-rate
+    all come from ``row``/``params`` unchanged, on the same loaded-cargo
+    basis model.strip() uses.
+
+    "Boil-off" is revenue foregone on gas that never reached delivery
+    (``cargo - delivered_mmbtu``, valued at the same sale price as
+    revenue) -- this keeps model.waterfall_breakdown()'s own "boil-off is
+    lost cargo, valued at sale price" narrative, but the mass is now the
+    engine's actual per-segment result (net of reliquefaction) instead of
+    a flat boil_off_rate*laden_days constant. "Bunkers" is *only* the
+    liquid fuel actually purchased (net of free BOG) -- the engine's own
+    shortfall output, not a separately pre-netted constant -- so the same
+    gas is never charged as both a boil-off loss and a like-for-like fuel
+    cost. revenue - sum(v for _, v in lines) == margin exactly, by
+    construction (same invariant model.waterfall_breakdown() documents),
+    and margin * cargo == _physical_route_value()'s full_cargo_value.
+
+    heel_target_mmbtu=0.0: the legacy model has no heel concept and treats
+    100% of ballast/discharge fuel demand as purchased VLSFO with no BOG
+    offset (docs/PHASE2_PLAN.md Section 10 item 5/7); zero heel reproduces
+    that assumption exactly rather than silently changing it as a side
+    effect of this wiring.
+    """
+    route = _normalise_route(route)
+    vessel = physical.vessel_performance_from_params(params)
+    fx_l = float(row["fx"])
+    load_month = pd.Timestamp(row["load_month"])
+    phase = model.phase_for_year(load_month.year)
+    charter_rate = float(row["charter"])
+    cargo = params.cargo_size
+
+    if route == "Europe":
+        segments = physical.europe_route_segments(params)
+        price = float(row["ttf_usd"])
+    else:
+        segments = physical.asia_route_segments(params)
+        price = float(row["JKM"])
+
+    ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=cargo, heel_target_mmbtu=0.0)
+    voyage_em = emissions.voyage_emissions(ledger)
+
+    boiloff = price * (cargo - ledger.delivered_mmbtu) / cargo
+    bunkers = ledger.total_liquid_fuel_tonnes * params.vlsfo_price / cargo
+    charter_line = charter_rate * ledger.total_days / cargo
+
+    lines = [
+        ("Procurement", float(row["proc"])),
+        ("Loading", params.loading),
+        ("Charter", charter_line),
+        ("Bunkers", bunkers),
+        ("Boil-off", boiloff),
+    ]
+    if route == "Europe":
+        ets_line = emissions.ets_cost_usd(voyage_em, params.eua_price, fx_l) * phase / cargo
+        lines += [("Discharge", params.eu_regas_port), ("ETS", ets_line), ("Other", params.other_cost)]
+    else:
+        lines += [
+            ("Canal", params.panama_toll_roundtrip / cargo),
+            ("Port", params.asia_port_cost),
+            ("Other", params.other_cost),
+        ]
+
+    margin = price - sum(v for _, v in lines)
+    return dict(revenue=price, lines=lines, margin=margin, duration_days=ledger.total_days)
+
+
+def _physical_route_value(row: Mapping, params: model.Params, route: str) -> tuple[float, float]:
+    """``(duration_days, full_cargo_value)`` from _physical_route_breakdown()
+    -- see that function for what changes relative to model.strip() and
+    why. full_cargo_value is margin (a $/MMBtu rate) scaled to the total
+    loaded-cargo basis, matching _full_value()'s (legacy) return
+    convention."""
+    bd = _physical_route_breakdown(row, params, route)
+    return bd["duration_days"], bd["margin"] * params.cargo_size
+
+
+def physical_waterfall_breakdown(row: Mapping, params: model.Params) -> dict:
+    """model.waterfall_breakdown()'s shape (per-route revenue/lines/margin
+    in $/MMBtu) for app.py's waterfall/Sankey display, but physical-engine
+    -derived (docs/PHASE2_PLAN.md Section 8 step 8) -- used by
+    POST_LIFT_DIVERSION/PRE_LIFT_CARGO/VESSEL_PROGRAMME. RENEWAL_RATE_SCREEN
+    keeps using model.waterfall_breakdown() unchanged (that mode never
+    calls this)."""
+    return {
+        route: {k: v for k, v in _physical_route_breakdown(row, params, route).items()
+                if k in {"revenue", "lines", "margin"}}
+        for route in ("Europe", "Asia")
+    }
+
+
 def route_value(
     row: Mapping,
     params: model.Params,
@@ -166,15 +274,26 @@ def route_value(
 ) -> RouteValue:
     """Value one route under an explicit decision state.
 
-    The legacy strip's ``eu_cargo``/``asia_cargo`` values are full pre-lift
-    cargo margins.  For an already loaded current cargo, procurement and
-    loading are added back because they are sunk and cannot distinguish the
-    remaining route alternatives.
+    RENEWAL_RATE_SCREEN keeps reading the legacy strip's ``eu_cargo``/
+    ``asia_cargo`` full pre-lift cargo margins unchanged (Section 3: this
+    mode's screening formula stays permanent). Every other mode
+    (POST_LIFT_DIVERSION, PRE_LIFT_CARGO, VESSEL_PROGRAMME) is valued from
+    the physical engine instead (Section 8 step 8) -- see
+    _physical_route_value() for what changes and why.
+
+    For an already loaded current cargo, procurement and loading are added
+    back because they are sunk and cannot distinguish the remaining route
+    alternatives.
     """
 
     route = _normalise_route(route)
     mode = DecisionMode(mode)
-    full = _full_value(row, route)
+
+    if mode == DecisionMode.RENEWAL_RATE_SCREEN:
+        duration_days = _duration(row, route)
+        full = _full_value(row, route)
+    else:
+        duration_days, full = _physical_route_value(row, params, route)
 
     proc_treatment = cost_policy(mode, "procurement", future_cargo=future_cargo)
     loading_treatment = cost_policy(mode, "loading", future_cargo=future_cargo)
@@ -189,7 +308,7 @@ def route_value(
         route=route,
         month_index=month_index,
         load_month=pd.Timestamp(row["load_month"]),
-        duration_days=_duration(row, route),
+        duration_days=duration_days,
         full_cargo_value=full,
         incremental_value=incremental,
         procurement_treatment=proc_treatment,

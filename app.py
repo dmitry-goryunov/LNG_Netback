@@ -462,7 +462,7 @@ if PAGE == "0 Decision":
         wf_route = st.radio("Route", [v.route for v in ranked], horizontal=True, key="isolated_wf_route")
         wf_value = next(v for v in ranked if v.route == wf_route)
         wf_sunk = wf_value.procurement_treatment == decision.CostTreatment.SUNK
-        wf_bd_all = model.waterfall_breakdown(strip_df.iloc[month_index].to_dict(), params)
+        wf_bd_all = decision.physical_waterfall_breakdown(strip_df.iloc[month_index], params)
         wf_lines, wf_margin = _decision_waterfall_lines(wf_bd_all[wf_route], wf_sunk)
         st.plotly_chart(
             _plotly_waterfall(
@@ -550,8 +550,11 @@ if PAGE == "0 Decision":
             st.caption(
                 "Current cargo is valued post-lift. Every later cargo is valued "
                 "pre-lift using the forward-strip month matching its start date. "
-                "The provisional programme uses legacy voyage physics and must be "
-                "re-baselined after the physical-engine rebuild."
+                "Cargo values come from the segment-level physical engine "
+                "(physical.py/emissions.py, docs/PHASE2_PLAN.md step 8) -- fuel, "
+                "boil-off and EU ETS cost are derived per voyage segment rather "
+                "than the flat legacy constants. Voyage durations are unchanged "
+                "(the engine reproduces the legacy day-count fields exactly)."
             )
             st.caption(
                 "Charter and every other running cost are only charged for the "
@@ -624,8 +627,8 @@ if PAGE == "0 Decision":
                                      format_func=lambda i: leg_labels[i], key="programme_leg_pick")
             sel_leg, sel_rv = best.legs[leg_pick], leg_values[leg_pick]
             sel_sunk = sel_rv.procurement_treatment == decision.CostTreatment.SUNK
-            sel_bd_all = model.waterfall_breakdown(
-                programme_strip.iloc[sel_leg.month_index].to_dict(), programme_params
+            sel_bd_all = decision.physical_waterfall_breakdown(
+                programme_strip.iloc[sel_leg.month_index], programme_params
             )
             sel_lines, sel_margin = _decision_waterfall_lines(sel_bd_all[sel_leg.route], sel_sunk)
             st.plotly_chart(
@@ -704,12 +707,14 @@ if PAGE == "0 Decision":
                     "starting that month."
                 )
 
-    with st.expander("Physical reconciliation (preview -- not yet used in the decision values above)"):
+    with st.expander("Physical reconciliation (segment-level detail)"):
         st.caption(
             "Segment-level physical engine (physical.py/emissions.py, docs/PHASE2_PLAN.md). "
-            "Shown here for transparency and audit only -- the programme/decision values "
-            "elsewhere on this page still come from the legacy model.strip() formula until "
-            "Phase 2 step 8 wires this engine into route valuation."
+            "This is the same engine now valuing the Post-lift/Pre-lift/Vessel-programme "
+            "decision modes above (Phase 2 step 8) -- shown here as an independent, "
+            "audit-only ledger view for any load month/route you pick, not tied to the "
+            "currently selected cargo. Renewal-rate screen mode still uses the legacy "
+            "model.strip() formula unchanged (Section 3 of the plan)."
         )
         recon_month_index = st.selectbox(
             "Load month", options=list(range(len(strip_df))),

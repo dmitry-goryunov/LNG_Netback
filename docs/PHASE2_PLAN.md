@@ -570,19 +570,91 @@ with everything else in Sections 3/9.
    Verified live: Europe and Asia-congested both reproduce the exact
    figures already proven in the test suite (e.g. congested Asia: 0 vented,
    7,226 MMBtu reliquefied, 0 ETS-covered CO2e).
-8. Wire `decision.py`'s `route_value()` to read `duration_days` and
-   ship/BOG/ETS cost from a `physical.py` voyage ledger instead of
-   `row["europe_rt"]`/`row["eu_cargo"]`/`row["asia_cargo"]`, **for the three
-   new decision modes only** (`POST_LIFT_DIVERSION`, `PRE_LIFT_CARGO`,
-   `VESSEL_PROGRAMME`); `RENEWAL_RATE_SCREEN` keeps calling `model.strip()`
-   unchanged (Section 3). This step re-baselines the programme optimiser's
-   absolute values, which `docs/IMPLEMENTATION_STATUS.md` already documents
-   as provisional and expected to change here.
-9. Re-run the full suite: legacy 64/64 (must be unaffected --
-   `RENEWAL_RATE_SCREEN`/`model.strip()` untouched), the existing 14
-   decision/programme/risk-containment tests (values will change for
-   programme tests per step 8; re-baseline those specific assertions, not
-   the pass/fail architecture), plus the ~11 new physical/emissions tests.
+8. **DONE** (`decision.py`: `_physical_route_breakdown()`,
+   `_physical_route_value()`, `physical_waterfall_breakdown()`;
+   `route_value()` now dispatches on `mode`). `RENEWAL_RATE_SCREEN` still
+   reads `row["eu_cargo"]`/`row["asia_cargo"]`/`row["europe_rt"]`/
+   `row["asia_rt"]` exactly as before (guarded by an explicit test,
+   `test_renewal_rate_screen_mode_still_matches_legacy_row_exactly` --
+   this mode isn't actually reachable through `isolated_route_values()`/
+   `optimise_programme()` today, but the contract is pinned for any future
+   direct caller anyway). The other three modes now get `duration_days`
+   and `full_cargo_value` from `physical.run_voyage()` +
+   `emissions.voyage_emissions()`/`ets_cost_usd()`, with procurement,
+   loading, regas/port, other_cost, Panama toll and the snapped/overridden
+   charter day-rate untouched, on the same loaded-cargo basis
+   `model.strip()` uses. `heel_target_mmbtu=0.0` throughout, closing
+   Section 10 item 7 (below) by deliberately *not* introducing a new
+   unverified non-zero heel assumption into real decision values.
+
+   **Verified, quantified consequences (all confirmed against the real
+   workbook, 2026-07-08, `model.Params()` defaults except where noted):**
+   - **Europe:** `full_cargo_value` comes in ~0.04-0.08% *lower* than
+     `model.strip()`'s `eu_cargo` (~$18.0k on a ~$24.0-48.6M cargo,
+     depending on decision mode). This is essentially 100% the Section 6
+     ETS-scope finding landing in a real value for the first time: the
+     gap between legacy and physical `full_cargo_value` matches the gap
+     between legacy and physical ETS cost to $0.49 out of $18,046 (rel.
+     0.003%) -- fuel/delivered-cargo differences are floating-point noise
+     for the uncongested base case, exactly as the Section 6 equivalence
+     tests predict. Pinned in
+     `test_europe_physical_value_is_lower_than_legacy_by_the_documented_ets_scope_fix`.
+   - **Asia, base case (no congestion):** `full_cargo_value` matches
+     `asia_cargo` to floating-point noise (diff ~-$0.96 on a ~$25.7M
+     cargo, rel. 3.7e-8) -- confirms the physical engine is a strict
+     refinement of the legacy formula here, not a new assumption set.
+     Pinned in `test_base_asia_physical_value_matches_legacy_to_floating_point_noise`.
+   - **Asia, congested case:** `full_cargo_value` comes in ~1.9% *higher*
+     than the legacy flat-rate `asia_cargo` (ratio 1.0191 at this date).
+     Asia has zero EU ETS exposure in both models, so this is purely the
+     step-6 queue-rate/reliquefaction effect landing in a real value:
+     queue time is charged at the lower queue demand rate rather than the
+     full sea-passage rate, and the laden queue's BOG surplus is
+     reliquefied (stays in cargo, delivered is not reduced) rather than
+     assumed lost, at the engine's default reliq capacity. A real,
+     quantified value-side improvement, not a rounding artifact. Pinned
+     (as a ratio band, since this is a dollar figure that also moves with
+     the day's JKM price level) in
+     `test_congested_asia_physical_value_exceeds_legacy_flat_rate_fuel_assumption`.
+   - **Discrete scheduling was unaffected at this date/config:** best
+     programme sequence stayed "Europe -> Europe", `used_days` stayed
+     51.8803, and the 52/54/55-day feasibility tests were all unaffected
+     (`test_decision_programme.py`, unchanged assertions) -- step 8
+     changes the $ values, not (at least for this snapshot) which
+     schedule wins.
+   - **Bug found and fixed while verifying live, not by inspection:** the
+     Decision page's two waterfall/Sankey charts
+     (`app.py`'s "How the decision/cargo value is calculated") still
+     called `model.waterfall_breakdown()` -- reading the same static
+     `model.strip()` columns step 8 just stopped using for these modes --
+     so the chart's own caption ("matching ... above") became false,
+     silently off by exactly the Europe ETS delta. Confirmed live (UI
+     showed $48,617,563 in the waterfall caption against $48,599,517 in
+     the table above it) before being caught; not something the pytest
+     suite alone would have surfaced, since `model.waterfall_breakdown()`
+     and `decision.route_value()` were never compared against each other
+     in a test. Fixed with `decision.physical_waterfall_breakdown()`
+     (built on the same `_physical_route_breakdown()` core as
+     `_physical_route_value()`, so the two can never drift apart again by
+     construction) and a new reconciliation test,
+     `test_physical_waterfall_breakdown_reconciles_to_physical_route_value`.
+     The new waterfall keeps the legacy chart's shape and narrative
+     (Revenue at full-loaded-cargo basis, an explicit "Boil-off" line
+     valuing gas that never reached delivery at the sale price, "Bunkers"
+     as the purchased-fuel-only cost) so the *story* the chart tells is
+     unchanged -- only the underlying numbers are now dynamic per-segment
+     results instead of the flat legacy constants.
+9. **DONE.** Full suite re-run after step 8: legacy 64/64 unaffected
+   (`RENEWAL_RATE_SCREEN`/`model.strip()` untouched, confirmed);
+   `tests/test_decision_programme.py` grew from 10 to 16 (3 pre-existing
+   dollar-comparison assertions rewritten to check engine-agnostic
+   invariants -- sunk-cost add-back, pre-lift-equals-full -- instead of
+   hardcoded legacy numbers now that non-screen modes use a different
+   formula; duration/feasibility/ranking assertions untouched; 6 new
+   tests added for the dispatch itself, the three quantified findings
+   above, and the waterfall reconciliation); full pytest suite 83/83;
+   `tests/app_smoke_check.py` re-verified live (Best programme still
+   "Europe -> Europe", Used vessel-days still 51.8803, no exceptions).
 
 ## 9. Explicit non-goals for this phase
 
@@ -661,8 +733,20 @@ Reordered after step 6's finding. Items 1 and 2 are now both **closed**.
    engine type, e.g. WinGD X-DF vs MAN ME-GI have different slip profiles).
 6. **Section 5.3**: confirm shipping FuelEU as an explicit `NOT_PRICED`
    marker (recommended) rather than attempting a shadow price this phase.
-7. **Section 4.4**: `heel_fraction` default for the ballast leg -- this phase
-   introduces heel as a real, non-zero inventory for the first time. A
-   reasonable industry-typical default (commonly cited range is low single-
-   digit percent of cargo capacity) needs to be chosen and flagged as an
-   assumption, not derived from the workbook (no heel data exists in it).
+7. **CLOSED for step 8's route-valuation wiring.** `decision.py`'s
+   `_physical_route_breakdown()` calls `physical.run_voyage(..., 
+   heel_target_mmbtu=0.0)` -- zero heel, matching `model.strip()`'s
+   implicit assumption exactly (the legacy model has no heel concept at
+   all; it treats 100% of ballast/discharge fuel demand as purchased
+   VLSFO with no BOG offset). This is a deliberate choice *not* to
+   introduce a new, unverified non-zero heel assumption into real
+   decision values just because the engine now supports one -- not a
+   claim that real vessels sail in ballast with zero heel. A reasonable
+   industry-typical non-zero default (commonly cited range is low
+   single-digit percent of cargo capacity) is still worth adding in a
+   future phase, at which point it would change the ballast leg's fuel
+   mix (some ballast demand would be met by heel BOG instead of 100%
+   purchased fuel) -- tracked as a follow-on, not blocking here, since
+   step 8's numbers already exactly reproduce legacy's own ballast-fuel
+   economics rather than silently changing them as a side effect of
+   unrelated wiring.
