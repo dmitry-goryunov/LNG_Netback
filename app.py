@@ -93,6 +93,50 @@ def _plotly_flow_sankey(title: str, revenue: float, lines: list, margin: float):
     fig.update_layout(title=title, height=320, font_size=12, margin=dict(t=40, b=10, l=10, r=10))
     return fig
 
+
+def _decision_waterfall_lines(bd: dict, sunk: bool) -> tuple[list, float]:
+    """Adapts model.waterfall_breakdown()'s $/MMBtu lines/margin to a
+    decision-state view: when procurement and loading are sunk (an
+    already-loaded current cargo), they are removed from the cost lines --
+    rather than shown as a subtraction -- so the waterfall foots to the
+    *incremental* decision value shown in the metrics above it, not the
+    full-cargo P&L. margin + sum(dropped) == incremental value / cargo_size,
+    matching decision.route_value()'s sunk-cost add-back exactly."""
+    if not sunk:
+        return bd["lines"], bd["margin"]
+    dropped = {"Procurement", "Loading"}
+    kept = [(n, v) for n, v in bd["lines"] if n not in dropped]
+    sunk_total = sum(v for n, v in bd["lines"] if n in dropped)
+    return kept, bd["margin"] + sunk_total
+
+
+def _plotly_programme_waterfall(title: str, legs, residual_days: float, residual_value: float,
+                                 total_value: float):
+    """How the programme's total $ value is assembled: one relative bar per
+    scheduled cargo's incremental value, one for residual vessel-day value,
+    and a total bar. Reads decision.ProgrammeLeg.value only -- no
+    recalculation."""
+    names = [f"Cargo {leg.cargo_number}: {leg.route} ({leg.load_month.strftime('%b-%y')})" for leg in legs]
+    values = [leg.value for leg in legs]
+    if abs(residual_value) > 1e-6 or residual_days > 1e-6:
+        names.append(f"Residual ({residual_days:,.2f} d)")
+        values.append(residual_value)
+    names.append("Programme value")
+    measures = ["relative"] * len(values) + ["total"]
+    values_full = values + [total_value]
+    fig = go.Figure(go.Waterfall(
+        x=names, measure=measures, y=values_full,
+        text=[f"{v:,.0f}" for v in values_full],
+        textposition="outside",
+        increasing={"marker": {"color": "#2f6db3"}},
+        decreasing={"marker": {"color": "#c66b4e"}},
+        totals={"marker": {"color": "#3d8a5f" if total_value >= 0 else "#b23a3a"}},
+        connector={"line": {"color": "#c9d0d8", "dash": "dot"}},
+    ))
+    fig.update_layout(title=title, showlegend=False, height=380, yaxis_title="$",
+                       margin=dict(t=40, b=10, l=10, r=10))
+    return fig
+
 # ===========================================================================
 # Data loading (spec 1.7: env var path, cached on path+mtime; else
 # file_uploader fallback so the app runs without the Drive path mounted)
@@ -325,6 +369,30 @@ if PAGE == "0 Decision":
                 "but remain in full-cargo P&L."
             )
 
+        st.subheader("How the decision value is calculated")
+        wf_route = st.radio("Route", [v.route for v in ranked], horizontal=True, key="isolated_wf_route")
+        wf_value = next(v for v in ranked if v.route == wf_route)
+        wf_sunk = wf_value.procurement_treatment == decision.CostTreatment.SUNK
+        wf_bd_all = model.waterfall_breakdown(strip_df.iloc[month_index].to_dict(), params)
+        wf_lines, wf_margin = _decision_waterfall_lines(wf_bd_all[wf_route], wf_sunk)
+        st.plotly_chart(
+            _plotly_waterfall(
+                f"{wf_route} {'incremental (sunk costs excluded)' if wf_sunk else 'full-cargo'} "
+                f"waterfall ({wf_value.load_month.strftime('%b-%y')})",
+                wf_bd_all[wf_route]["revenue"], wf_lines, wf_margin,
+            ),
+            width="stretch",
+        )
+        st.caption(
+            f"$/MMBtu margin x cargo size ({params.cargo_size:,.0f} MMBtu) = "
+            f"${wf_margin * params.cargo_size:,.0f}, matching the decision value above "
+            "(subject to rounding)." + (
+                " Procurement and loading are removed from the cost lines here because "
+                "they are sunk -- this is the incremental view, not the full-cargo P&L."
+                if wf_sunk else ""
+            )
+        )
+
     else:
         st.subheader("Discrete one-vessel programme")
         c1, c2, c3 = st.columns(3)
@@ -385,6 +453,86 @@ if PAGE == "0 Decision":
                 "pre-lift using the forward-strip month matching its start date. "
                 "The provisional programme uses legacy voyage physics and must be "
                 "re-baselined after the physical-engine rebuild."
+            )
+
+            # --- How the programme value is calculated -----------------------
+            # Recomputes decision.route_value() per leg for display only; this
+            # is exactly what optimise_programme() already computed internally
+            # to produce leg.value, so leg_values[i].incremental_value ==
+            # best.legs[i].value by construction -- nothing new is modelled.
+            st.subheader("How the programme value is calculated")
+            leg_values = [
+                decision.route_value(
+                    programme_strip.iloc[leg.month_index], programme_params, leg.route, leg.decision_mode,
+                    month_index=leg.month_index, future_cargo=(leg.cargo_number > 1),
+                )
+                for leg in best.legs
+            ]
+            detail_rows = []
+            for leg, rv in zip(best.legs, leg_values):
+                detail_rows.append({
+                    "cargo": str(leg.cargo_number),
+                    "route": leg.route,
+                    "load_month": leg.load_month.strftime("%b-%y"),
+                    "decision_mode": leg.decision_mode.value,
+                    "full_cargo_value": rv.full_cargo_value,
+                    "procurement": rv.procurement_treatment.value,
+                    "loading": rv.loading_treatment.value,
+                    "sunk_addback": rv.incremental_value - rv.full_cargo_value,
+                    "cargo_value": rv.incremental_value,
+                })
+            if abs(best.residual_value) > 1e-6 or best.residual_days > 1e-6:
+                detail_rows.append({
+                    "cargo": "residual", "route": "-", "load_month": "-",
+                    "decision_mode": "residual vessel-day value",
+                    "full_cargo_value": np.nan, "procurement": "-", "loading": "-",
+                    "sunk_addback": np.nan, "cargo_value": best.residual_value,
+                })
+            st.dataframe(
+                pd.DataFrame(detail_rows).style.format({
+                    "full_cargo_value": "${:,.0f}", "sunk_addback": "${:,.0f}", "cargo_value": "${:,.0f}",
+                }, na_rep="-"),
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "full_cargo_value is the pre-lift cargo margin from the forward strip. "
+                "sunk_addback restores procurement/loading for an already-loaded current "
+                "cargo (post-lift) and is zero for future pre-lift cargoes, which already "
+                "include procurement once. cargo_value = full_cargo_value + sunk_addback, "
+                "and the cargo_value column sums to the programme value above."
+            )
+            st.plotly_chart(
+                _plotly_programme_waterfall(
+                    f"Programme value build-up: {best.sequence}",
+                    best.legs, best.residual_days, best.residual_value, best.total_value,
+                ),
+                width="stretch",
+            )
+
+            st.subheader("How one cargo's value is calculated")
+            leg_labels = [f"Cargo {leg.cargo_number}: {leg.route} ({leg.load_month.strftime('%b-%y')})"
+                          for leg in best.legs]
+            leg_pick = st.selectbox("Cargo", options=list(range(len(best.legs))),
+                                     format_func=lambda i: leg_labels[i], key="programme_leg_pick")
+            sel_leg, sel_rv = best.legs[leg_pick], leg_values[leg_pick]
+            sel_sunk = sel_rv.procurement_treatment == decision.CostTreatment.SUNK
+            sel_bd_all = model.waterfall_breakdown(
+                programme_strip.iloc[sel_leg.month_index].to_dict(), programme_params
+            )
+            sel_lines, sel_margin = _decision_waterfall_lines(sel_bd_all[sel_leg.route], sel_sunk)
+            st.plotly_chart(
+                _plotly_waterfall(
+                    f"Cargo {sel_leg.cargo_number}: {sel_leg.route} "
+                    f"{'incremental (sunk costs excluded)' if sel_sunk else 'pre-lift'} "
+                    f"waterfall ({sel_leg.load_month.strftime('%b-%y')})",
+                    sel_bd_all[sel_leg.route]["revenue"], sel_lines, sel_margin,
+                ),
+                width="stretch",
+            )
+            st.caption(
+                f"$/MMBtu margin x cargo size ({programme_params.cargo_size:,.0f} MMBtu) = "
+                f"${sel_margin * programme_params.cargo_size:,.0f}, matching this cargo's value "
+                "in the table above (subject to rounding)."
             )
 
     fx_rows = model.fx_extrapolated_rows(strip_df)
