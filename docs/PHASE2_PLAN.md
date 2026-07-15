@@ -1,11 +1,31 @@
 # Phase 2 implementation plan: unified physical and emissions engine
 
 **Governing plan:** `docs/IMPROVEMENT_PLAN.md` v1.2, Improvements 3-5, Phase 2.
-**Status:** draft, not yet implemented. No code has been written against this
-plan.
-**Builds on:** `v2.3-phase1` (commit `0be26cc`) -- decision modes and the
-provisional programme optimiser, which currently still consume `model.strip()`
-directly.
+**Status:** in progress -- see `docs/IMPLEMENTATION_STATUS.md` for exactly
+what has been built against this plan so far.
+**Builds on:** current `main`, which by now includes `v2.3-phase1`
+(`0be26cc`) plus later same-day work not reflected in that release's own
+docs: the 36-month forward strip and multi-tenor FX curve (`312e7b8`,
+`b46a75a`), Decision-page waterfalls with explicit sunk-cost add-back
+(`14842f3`, `3707d70`, `45de9ab`), and the two "all months in one place"
+graphs with the chronological-axis fix (`cc213ef`). Anyone resuming this
+plan should re-run Section 5 ("Step 1: inspect the current code") against
+actual `main`, not trust any single commit's own snapshot of "current
+state" -- including this document's, which will itself go stale the moment
+more work lands.
+
+## 0. Incorporated from `docs/AGENT_TASK_V2_4_PHYSICAL_ENGINE.md`
+
+A separately-authored task brief for the same phase landed in this repo.
+Reviewed against this plan; three genuinely better ideas were merged in
+(marked inline below with **[v2.4 brief]**): a three-state first-cargo
+model instead of two, an explicit terminal-heel reconciliation, and a
+mutation-testing requirement. Its single-release, ~70-test, five-new-UI,
+ZIP-packaged scope was deliberately **not** adopted -- that's several weeks
+of work bundled into one unreviewable cutover, which is exactly the
+big-bang risk Section 3 below exists to avoid. This plan keeps the staged,
+independently-committable-increment structure instead (Section 8); the
+brief's content was mined for requirements, not adopted as a work plan.
 
 ---
 
@@ -94,6 +114,38 @@ determines whether `co2_eu_ets_tonnes` is literally deleted from `model.py`
 this phase (it is not, under this recommendation -- it becomes unused by the
 new decision modes but stays as the legacy screen's input) or removed
 outright.
+
+## 3a. Related small increment: three-state first-cargo model **[v2.4 brief]**
+
+Independent of the physical engine and safe to do first (`decision.py`
+only, no `model.py`/physical dependency, small diff): `decision.py`'s
+`RouteValue` already carries `procurement_treatment` and `loading_treatment`
+as *separate* `CostTreatment` fields, but `cost_policy()` currently only
+ever produces two combinations -- both `SUNK` (`POST_LIFT_DIVERSION`,
+`VESSEL_PROGRAMME`'s current cargo) or both `INCLUDED` (`PRE_LIFT_CARGO`,
+any `future_cargo=True`). There is no way to represent a cargo that is
+already bought (procurement sunk) but not yet loaded (loading still
+avoidable) -- a real, distinct commercial state (DES/FOB-purchased cargo
+sitting pre-loading).
+
+Add:
+
+```python
+class FirstCargoState(str, Enum):
+    ALREADY_LOADED = "already_loaded"                                    # procurement + loading both sunk
+    PROCUREMENT_COMMITTED_LOADING_REQUIRED = "procurement_committed_loading_required"  # procurement sunk, loading avoidable
+    FULLY_PRE_LIFT = "fully_pre_lift"                                    # both avoidable (== today's PRE_LIFT_CARGO)
+```
+
+`cost_policy()` gains an optional `first_cargo_state` parameter (default
+`None`, preserving today's two-combination behaviour exactly when omitted
+-- this is additive, not a breaking change to the existing signature or
+any existing call site); when supplied it independently sets
+`procurement_treatment`/`loading_treatment` per the state. Surfaces as a
+third radio option (or extends the existing mode selector) on the Decision
+page for `POST_LIFT_DIVERSION`/`VESSEL_PROGRAMME`'s *current* cargo only --
+future programme cargoes stay `FULLY_PRE_LIFT` always, per existing
+`route_value(..., future_cargo=True)` semantics.
 
 ## 4. New module: `physical.py`
 
@@ -220,6 +272,23 @@ reconciliation identity `loaded == delivered + lng_burned + vented +
 other_loss + heel_out` (± floating-point tolerance; `other_loss` is 0 until a
 concrete loss mechanism is specified -- do not invent one).
 
+**[v2.4 brief] Two separate reconciliations, not one.** The main identity
+above covers only the laden-period disposition of the loaded cargo (ending
+at `heel_out_mmbtu` = heel *as retained at discharge*). Ballast-leg BOG and
+any forced vaporisation during the return leg draw down that heel further
+before the vessel is available again; report this as a second, explicit
+reconciliation --
+
+```
+heel_at_discharge = delivered_leg's heel_out_mmbtu
+terminal_heel = heel_at_discharge - ballast_lng_consumed_mmbtu
+```
+
+-- so `VoyageLedger` exposes both `heel_at_discharge_mmbtu` and
+`terminal_heel_mmbtu`, and the acceptance criterion "ballast consumption
+does not reduce delivered cargo" is checked against the *first* identity
+(which never includes ballast terms), not conflated with the second.
+
 ## 5. New module: `emissions.py`
 
 ### 5.1 Combustion factors
@@ -336,8 +405,22 @@ test style, which favours explicit fixtures over property frameworks).
 | 10 | Changing `eua_price` changes only EU-scope segments' cost, never Asia's | §E.4 |
 | 11 | Legacy-equivalence test (Section 6 above) | new, this plan |
 
+**[v2.4 brief] Mutation check, not committed:** for at least the
+conservation test (#1) and one emissions test (#7), deliberately break the
+implementation locally (e.g. double-count a segment's burn, or hardcode
+`ets_scope_fraction=0`), confirm the corresponding test actually fails, then
+revert before committing. A test that can't be made to fail by breaking the
+thing it claims to check is not verifying anything. Record what was broken
+and that the test caught it in the commit message rather than a separate
+file -- this repo doesn't otherwise keep a `test_results/` directory of
+prose evidence, and introducing one just for this would be inconsistent
+with everything else in Sections 3/9.
+
 ## 8. Sequencing
 
+0. Section 3a (three-state first-cargo model) can land independently, any
+   time, before or in parallel with the rest of this sequence -- it touches
+   only `decision.py` and is additive to `cost_policy()`'s signature.
 1. `physical.py`: enums, `VesselPerformance`, `VoyageSegment`, segment-balance
    function, `run_voyage`. No route builders yet -- unit-test the balance
    function directly against hand-computed numbers first.
