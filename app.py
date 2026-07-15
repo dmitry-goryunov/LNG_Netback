@@ -25,7 +25,9 @@ import streamlit as st
 
 import data
 import decision
+import emissions
 import model
+import physical
 import risk
 
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
@@ -701,6 +703,86 @@ if PAGE == "0 Decision":
                     "\"(infeasible)\" means no route fits the current cargo within the horizon "
                     "starting that month."
                 )
+
+    with st.expander("Physical reconciliation (preview -- not yet used in the decision values above)"):
+        st.caption(
+            "Segment-level physical engine (physical.py/emissions.py, docs/PHASE2_PLAN.md). "
+            "Shown here for transparency and audit only -- the programme/decision values "
+            "elsewhere on this page still come from the legacy model.strip() formula until "
+            "Phase 2 step 8 wires this engine into route valuation."
+        )
+        recon_month_index = st.selectbox(
+            "Load month", options=list(range(len(strip_df))),
+            format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
+            key="recon_month",
+        )
+        recon_route_choice = st.radio(
+            "Route", ["Europe", "Asia (base, 46.7436 days)", "Asia (congested, 54.7436 days)"],
+            horizontal=True, key="recon_route",
+        )
+        recon_params = copy.deepcopy(params)
+        if recon_route_choice.startswith("Asia"):
+            recon_params.asia_rt_days = (
+                model.ASIA_RT_CONG if "congested" in recon_route_choice else model.ASIA_RT_BASE
+            )
+        recon_vessel = physical.vessel_performance_from_params(recon_params)
+        recon_segments = (
+            physical.europe_route_segments(recon_params) if recon_route_choice == "Europe"
+            else physical.asia_route_segments(recon_params)
+        )
+        recon_ledger = physical.run_voyage(recon_segments, recon_vessel, loaded_mmbtu=recon_params.cargo_size)
+        recon_emissions = emissions.voyage_emissions(recon_ledger)
+
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Loaded", f"{recon_ledger.loaded_mmbtu:,.0f} MMBtu")
+        rc2.metric("Delivered", f"{recon_ledger.delivered_mmbtu:,.0f} MMBtu")
+        rc3.metric("LNG burned", f"{recon_ledger.lng_burned_mmbtu:,.0f} MMBtu")
+        rc4.metric("Vented", f"{recon_ledger.vented_mmbtu:,.0f} MMBtu")
+        rc5, rc6, rc7, rc8 = st.columns(4)
+        rc5.metric("Reliquefied", f"{recon_ledger.reliquefied_mmbtu:,.0f} MMBtu")
+        rc6.metric("Heel at discharge", f"{recon_ledger.heel_at_discharge_mmbtu:,.0f} MMBtu")
+        rc7.metric("Terminal heel", f"{recon_ledger.terminal_heel_mmbtu:,.0f} MMBtu")
+        rc8.metric("Reconciliation error", f"{recon_ledger.reconciliation_error_mmbtu:,.6f} MMBtu")
+
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.metric("CO2", f"{recon_emissions.total_co2_tonnes:,.1f} t")
+        ec2.metric("CH4 (slip + vented)", f"{recon_emissions.total_ch4_tonnes:,.2f} t")
+        ec3.metric("CO2e", f"{recon_emissions.total_co2e_tonnes:,.1f} t")
+        ec4.metric("ETS-covered CO2e", f"{recon_emissions.ets_covered_co2e_tonnes:,.1f} t")
+        if recon_emissions.total_ch4_vented_tonnes > 0.01:
+            st.warning(
+                f"{recon_emissions.total_ch4_vented_tonnes:,.1f} t of raw methane vented -- "
+                f"reliquefaction capacity ({recon_vessel.reliq_capacity_mmbtu_per_day:,.0f} MMBtu/day) "
+                "was insufficient to absorb the surplus at this route/month."
+            )
+
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "segment": r.segment.name, "state": r.segment.state.value,
+                    "days": r.segment.duration_days, "opening_inv": r.opening_inventory_mmbtu,
+                    "natural_bog": r.natural_bog_mmbtu, "demand": r.demand_mmbtu,
+                    "bog_burned": r.bog_burned_mmbtu, "surplus": r.surplus_mmbtu,
+                    "reliquefied": r.reliquefied_mmbtu, "vented": r.vented_mmbtu,
+                    "shortfall": r.shortfall_mmbtu, "liquid_fuel_t": r.shortfall_liquid_fuel_tonnes,
+                    "closing_inv": r.closing_inventory_mmbtu,
+                }
+                for r in recon_ledger.segments
+            ]).style.format({
+                "days": "{:,.4f}", "opening_inv": "{:,.0f}", "natural_bog": "{:,.0f}",
+                "demand": "{:,.0f}", "bog_burned": "{:,.0f}", "surplus": "{:,.0f}",
+                "reliquefied": "{:,.0f}", "vented": "{:,.0f}", "shortfall": "{:,.0f}",
+                "liquid_fuel_t": "{:,.2f}", "closing_inv": "{:,.0f}",
+            }),
+            width="stretch", hide_index=True,
+        )
+        st.caption(
+            f"Reliquefaction capacity assumed: {recon_vessel.reliq_capacity_mmbtu_per_day:,.0f} MMBtu/day "
+            "(physical.DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY, an informed estimate, not a vendor spec -- "
+            "see docs/PHASE2_PLAN.md Section 10 item 2). Methane slip assumed "
+            f"{emissions.DEFAULT_METHANE_SLIP_FRACTION:.1%} of LNG burned (UNCONFIRMED placeholder -- "
+            "Section 10 item 5)."
+        )
 
     _fx_warning(strip_df)
 

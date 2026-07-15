@@ -557,13 +557,19 @@ with everything else in Sections 3/9.
      reliquefaction capacity, and set an informed-estimate default
      (Section 10 item 2) that fully absorbs the congested queue's surplus,
      verified live.
-7. Reconciliation surface: add a "Physical reconciliation" expander to the
-   existing Decision page (`app.py` page `"0 Decision"`) showing the
-   `VoyageLedger` for the selected route -- **not** a new top-level page yet
+7. **DONE.** "Physical reconciliation" expander on the existing Decision
+   page (`app.py` page `"0 Decision"`) -- not a new top-level page yet
    (`IMPROVEMENT_PLAN.md`'s "Page 5: Physical reconciliation" is a Phase 6
-   interface concern; a minimal expander satisfies this phase's "no fuel or
-   BOG input should be display-only" acceptance criterion without a UI
-   redesign).
+   interface concern). Independent load-month/route pickers (Europe, Asia
+   base, Asia congested), showing the full `VoyageLedger` (loaded/
+   delivered/burned/vented/reliquefied/heel/reconciliation error), the
+   `VoyageEmissions` summary (CO2/CH4/CO2e/ETS-covered), a per-segment
+   detail table, and the reliq-capacity/methane-slip assumptions inline so
+   they're not hidden in code. Explicitly labelled "preview -- not yet
+   used in the decision values above," since step 8 (below) hasn't landed.
+   Verified live: Europe and Asia-congested both reproduce the exact
+   figures already proven in the test suite (e.g. congested Asia: 0 vented,
+   7,226 MMBtu reliquefied, 0 ETS-covered CO2e).
 8. Wire `decision.py`'s `route_value()` to read `duration_days` and
    ship/BOG/ETS cost from a `physical.py` voyage ledger instead of
    `row["europe_rt"]`/`row["eu_cargo"]`/`row["asia_cargo"]`, **for the three
