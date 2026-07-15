@@ -181,27 +181,31 @@ engine work specifically.
 
   93 tests total (10 new), full pytest suite and legacy 64/64 both green.
 
-- **Intrinsic/extrinsic value (spread option) on the Forward-strip page**
-  (`spread_option.py`, `docs/SPREAD_OPTION.md` has the full design
-  writeup). Each route's margin is priced as a spread option (revenue --
-  TTF or JKM -- vs Henry-Hub-linked procurement cost) via the Bachelier
-  (normal) model, chosen over Black-76 because margins can be negative.
-  Intrinsic = `max(margin, 0)`; extrinsic = that option's time value.
-  Two vol/correlation sources, user-toggled: "Historical" (realized vol/
-  correlation from the workbook's actual daily price history, rolling
-  60-calendar-day window by default) and "Volatilities tab" (the
-  workbook's new `volatilities` sheet, indexed by tenor).
+- **Intrinsic/extrinsic value (JKM vs TTF diversion option) on the
+  Forward-strip page** (`spread_option.py`, `docs/SPREAD_OPTION.md` has
+  the full design writeup, including a superseded-design section).
+  Framing: a cargo is delivered to TTF (Europe) as the base case; the
+  option is diverting to JKM (Asia) instead when JKM is higher.
+  Intrinsic = `max(JKM - TTF, 0)`; extrinsic = that diversion option's
+  time value, priced as a zero-strike Margrabe (1978) exchange option
+  (lognormal, since JKM/TTF are strictly positive market prices, unlike
+  a netback margin). Two vol/correlation sources, user-toggled:
+  "Historical" (realized vol/correlation of JKM vs TTF from the
+  workbook's actual daily price history, rolling 60-calendar-day window
+  by default) and "Volatilities tab" (the workbook's `volatilities`
+  sheet, indexed by tenor) -- `Volatility TTF`/`Volatility JKM`/
+  `Correlation TTF/JKM` are exactly what this formula needs, and the
+  sheet has all three, so both sources are fully populated for every
+  month with no gaps.
 
-  The `volatilities` sheet has `Volatility TTF`/`HH`/`JKM` and
-  `Correlation TTF/HH`/`TTF/JKM`, but no `Correlation JKM/HH`, which
-  Asia's spread option needs (TTF and JKM never appear in the same
-  route's margin) -- Asia's extrinsic shows "N/A" in "Volatilities tab"
-  mode with an explicit on-page explanation, not a silently wrong
-  number; "Historical" mode is unaffected for both routes. `revenue_0`/
-  `cost_0`/`strike` are derived residually from existing `model.strip()`
-  columns so the option's forward value reproduces `eu_margin`/
-  `asia_margin` exactly by construction, verified by test.
+  This replaced an initial per-route revenue-vs-cost design (four
+  columns, Bachelier pricing, and a real gap in "Volatilities tab" mode
+  for Asia) by direct, explicit user correction after reviewing it --
+  the `Correlation TTF/JKM` column the user had already added to the
+  sheet before that correction didn't fit the per-route design (which
+  needed `Correlation JKM/HH` instead) but fits this one exactly; worth
+  weighing a user's own data changes as a signal earlier next time.
 
-  19 new tests (112 total), full pytest suite and legacy 64/64 both
-  green; verified live in-browser in both vol/correlation modes for both
-  routes, matching a standalone reference computation exactly.
+  19 tests (112 total), full pytest suite and legacy 64/64 both green;
+  verified live in-browser in both vol/correlation modes, matching a
+  standalone reference computation exactly.
