@@ -71,22 +71,41 @@ engine work specifically.
   full strip; programme value across every possible start month), and a
   fix for a pre-existing alphabetical- vs chronological-sort bug these
   exposed in the two original forward-strip charts.
-- Phase 2 (`docs/PHASE2_PLAN.md`) steps 1-4 of 9: `physical.py`'s
-  segment-level mass-balance engine, route builders, and `emissions.py`;
-  standalone and not yet wired into `model.py`/`decision.py`/`app.py`. The
-  legacy-equivalence test (`tests/test_physical_legacy_equivalence.py`)
-  passes for Europe and both Asia cases, and surfaced a real, verified
-  finding along the way: the legacy `co2_eu_ets_tonnes` constant used a
-  uniform 50% ETS-scope factor where the actual EU ETS Directive requires
-  100% for time at berth -- correcting this will raise EU-bound ETS cost by
-  ~4.45% (~5.09% once methane slip is included) once wired into route
-  valuation (step 8, not yet done). Step 4 also caught and fixed a real
-  bug: nothing actually connected `model.Params` to the engine's
-  `VesselPerformance` (a bare `VesselPerformance()`'s defaults only
-  coincidentally matched `model.Params()`'s), so editing boil-off rate or
-  fuel-requirement fields would have silently done nothing -- exactly the
-  Improvement 3 defect, reproduced inside the new engine. Fixed with
-  `physical.vessel_performance_from_params()`. 62 new tests across four
-  files (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`,
+- Phase 2 (`docs/PHASE2_PLAN.md`) steps 1-6 of 9: `physical.py`'s
+  segment-level mass-balance engine, route builders (including queue
+  separation for Asia congestion), and `emissions.py`; standalone and not
+  yet wired into `model.py`/`decision.py`/`app.py`. The legacy-equivalence
+  test (`tests/test_physical_legacy_equivalence.py`) passes for Europe and
+  both Asia cases. Step 4 caught and fixed a real bug: nothing actually
+  connected `model.Params` to the engine's `VesselPerformance` (a bare
+  `VesselPerformance()`'s defaults only coincidentally matched
+  `model.Params()`'s), so editing boil-off rate or fuel-requirement fields
+  would have silently done nothing -- exactly the Improvement 3 defect,
+  reproduced inside the new engine. Fixed with
+  `physical.vessel_performance_from_params()`.
+
+  **Two real, quantified findings, not implementation detail:**
+  1. The legacy `co2_eu_ets_tonnes` constant used a uniform 50% ETS-scope
+     factor where the actual EU ETS Directive requires 100% for time at
+     berth -- correcting this raises EU-bound ETS cost by ~4.45% (~5.09%
+     with methane slip included) once wired into route valuation (step 8,
+     not yet done).
+  2. **Larger finding, from step 6 (queue separation):** splitting Asia's
+     congestion allowance into proper queue segments revealed that, at
+     zero reliquefaction capacity (today's default), the laden queue's
+     boil-off exceeds its (lower) demand and the surplus is vented
+     outright -- ~148.7 t LNG-equivalent per congested round trip, which
+     if counted as raw methane (GWP 25) is **~3,717 t CO2e, larger than
+     the rest of that route's combustion emissions combined**.
+     `emissions.py`'s "vented gas isn't counted" limitation, previously
+     theoretical, is now demonstrably load-bearing. `docs/PHASE2_PLAN.md`
+     Section 10 escalates both the vented-methane accounting gap and the
+     zero-reliquefaction-capacity default to blocking items, ahead of
+     step 8.
+
+  62 tests through step 4, growing to 73 through step 6, across four files
+  (`test_physical_engine.py`, `test_physical_legacy_equivalence.py`,
   `test_emissions.py`, and the extended-strip suite), all passing alongside
-  an unaffected legacy 64/64.
+  an unaffected legacy 64/64 and the unmodified 10/10 programme benchmark
+  suite (`tests/test_decision_programme.py`, confirming duration-only
+  arithmetic is untouched by queue separation).

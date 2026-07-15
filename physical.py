@@ -346,19 +346,45 @@ def europe_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
 
 def asia_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
     """Asia round trip (base or congested, according to params.asia_rt_days
-    /params.asia_laden_days as already configured on params -- this
-    function does not itself choose between base and congested). Same
-    structural simplification as europe_route_segments: no separate canal
-    or queue segments yet. Every segment is outside EU ETS scope, matching
-    the legacy model's ets line only ever being added to eu_margin."""
-    asia_laden = params.asia_laden_days
+    /params.asia_laden_days as already configured on params).
+
+    Congestion (Improvement 4) is derived, not selected by a flag: any of
+    params.asia_laden_days / the implied ballast days beyond
+    model.ASIA_LEG_DAYS (the base, uncongested one-way sea time) becomes a
+    LADEN_QUEUE/BALLAST_QUEUE segment at the queue demand rate, instead of
+    inflating LADEN_SEA/BALLAST_SEA at the full sea-passage rate. At
+    asia_rt_days == ASIA_RT_BASE the excess is exactly 0 (no queue
+    segments, zero duration); at ASIA_RT_CONG it is exactly 4.0 days per
+    leg, matching model.py's own "+4 waiting days per leg" congestion
+    convention (model.py:24-26's comment: charging that at full propulsion
+    is "a documented overstatement" -- this is the fix). No separate canal
+    segment yet (ASIA_LEG_DAYS already folds in a 1-day canal allowance at
+    the sea rate, same as the legacy model). Every segment is outside EU
+    ETS scope, matching the legacy model's ets line only ever being added
+    to eu_margin.
+
+    Ordering places each queue segment adjacent to the discharge port call
+    (laden_sea -> laden_queue -> discharge -> ballast_queue -> ballast_sea)
+    as a simplification -- the legacy model does not specify where in the
+    voyage congestion occurs, so this is not claiming Panama-specific
+    positioning, only "not conflated with open-sea steaming."
+    """
+    asia_laden_total = params.asia_laden_days
     asia_port = params.asia_port_days
-    asia_ballast = params.asia_rt_days - asia_laden - asia_port
+    asia_ballast_total = params.asia_rt_days - asia_laden_total - asia_port
+
+    laden_sea = min(asia_laden_total, model.ASIA_LEG_DAYS)
+    laden_queue = max(asia_laden_total - model.ASIA_LEG_DAYS, 0.0)
+    ballast_sea = min(asia_ballast_total, model.ASIA_LEG_DAYS)
+    ballast_queue = max(asia_ballast_total - model.ASIA_LEG_DAYS, 0.0)
+
     return (
         VoyageSegment("loading", OperatingState.LOADING, duration_days=0.0, ets_scope_fraction=0.0),
-        VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=asia_laden, ets_scope_fraction=0.0),
+        VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=laden_sea, ets_scope_fraction=0.0),
+        VoyageSegment("laden_queue", OperatingState.LADEN_QUEUE, duration_days=laden_queue, ets_scope_fraction=0.0),
         VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=asia_port, ets_scope_fraction=0.0),
-        VoyageSegment("ballast_sea", OperatingState.BALLAST_SEA, duration_days=asia_ballast, ets_scope_fraction=0.0),
+        VoyageSegment("ballast_queue", OperatingState.BALLAST_QUEUE, duration_days=ballast_queue, ets_scope_fraction=0.0),
+        VoyageSegment("ballast_sea", OperatingState.BALLAST_SEA, duration_days=ballast_sea, ets_scope_fraction=0.0),
     )
 
 

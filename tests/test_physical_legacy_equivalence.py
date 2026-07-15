@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
+import emissions
 import model
 import physical
 
@@ -129,10 +130,29 @@ class TestEuropeRouteEquivalence:
 
 
 class TestAsiaRouteEquivalence:
-    """model.Params(asia_rt_days=...) for both the base and congested case.
+    """model.Params(asia_rt_days=...) for the base case, plus the
+    congested case's genuine, step-6 (queue separation) divergence from
+    the legacy flat-rate assumption.
+
     Asia legs are entirely outside EU ETS scope in both the legacy model
-    and this engine's route builder, so there is no scope-divergence
-    finding here -- only the fuel/BOG equivalence."""
+    and this engine's route builder -- no CO2-scope finding here, unlike
+    Europe. But congestion is a second, independent, and larger finding:
+    once physical.asia_route_segments() splits the +4-days-per-leg
+    congestion allowance into LADEN_QUEUE/BALLAST_QUEUE segments (at the
+    lower queue demand rate) instead of inflating LADEN_SEA/BALLAST_SEA
+    (the full sea-passage rate), the laden queue segment's natural BOG
+    (from the full cargo inventory, unaffected by which state consumes it)
+    *exceeds* the queue's own lower demand -- a surplus-BOG regime this
+    engine has not hit anywhere else, since every other laden segment
+    tested is a liquid-fuel shortfall. At the engine's default zero
+    reliquefaction capacity, that surplus (~148.7 t LNG-equivalent per
+    round trip) is entirely vented. emissions.py does not count vented gas
+    yet (its own module-level KNOWN LIMITATION) -- this route is what
+    makes that limitation genuinely load-bearing rather than a theoretical
+    edge case that never triggers, since if counted as raw methane
+    (GWP 25), 148.7 t LNG-equivalent is ~3,717 t CO2e, larger than the
+    entire rest of the round trip's combustion emissions combined.
+    """
 
     def _ledger_for(self, asia_rt_days: float) -> tuple:
         params = model.Params(asia_rt_days=asia_rt_days)
@@ -141,38 +161,83 @@ class TestAsiaRouteEquivalence:
         ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=params.cargo_size, heel_target_mmbtu=0.0)
         return params, ledger
 
-    @pytest.mark.parametrize("asia_rt_days", [model.ASIA_RT_BASE, model.ASIA_RT_CONG])
-    def test_no_reliquefaction_or_venting(self, asia_rt_days):
-        _, ledger = self._ledger_for(asia_rt_days)
-        assert ledger.reliquefied_mmbtu == pytest.approx(0.0)
+    def test_base_case_has_no_queue_time_and_no_venting(self):
+        params, ledger = self._ledger_for(model.ASIA_RT_BASE)
+        queue_days = sum(
+            r.segment.duration_days for r in ledger.segments
+            if r.segment.state in (physical.OperatingState.LADEN_QUEUE, physical.OperatingState.BALLAST_QUEUE)
+        )
+        assert queue_days == pytest.approx(0.0)
         assert ledger.vented_mmbtu == pytest.approx(0.0)
+        assert ledger.reliquefied_mmbtu == pytest.approx(0.0)
 
     @pytest.mark.parametrize("asia_rt_days", [model.ASIA_RT_BASE, model.ASIA_RT_CONG])
-    def test_laden_leg_reproduces_residual_laden_vlsfo(self, asia_rt_days):
+    def test_sea_and_discharge_segments_always_reproduce_legacy_rates(self, asia_rt_days):
+        """Regardless of congestion, the sea-passage and discharge
+        segments must still reproduce the legacy flat rates exactly --
+        only the queue portion (present only when congested) is allowed
+        to diverge."""
         params, ledger = self._ledger_for(asia_rt_days)
-        rate = _fuel_rate_t_per_day(ledger, "laden_sea", params.asia_laden_days)
-        assert rate == pytest.approx(params.residual_laden_vlsfo, abs=0.01)
+        assert _fuel_rate_t_per_day(ledger, "laden_sea", model.ASIA_LEG_DAYS) == pytest.approx(
+            params.residual_laden_vlsfo, abs=0.01
+        )
+        assert _fuel_rate_t_per_day(ledger, "ballast_sea", model.ASIA_LEG_DAYS) == pytest.approx(
+            params.ballast_fuel, abs=0.01
+        )
+        assert _fuel_rate_t_per_day(ledger, "discharge", params.asia_port_days) == pytest.approx(
+            params.port_fuel_rate, abs=0.01
+        )
 
-    @pytest.mark.parametrize("asia_rt_days", [model.ASIA_RT_BASE, model.ASIA_RT_CONG])
-    def test_ballast_leg_reproduces_ballast_fuel(self, asia_rt_days):
-        params, ledger = self._ledger_for(asia_rt_days)
-        asia_ballast = asia_rt_days - params.asia_laden_days - params.asia_port_days
-        rate = _fuel_rate_t_per_day(ledger, "ballast_sea", asia_ballast)
-        assert rate == pytest.approx(params.ballast_fuel, abs=0.01)
+    def test_congestion_produces_exactly_four_queue_days_per_leg(self):
+        _, ledger = self._ledger_for(model.ASIA_RT_CONG)
+        laden_queue = next(r for r in ledger.segments if r.segment.name == "laden_queue")
+        ballast_queue = next(r for r in ledger.segments if r.segment.name == "ballast_queue")
+        assert laden_queue.segment.duration_days == pytest.approx(4.0)
+        assert ballast_queue.segment.duration_days == pytest.approx(4.0)
 
-    @pytest.mark.parametrize("asia_rt_days", [model.ASIA_RT_BASE, model.ASIA_RT_CONG])
-    def test_discharge_reproduces_port_fuel_rate(self, asia_rt_days):
-        params, ledger = self._ledger_for(asia_rt_days)
-        rate = _fuel_rate_t_per_day(ledger, "discharge", params.asia_port_days)
-        assert rate == pytest.approx(params.port_fuel_rate, abs=0.01)
+    def test_congested_laden_queue_vents_instead_of_needing_liquid_fuel(self):
+        """The central finding of step 6, pinned precisely: natural BOG
+        during the laden queue (from the still-full cargo inventory)
+        exceeds the queue's own lower demand, so the entire surplus is
+        vented -- zero liquid fuel needed for this segment at all, the
+        opposite regime from every other laden segment in this suite."""
+        _, ledger = self._ledger_for(model.ASIA_RT_CONG)
+        laden_queue = next(r for r in ledger.segments if r.segment.name == "laden_queue")
+        assert laden_queue.shortfall_mmbtu == pytest.approx(0.0)
+        assert laden_queue.shortfall_liquid_fuel_tonnes == pytest.approx(0.0)
+        assert laden_queue.vented_mmbtu == pytest.approx(7226.3, abs=1.0)
+        assert ledger.vented_mmbtu / emissions.LNG_MMBTU_PER_T == pytest.approx(148.7, abs=0.5)
 
-    @pytest.mark.parametrize("asia_rt_days", [model.ASIA_RT_BASE, model.ASIA_RT_CONG])
-    def test_total_fuel_tonnes_matches_as_ship_fuel_component_exactly(self, asia_rt_days):
-        params, ledger = self._ledger_for(asia_rt_days)
-        asia_ballast = asia_rt_days - params.asia_laden_days - params.asia_port_days
+    def test_congested_ballast_queue_uses_queue_rate_not_ballast_sea_rate(self):
+        """Unlike the laden queue, the ballast queue starts at zero
+        inventory (no heel modelled yet -- docs/PHASE2_PLAN.md Section 10
+        item 5), so it has no BOG to vent: 100% of its (lower) queue
+        demand becomes a liquid-fuel shortfall at the queue rate (35 t/d),
+        not the flat legacy ballast_fuel rate (130 t/d)."""
+        _, ledger = self._ledger_for(model.ASIA_RT_CONG)
+        ballast_queue = next(r for r in ledger.segments if r.segment.name == "ballast_queue")
+        rate = ballast_queue.shortfall_liquid_fuel_tonnes / ballast_queue.segment.duration_days
+        assert rate == pytest.approx(35.0, abs=0.01)
+
+    def test_congested_total_fuel_is_materially_lower_than_flat_legacy_assumption(self):
+        """Documents, rather than hides, step 6's fuel-side consequence:
+        the legacy model charges all 8 congestion days (4 laden + 4
+        ballast) at the full sea rate; this engine charges them at the
+        (lower) queue rate, and the laden side substitutes venting for
+        liquid fuel entirely. Net: total liquid fuel for the congested
+        round trip comes in at ~87% of the legacy flat-rate total -- a
+        real fuel-cost reduction that arrives bundled with a real,
+        currently-uncounted venting increase (see the two tests above).
+        Pinned here so a future change to the queue demand table is
+        visible rather than silently absorbed."""
+        params, ledger = self._ledger_for(model.ASIA_RT_CONG)
         legacy_tonnes = (
             params.residual_laden_vlsfo * params.asia_laden_days
-            + params.ballast_fuel * asia_ballast
+            + params.ballast_fuel * (params.asia_rt_days - params.asia_laden_days - params.asia_port_days)
             + params.port_fuel_rate * params.asia_port_days
         )
-        assert ledger.total_liquid_fuel_tonnes == pytest.approx(legacy_tonnes, rel=1e-6)
+        ratio = ledger.total_liquid_fuel_tonnes / legacy_tonnes
+        assert 0.86 < ratio < 0.88, (
+            f"expected queue-adjusted congested fuel ({ledger.total_liquid_fuel_tonnes:.1f} t) at ~87% of "
+            f"the flat legacy assumption ({legacy_tonnes:.1f} t); got ratio {ratio:.4f}"
+        )

@@ -496,20 +496,68 @@ with everything else in Sections 3/9.
 
    One limitation deliberately shipped and explicitly tested rather than
    silently absent: `vented_mmbtu` (surplus BOG exceeding both demand and
-   reliquefaction capacity) is not counted as an emission at all yet.
-   Under every scenario exercised so far it's exactly zero, so this has no
-   effect today, but a real vent (high BOR, no reliq capacity) would
-   understate CO2e -- raw vented methane should count far more than the
-   same mass combusted. Must be closed before this module is trusted for
-   any scenario where a route actually vents.
+   reliquefaction capacity) is not counted as an emission at all yet. At
+   the time step 4 landed this was exactly zero in every scenario
+   exercised -- **step 6 below changed that**, and closing this is now
+   genuinely load-bearing, not a hypothetical.
 5. Physical/emissions invariant tests (Section 7, items 1-10) -- partially
    covered already by `test_emissions.py` (items 7-10) and
    `test_physical_engine.py` (items 2, 4, 6); items 1, 3, 5 remain.
-6. Queue separation: extend `asia_route_segments(congested=True)` to emit
-   `LADEN_QUEUE`/`BALLAST_QUEUE` segments instead of inflating sea-leg demand;
-   re-run the Phase-3 programme benchmark suite
-   (`tests/test_decision_programme.py`) unmodified to confirm duration-only
-   arithmetic is untouched (Section 4.3).
+6. **DONE** (`physical.asia_route_segments`, 7 tests added/rewritten in
+   `tests/test_physical_legacy_equivalence.py`). No `congested` parameter,
+   per Section 4.3/8-step-2's note -- congestion is derived as whatever
+   `params.asia_laden_days`/implied ballast days exceed `model.ASIA_LEG_DAYS`
+   (the base one-way sea time), which is exactly 0 at `ASIA_RT_BASE` and
+   exactly 4.0 days/leg at `ASIA_RT_CONG`, matching the legacy "+4 waiting
+   days per leg" convention without needing a flag. `tests/
+   test_decision_programme.py` (the Phase-3 programme benchmark suite)
+   re-run unmodified: still 10/10, confirming duration-only arithmetic is
+   genuinely untouched.
+
+   **This step's fuel/emissions consequence turned out to be substantially
+   larger than expected, and matters more than the Section 6 ETS-scope
+   finding.** At the engine's default zero reliquefaction capacity, the
+   laden queue segment's natural BOG -- generated from the still-full cargo
+   inventory, independent of which operating state consumes it -- exceeds
+   the queue's own *lower* demand (the queue burns less energy than full
+   sea passage, but boil-off doesn't slow down to match). That is a
+   surplus-BOG regime this engine had not exercised anywhere else covered
+   in step 3 (every other laden segment tested is a liquid-fuel
+   *shortfall*). The result: the entire surplus, ~148.7 t LNG-equivalent
+   per congested round trip, is vented outright -- not reliquefied, not
+   burned. `emissions.py`'s step-4 KNOWN LIMITATION (vented gas isn't
+   counted) is no longer a hypothetical edge case: verified via
+   `emissions.LNG_MMBTU_PER_T`, that vented mass, if counted as raw
+   methane at GWP 25, is **~3,717 t CO2e -- larger than the entire rest of
+   the round trip's combustion emissions combined** (Europe's unscoped
+   total was ~8,852 t CO2 in Section 6; Asia is the same order of
+   magnitude). The ballast queue segment does *not* show this effect (it
+   starts at zero inventory/heel, so has no BOG to vent, and its full
+   demand becomes an ordinary liquid-fuel shortfall at the lower queue
+   rate) -- the asymmetry itself is informative: congestion is cheap in
+   liquid-fuel terms on the ballast leg but creates a real venting problem
+   on the laden leg specifically.
+
+   Net effect on fuel cost alone (ignoring the uncounted venting): total
+   liquid fuel for the congested round trip comes in at **~87% of the
+   legacy flat-rate total** (verified, not estimated), since 8 of the
+   congestion days move from full-sea rates to lower queue rates. Fuel
+   cost goes *down*; a currently-unpriced methane liability goes up by an
+   amount that dwarfs it. Reporting only the fuel-cost effect without the
+   venting would be actively misleading.
+
+   **This escalates two of Section 10's open decisions from "needs
+   sign-off eventually" to "needs sign-off before step 8 (route-valuation
+   wiring) or before any congested-Asia number is shown to a real user":**
+   - closing the vented-methane emissions gap (Section 4.4/emissions.py) is
+     no longer optional cleanup;
+   - `reliq_capacity_mmbtu_per_day = 0.0` (no reliquefaction plant at all)
+     is the *cause* of the entire vented amount -- real modern LNG
+     carriers, especially 2-stroke tonnage, often do carry reliquefaction
+     capacity precisely to handle exactly this scenario. Shipping a
+     nonzero default without a real spec would be inventing a number; but
+     shipping zero without flagging that the zero itself is what's
+     producing a multi-thousand-tonne CO2e result is worse.
 7. Reconciliation surface: add a "Physical reconciliation" expander to the
    existing Decision page (`app.py` page `"0 Decision"`) showing the
    `VoyageLedger` for the selected route -- **not** a new top-level page yet
@@ -552,26 +600,48 @@ listed here so scope creep is visible if it happens:
   the physical ledger and vectorise only the price multiplication, per
   Design Principle 2.3. No Phase 5 code is written now.
 
-## 10. Open decisions needing sign-off before coding starts
+## 10. Open decisions needing sign-off
 
-1. **Section 3**: confirm `model.strip()` / `RENEWAL_RATE_SCREEN` stays
+Reordered after step 6's finding -- items 1 and 2 are now blocking (needed
+before step 8 wires this into route valuation, or before any congested-Asia
+number reaches a real user), not "eventually."
+
+1. **BLOCKING, escalated by step 6.** Vented methane is not counted as an
+   emission (`emissions.py`'s KNOWN LIMITATION). No longer hypothetical: the
+   congested Asia route already produces ~148.7 t LNG-equivalent vented per
+   round trip, ~3,717 t CO2e if counted as raw methane -- larger than the
+   rest of that route's combustion emissions combined. Needs a
+   vented-gas CO2e treatment before step 8, or an explicit, visible
+   "venting not priced" warning on any congested-Asia output in the
+   interim (mirroring the `NOT_PRICED` FuelEU pattern in item 4 below).
+2. **BLOCKING, escalated by step 6.** `reliq_capacity_mmbtu_per_day = 0.0`
+   (no reliquefaction plant at all) is the direct cause of item 1's vented
+   amount -- real modern LNG carriers, especially 2-stroke tonnage, often
+   carry reliquefaction capacity precisely to handle this. Needs a real
+   vessel spec (does this vessel class have a reliq plant, and what
+   capacity?) or an explicit, visible flag that the zero default is known
+   to be driving a multi-thousand-tonne CO2e result, not a neutral
+   placeholder.
+3. **Section 3**: confirm `model.strip()` / `RENEWAL_RATE_SCREEN` stays
    permanently on the old formula (recommended), vs. a future phase
    eventually retiring it in favour of the physical engine with
    legacy-equivalent parameters. Affects whether `co2_eu_ets_tonnes` and the
    flat fuel constants are ever deleted from `model.py`, or just superseded
    for new decision modes.
-2. **Section 4.2**: the queue/canal/discharge/port demand-rate placeholders
-   are not sourced from any workbook data and need a vessel-performance
-   figure from someone with the actual SFOC curve, or an explicit acceptance
-   that they ship as rough placeholders labelled as such in the UI.
-3. **Section 4.2**: `methane_slip_pct_of_fuel_energy` default (0.3%) is a
+4. **Section 4.2**: the queue/canal/discharge/port demand-rate placeholders
+   not covered by items 1-2 above (e.g. `LADEN_QUEUE`'s 40 t/d, unused by
+   any route builder yet since only Asia's queue segments exist so far) are
+   not sourced from any workbook data and need a vessel-performance figure
+   from someone with the actual SFOC curve, or an explicit acceptance that
+   they ship as rough placeholders labelled as such in the UI.
+5. **Section 4.2**: `methane_slip_pct_of_fuel_energy` default (0.3%) is a
    plausible modern 2-stroke low-pressure dual-fuel figure but is not
    verified against this vessel class's actual engine (the charter sheet
    implies "174k 2-stroke" -- confirm slip factor against that specific
    engine type, e.g. WinGD X-DF vs MAN ME-GI have different slip profiles).
-4. **Section 5.3**: confirm shipping FuelEU as an explicit `NOT_PRICED`
+6. **Section 5.3**: confirm shipping FuelEU as an explicit `NOT_PRICED`
    marker (recommended) rather than attempting a shadow price this phase.
-5. **Section 4.4**: `heel_fraction` default for the ballast leg -- this phase
+7. **Section 4.4**: `heel_fraction` default for the ballast leg -- this phase
    introduces heel as a real, non-zero inventory for the first time. A
    reasonable industry-typical default (commonly cited range is low single-
    digit percent of cargo capacity) needs to be chosen and flagged as an
