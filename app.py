@@ -29,6 +29,7 @@ import emissions
 import model
 import physical
 import risk
+import spread_option
 
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 
@@ -915,6 +916,77 @@ elif PAGE == "1 Forward strip":
             )
     else:
         st.caption("Pick at least one line to plot.")
+
+    st.subheader("Intrinsic / extrinsic value (spread option)")
+    st.caption(
+        "Each route's margin, treated as a spread option: revenue (TTF or JKM) vs "
+        "Henry-Hub-linked procurement cost. Intrinsic = max(margin, 0) -- today's "
+        "forward view, no uncertainty. Extrinsic = that option's time value "
+        "(Bachelier/normal model), from the volatility/correlation source below. "
+        "FX volatility is not modelled as a separate risk factor (see spread_option.py)."
+    )
+    vol_source_label = st.radio(
+        "Volatility / correlation source",
+        ["Historical", "Volatilities tab"],
+        horizontal=True, key="vol_source",
+    )
+    vol_source = "historical" if vol_source_label == "Historical" else "tab"
+    window_days = spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS
+    if vol_source == "historical":
+        window_days = st.number_input(
+            "Historical window (calendar days)", min_value=10, max_value=1000,
+            value=spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS, step=10, key="vol_window_days",
+        )
+    elif tables.vol is None:
+        st.warning(
+            "This workbook has no 'volatilities' sheet -- switch to Historical, or add one "
+            "(tenor rows 'spot'/'M+1'/'M+2'/... in column A; 'Volatility TTF'/'Volatility HH'/"
+            "'Volatility JKM' and 'Correlation TTF/HH'/'Correlation JKM/HH' headers)."
+        )
+
+    ie_df = spread_option.intrinsic_extrinsic_strip(
+        strip_df, params, tables, D, vol_source, window_days=int(window_days)
+    )
+    ie_display = ie_df[["month_label", "eu_intrinsic", "eu_extrinsic", "asia_intrinsic", "asia_extrinsic"]].copy()
+    ie_display.columns = ["Month", "Europe intrinsic", "Europe extrinsic", "Asia intrinsic", "Asia extrinsic"]
+    st.dataframe(
+        ie_display.style.format({
+            "Europe intrinsic": "{:.3f}", "Europe extrinsic": "{:.3f}",
+            "Asia intrinsic": "{:.3f}", "Asia extrinsic": "{:.3f}",
+        }, na_rep="N/A"),
+        width="stretch", hide_index=True,
+    )
+    if vol_source == "tab" and ie_df["asia_extrinsic"].isna().any():
+        st.caption(
+            "Asia extrinsic is N/A in 'Volatilities tab' mode: the sheet has no "
+            "'Correlation JKM/HH' column (it has 'Correlation TTF/JKM', which this "
+            "calculation doesn't use -- TTF and JKM never appear in the same route's "
+            "margin). Add a 'Correlation JKM/HH' column, or switch to Historical."
+        )
+    ie_chart_df = ie_df.set_index("load_month")[
+        ["eu_intrinsic", "eu_extrinsic", "asia_intrinsic", "asia_extrinsic"]
+    ].rename(columns={
+        "eu_intrinsic": "Europe intrinsic", "eu_extrinsic": "Europe extrinsic",
+        "asia_intrinsic": "Asia intrinsic", "asia_extrinsic": "Asia extrinsic",
+    })
+    st.line_chart(ie_chart_df)
+
+    with st.expander("How intrinsic/extrinsic is calculated (one month)"):
+        ie_mi = st.selectbox(
+            "Load month", options=list(range(len(strip_df))),
+            format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
+            key="ie_detail_month",
+        )
+        ie_route = st.radio("Route", ["Europe", "Asia"], horizontal=True, key="ie_detail_route")
+        ie_result = spread_option.route_spread_option(
+            strip_df.iloc[ie_mi], params, tables, D, ie_route, vol_source, window_days=int(window_days),
+        )
+        dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+        dcol1.metric("Forward margin", f"{ie_result.forward_margin:+.3f} $/MMBtu")
+        dcol2.metric("Intrinsic", f"{ie_result.intrinsic:.3f} $/MMBtu")
+        dcol3.metric("Option value", "N/A" if ie_result.option_value is None else f"{ie_result.option_value:.3f} $/MMBtu")
+        dcol4.metric("Extrinsic", "N/A" if ie_result.extrinsic is None else f"{ie_result.extrinsic:.3f} $/MMBtu")
+        st.caption(f"Time to expiry: {ie_result.time_to_expiry_years:.3f} years. Source: {ie_result.detail}")
 
     st.subheader("Waterfall & flows (single load month)")
     wf_mi = st.selectbox("Load month for waterfall/flow view", options=list(range(len(strip_df))),

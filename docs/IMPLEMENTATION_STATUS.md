@@ -180,3 +180,28 @@ engine work specifically.
   decision value in the waterfall.
 
   93 tests total (10 new), full pytest suite and legacy 64/64 both green.
+
+- **Intrinsic/extrinsic value (spread option) on the Forward-strip page**
+  (`spread_option.py`, `docs/SPREAD_OPTION.md` has the full design
+  writeup). Each route's margin is priced as a spread option (revenue --
+  TTF or JKM -- vs Henry-Hub-linked procurement cost) via the Bachelier
+  (normal) model, chosen over Black-76 because margins can be negative.
+  Intrinsic = `max(margin, 0)`; extrinsic = that option's time value.
+  Two vol/correlation sources, user-toggled: "Historical" (realized vol/
+  correlation from the workbook's actual daily price history, rolling
+  60-calendar-day window by default) and "Volatilities tab" (the
+  workbook's new `volatilities` sheet, indexed by tenor).
+
+  The `volatilities` sheet has `Volatility TTF`/`HH`/`JKM` and
+  `Correlation TTF/HH`/`TTF/JKM`, but no `Correlation JKM/HH`, which
+  Asia's spread option needs (TTF and JKM never appear in the same
+  route's margin) -- Asia's extrinsic shows "N/A" in "Volatilities tab"
+  mode with an explicit on-page explanation, not a silently wrong
+  number; "Historical" mode is unaffected for both routes. `revenue_0`/
+  `cost_0`/`strike` are derived residually from existing `model.strip()`
+  columns so the option's forward value reproduces `eu_margin`/
+  `asia_margin` exactly by construction, verified by test.
+
+  19 new tests (112 total), full pytest suite and legacy 64/64 both
+  green; verified live in-browser in both vol/correlation modes for both
+  routes, matching a standalone reference computation exactly.

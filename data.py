@@ -196,6 +196,52 @@ def load_us_transport(path_or_buffer) -> pd.DataFrame:
     return raw
 
 
+def _volatility_tenor_to_months(label) -> int:
+    s = str(label).strip().lower()
+    if s == "spot":
+        return 0
+    if s.startswith("m+"):
+        return int(s[2:])
+    raise ValueError(f"unrecognised volatility-tab tenor label {label!r}")
+
+
+def load_volatilities(path_or_buffer) -> pd.DataFrame:
+    """'volatilities' sheet: annualised (fractional) vol and correlation by
+    forward tenor (row1 e.g. 'Volatility'/'Correlation', row2 e.g.
+    'TTF'/'HH'/'JKM'/'TTF/HH', row3+ tenor label 'spot'/'M+1'/'M+2'... in
+    column A). Feeds spread_option.py's "volatilities tab" mode for the
+    Forward-strip page's intrinsic/extrinsic columns (as opposed to
+    "historical" mode, which computes these from tables.hh/ttf/jkm's daily
+    price history instead -- see spread_option.py).
+
+    Columns are named vol_<LABEL> / corr_<LABEL1>_<LABEL2> from whatever
+    the sheet actually has (e.g. vol_TTF, vol_HH, vol_JKM, corr_TTF_HH,
+    corr_TTF_JKM) -- this sheet is user-maintained and may not have every
+    pairing a given caller wants (e.g. corr_JKM_HH), so callers must check
+    for a column's presence rather than assume a fixed set. Returned
+    indexed by integer months-forward (spot=0, M+1=1, ...), ascending.
+    """
+    raw = pd.read_excel(path_or_buffer, sheet_name="volatilities", header=None)
+    kind_row, label_row = raw.iloc[0], raw.iloc[1]
+
+    col_names = ["tenor"]
+    for j in range(1, raw.shape[1]):
+        kind = str(kind_row[j]).strip().lower()
+        prefix = "vol" if kind.startswith("vol") else "corr" if kind.startswith("corr") else None
+        if prefix is None:
+            raise ValueError(f"volatilities sheet column {j}: unrecognised header {kind_row[j]!r}")
+        label = str(label_row[j]).strip().upper().replace(" ", "").replace("/", "_")
+        col_names.append(f"{prefix}_{label}")
+
+    body = raw.iloc[2:].copy()
+    body.columns = col_names
+    body = body.dropna(subset=["tenor"]).reset_index(drop=True)
+    body["months_forward"] = body["tenor"].map(_volatility_tenor_to_months)
+    for c in col_names[1:]:
+        body[c] = pd.to_numeric(body[c], errors="coerce")
+    return body.drop(columns=["tenor"]).set_index("months_forward").sort_index()
+
+
 # ---------------------------------------------------------------------------
 # Master date list (spec 1.5)
 # ---------------------------------------------------------------------------
@@ -301,6 +347,7 @@ class CurveTables:
     charter: pd.DataFrame
     us_netbacks: Optional[pd.DataFrame] = None
     us_transport: Optional[pd.DataFrame] = None
+    vol: Optional[pd.DataFrame] = None
     master_dates: pd.DatetimeIndex = field(default_factory=lambda: pd.DatetimeIndex([]))
     warnings: list[str] = field(default_factory=list)
     source: str = ""
@@ -323,12 +370,16 @@ def load_all(path_or_buffer, source_label: str = "") -> CurveTables:
         us_transport = load_us_transport(path_or_buffer)
     except Exception:
         us_transport = None
+    try:
+        vol = load_volatilities(path_or_buffer)
+    except Exception:
+        vol = None
 
     master_dates = compute_master_dates(hh, ttf, jkm, fx, charter)
 
     tables = CurveTables(
         hh=hh, ttf=ttf, jkm=jkm, fx=fx, charter=charter,
-        us_netbacks=us_netbacks, us_transport=us_transport,
+        us_netbacks=us_netbacks, us_transport=us_transport, vol=vol,
         master_dates=master_dates,
         source=str(source_label),
     )
