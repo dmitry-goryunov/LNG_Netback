@@ -85,6 +85,9 @@ class SpreadOptionResult:
     jkm_0: float
     ttf_0: float
     intrinsic: float
+    vol_jkm: Optional[float]
+    vol_ttf: Optional[float]
+    correlation: Optional[float]
     option_value: Optional[float]
     extrinsic: Optional[float]
     time_to_expiry_years: float
@@ -115,6 +118,7 @@ def price_exchange_option(
     if vc.vol_jkm is None or vc.vol_ttf is None or vc.correlation is None:
         return SpreadOptionResult(
             jkm_0=jkm_0, ttf_0=ttf_0, intrinsic=intrinsic,
+            vol_jkm=vc.vol_jkm, vol_ttf=vc.vol_ttf, correlation=vc.correlation,
             option_value=None, extrinsic=None,
             time_to_expiry_years=time_to_expiry_years,
             detail=f"{vc.source_detail}: incomplete vol/correlation inputs",
@@ -134,6 +138,7 @@ def price_exchange_option(
 
     return SpreadOptionResult(
         jkm_0=jkm_0, ttf_0=ttf_0, intrinsic=intrinsic,
+        vol_jkm=vc.vol_jkm, vol_ttf=vc.vol_ttf, correlation=vc.correlation,
         option_value=option_value, extrinsic=option_value - intrinsic,
         time_to_expiry_years=time_to_expiry_years, detail=vc.source_detail,
     )
@@ -254,16 +259,21 @@ def intrinsic_extrinsic_strip(
     strip_df: pd.DataFrame, tables, D,
     source: VolSource, window_days: int = DEFAULT_HISTORICAL_WINDOW_DAYS,
 ) -> pd.DataFrame:
-    """One row per strip_df row: load_month/month_label plus
+    """One row per strip_df row: load_month/month_label, the vol_jkm/
+    vol_ttf/correlation actually used to price that month's option (the
+    inputs, not just the outputs -- so a caller can see *why* extrinsic
+    is what it is without opening the single-month detail view), and
     intrinsic/extrinsic ($/MMBtu, the JKM-vs-TTF diversion option's
-    value). extrinsic is NaN wherever the selected source could not
-    supply complete vol/correlation inputs, rather than silently zero."""
+    value). vol_jkm/vol_ttf/correlation/extrinsic are all NaN together
+    wherever the selected source could not supply complete inputs for
+    that tenor, rather than silently zero."""
     historical_dates = _historical_window_dates(tables, D, window_days) if source == "historical" else None
     rows = []
     for _, row in strip_df.iterrows():
         result = month_spread_option(row, tables, D, source, window_days, historical_dates)
         rows.append(dict(
             load_month=row["load_month"], month_label=row["month_label"],
+            vol_jkm=result.vol_jkm, vol_ttf=result.vol_ttf, correlation=result.correlation,
             intrinsic=result.intrinsic, extrinsic=result.extrinsic,
         ))
     return pd.DataFrame(rows)

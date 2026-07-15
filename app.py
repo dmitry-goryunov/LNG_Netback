@@ -960,10 +960,13 @@ elif PAGE == "1 Forward strip":
         ie_df = None
 
     if ie_df is not None:
-        ie_display = ie_df[["month_label", "intrinsic", "extrinsic"]].copy()
-        ie_display.columns = ["Month", "Intrinsic", "Extrinsic"]
+        ie_display = ie_df[["month_label", "vol_jkm", "vol_ttf", "correlation", "intrinsic", "extrinsic"]].copy()
+        ie_display.columns = ["Month", "Vol JKM", "Vol TTF", "Correlation", "Intrinsic", "Extrinsic"]
         st.dataframe(
-            ie_display.style.format({"Intrinsic": "{:.3f}", "Extrinsic": "{:.3f}"}, na_rep="N/A"),
+            ie_display.style.format({
+                "Vol JKM": "{:.3f}", "Vol TTF": "{:.3f}", "Correlation": "{:.3f}",
+                "Intrinsic": "{:.3f}", "Extrinsic": "{:.3f}",
+            }, na_rep="N/A"),
             width="stretch", hide_index=True,
         )
         if ie_df["extrinsic"].isna().any():
@@ -990,6 +993,10 @@ elif PAGE == "1 Forward strip":
             except Exception as exc:  # noqa: BLE001 -- same rationale as above
                 st.warning(f"Could not compute this month's detail ({type(exc).__name__}: {exc}).")
             else:
+                vcol1, vcol2, vcol3 = st.columns(3)
+                vcol1.metric("Vol JKM", "N/A" if ie_result.vol_jkm is None else f"{ie_result.vol_jkm:.3f}")
+                vcol2.metric("Vol TTF", "N/A" if ie_result.vol_ttf is None else f"{ie_result.vol_ttf:.3f}")
+                vcol3.metric("Correlation", "N/A" if ie_result.correlation is None else f"{ie_result.correlation:.3f}")
                 dcol1, dcol2, dcol3, dcol4 = st.columns(4)
                 dcol1.metric("JKM / TTF", f"{ie_result.jkm_0:.3f} / {ie_result.ttf_0:.3f} $/MMBtu")
                 dcol2.metric("Intrinsic", f"{ie_result.intrinsic:.3f} $/MMBtu")

@@ -245,11 +245,50 @@ def test_intrinsic_extrinsic_strip_shape_and_full_coverage(tables, params):
     for source in ("tab", "historical"):
         out = so.intrinsic_extrinsic_strip(df, tables, "2026-07-08", source)
         assert len(out) == 36
-        assert list(out.columns) == ["load_month", "month_label", "intrinsic", "extrinsic"]
-        assert out["intrinsic"].notna().all()
-        assert out["extrinsic"].notna().all()
+        assert list(out.columns) == [
+            "load_month", "month_label", "vol_jkm", "vol_ttf", "correlation", "intrinsic", "extrinsic",
+        ]
+        for col in ("vol_jkm", "vol_ttf", "correlation", "intrinsic", "extrinsic"):
+            assert out[col].notna().all(), f"{col} should be fully populated in {source!r} mode"
+        assert (out["vol_jkm"] > 0).all()
+        assert (out["vol_ttf"] > 0).all()
+        assert out["correlation"].between(-1.0, 1.0).all()
         assert (out["intrinsic"] >= 0).all()
         assert (out["extrinsic"] >= 0).all()
+
+
+def test_intrinsic_extrinsic_strip_vol_corr_columns_match_month_spread_option(tables, params):
+    """The strip's vol_jkm/vol_ttf/correlation columns must be exactly the
+    inputs month_spread_option() actually priced that month's option
+    with, not some independently recomputed or approximated figure."""
+    df = model.strip("2026-07-08", tables, params, n_months=12)
+    out = so.intrinsic_extrinsic_strip(df, tables, "2026-07-08", "tab")
+    for i in range(len(df)):
+        single = so.month_spread_option(df.iloc[i], tables, "2026-07-08", "tab")
+        assert out.iloc[i]["vol_jkm"] == pytest.approx(single.vol_jkm)
+        assert out.iloc[i]["vol_ttf"] == pytest.approx(single.vol_ttf)
+        assert out.iloc[i]["correlation"] == pytest.approx(single.correlation)
+
+
+def test_intrinsic_extrinsic_strip_vol_corr_columns_are_nan_together_with_extrinsic_when_incomplete(tables, params):
+    """Section 10-style guard: if a future edit strips a needed tab column
+    again, the vol/correlation columns must go NaN in lockstep with
+    extrinsic, not show a stale or partial number next to an N/A."""
+    df = model.strip("2026-07-08", tables, params, n_months=3)
+
+    class _EmptyVolTables:
+        def __init__(self, real):
+            self._real = real
+            self.vol = None
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    out = so.intrinsic_extrinsic_strip(df, _EmptyVolTables(tables), "2026-07-08", "tab")
+    assert out["vol_jkm"].isna().all()
+    assert out["vol_ttf"].isna().all()
+    assert out["correlation"].isna().all()
+    assert out["extrinsic"].isna().all()
+    assert out["intrinsic"].notna().all()  # intrinsic never depends on vol/correlation
 
 
 def test_intrinsic_extrinsic_strip_historical_caching_matches_per_row_calls(tables, params):
@@ -260,5 +299,8 @@ def test_intrinsic_extrinsic_strip_historical_caching_matches_per_row_calls(tabl
     batched = so.intrinsic_extrinsic_strip(df, tables, "2026-07-08", "historical", window_days=60)
     for i in range(len(df)):
         single = so.month_spread_option(df.iloc[i], tables, "2026-07-08", "historical", 60)
+        assert batched.iloc[i]["vol_jkm"] == pytest.approx(single.vol_jkm)
+        assert batched.iloc[i]["vol_ttf"] == pytest.approx(single.vol_ttf)
+        assert batched.iloc[i]["correlation"] == pytest.approx(single.correlation)
         assert batched.iloc[i]["intrinsic"] == pytest.approx(single.intrinsic)
         assert batched.iloc[i]["extrinsic"] == pytest.approx(single.extrinsic)

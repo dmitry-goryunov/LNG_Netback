@@ -3,16 +3,28 @@
 **Module:** `spread_option.py`. **Data:** `data.load_volatilities()` /
 `CurveTables.vol` (the workbook's `volatilities` sheet). **UI:** Forward-strip
 page, "Intrinsic / extrinsic value (JKM vs TTF diversion option)" section.
-**Tests:** `tests/test_spread_option.py` (19 tests).
+**Tests:** `tests/test_spread_option.py` (21 tests).
 
 ## What this adds
 
-For each of the 36 forward-strip months, two new numbers:
+For each of the 36 forward-strip months, five numbers:
 
+- **Vol JKM**, **Vol TTF**, **Correlation** -- the exact inputs
+  `price_exchange_option()` used to price that month's option (not an
+  independently recomputed or approximated figure -- `intrinsic_extrinsic_strip()`
+  reads them straight off the same `SpreadOptionResult` its intrinsic/
+  extrinsic columns come from, so they can never drift apart). Shown so
+  the table is self-explanatory without opening the single-month detail
+  expander for every row.
 - **Intrinsic** = `max(JKM - TTF, 0)` -- today's forward view, no uncertainty.
 - **Extrinsic** = the time value of the option to divert to JKM instead
   of delivering to TTF, from the volatility/correlation source selected
   in the UI.
+
+All three vol/correlation columns and extrinsic go `NaN` together
+whenever the selected source could not supply complete inputs for that
+tenor -- intrinsic is the only column that never depends on them (it is
+a pure function of today's forward JKM/TTF levels).
 
 Framing: a cargo is delivered to TTF (Europe) as the base case; the
 option is diverting to JKM (Asia) instead when JKM is higher. JKM and
