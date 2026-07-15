@@ -464,6 +464,15 @@ if PAGE == "0 Decision":
                 "The provisional programme uses legacy voyage physics and must be "
                 "re-baselined after the physical-engine rebuild."
             )
+            st.caption(
+                "Charter and every other running cost are only charged for the "
+                f"{best.used_days:,.4f} used_days above -- the "
+                f"{best.residual_days:,.4f} residual/idle day(s) are not charged "
+                "ongoing hire. If this is a real time charter where hire continues "
+                "during idle time, enter a negative Residual vessel value (e.g. "
+                f"-\\${snap_info.charter_rate:,.0f}/day, this curve's snapped charter "
+                "rate) instead of the default \\$0 credit to model that cost."
+            )
 
             # --- How the programme value is calculated -----------------------
             # Recomputes decision.route_value() per leg for display only; this
