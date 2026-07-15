@@ -32,6 +32,23 @@ class DecisionMode(str, Enum):
     VESSEL_PROGRAMME = "vessel_programme"
 
 
+class FirstCargoState(str, Enum):
+    """Finer-grained commercial state for the *current* cargo only
+    (docs/PHASE2_PLAN.md Section 3a), independent of the physical engine.
+
+    DecisionMode alone can only express "both procurement and loading are
+    sunk" (POST_LIFT_DIVERSION/VESSEL_PROGRAMME's current cargo) or "both
+    avoidable" (PRE_LIFT_CARGO, any future_cargo=True) -- there was no way
+    to represent a cargo that is already bought (procurement committed)
+    but not yet loaded (loading still avoidable), a real, distinct
+    commercial state (a DES/FOB-purchased cargo sitting pre-loading).
+    """
+
+    ALREADY_LOADED = "already_loaded"  # procurement + loading both sunk
+    PROCUREMENT_COMMITTED_LOADING_REQUIRED = "procurement_committed_loading_required"  # procurement sunk, loading avoidable
+    FULLY_PRE_LIFT = "fully_pre_lift"  # both avoidable -- same treatment as today's PRE_LIFT_CARGO
+
+
 class CostTreatment(str, Enum):
     INCLUDED = "included"
     SUNK = "sunk"
@@ -51,12 +68,27 @@ _COST_TYPES = {
 }
 
 
-def cost_policy(mode: DecisionMode, cost_type: str, *, future_cargo: bool = False) -> CostTreatment:
+def cost_policy(
+    mode: DecisionMode,
+    cost_type: str,
+    *,
+    future_cargo: bool = False,
+    first_cargo_state: FirstCargoState | None = None,
+) -> CostTreatment:
     """Return the decision-state treatment for one cost category.
 
     Future cargoes in a vessel programme are new pre-lift decisions and
     therefore include procurement and loading.  The currently loaded cargo in
-    POST_LIFT_DIVERSION or VESSEL_PROGRAMME treats them as sunk.
+    POST_LIFT_DIVERSION or VESSEL_PROGRAMME treats them as sunk by default.
+
+    first_cargo_state (Section 3a) is additive: when omitted (the
+    default), behaviour is identical to before it existed -- exactly the
+    two combinations above. When supplied (and future_cargo is False --
+    a future cargo is always fully pre-lift regardless of this argument,
+    per existing route_value(..., future_cargo=True) semantics),
+    procurement and loading are set independently per state, which is the
+    whole point: PROCUREMENT_COMMITTED_LOADING_REQUIRED sinks procurement
+    but not loading, a combination mode/future_cargo alone cannot express.
     """
 
     try:
@@ -68,13 +100,25 @@ def cost_policy(mode: DecisionMode, cost_type: str, *, future_cargo: bool = Fals
     if cost_type not in _COST_TYPES:
         raise ValueError(f"unknown cost type {cost_type!r}")
 
-    if cost_type in {"procurement", "loading"}:
-        if future_cargo:
-            return CostTreatment.INCLUDED
-        if mode in {DecisionMode.POST_LIFT_DIVERSION, DecisionMode.VESSEL_PROGRAMME}:
-            return CostTreatment.SUNK
+    if cost_type not in {"procurement", "loading"}:
         return CostTreatment.INCLUDED
 
+    if future_cargo:
+        return CostTreatment.INCLUDED
+
+    if first_cargo_state is not None:
+        try:
+            first_cargo_state = FirstCargoState(first_cargo_state)
+        except ValueError as exc:  # pragma: no cover - defensive API validation
+            raise ValueError(f"unknown first_cargo_state {first_cargo_state!r}") from exc
+        if first_cargo_state == FirstCargoState.ALREADY_LOADED:
+            return CostTreatment.SUNK
+        if first_cargo_state == FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED:
+            return CostTreatment.SUNK if cost_type == "procurement" else CostTreatment.INCLUDED
+        return CostTreatment.INCLUDED  # FULLY_PRE_LIFT
+
+    if mode in {DecisionMode.POST_LIFT_DIVERSION, DecisionMode.VESSEL_PROGRAMME}:
+        return CostTreatment.SUNK
     return CostTreatment.INCLUDED
 
 
@@ -271,6 +315,7 @@ def route_value(
     *,
     month_index: int,
     future_cargo: bool = False,
+    first_cargo_state: FirstCargoState | None = None,
 ) -> RouteValue:
     """Value one route under an explicit decision state.
 
@@ -283,7 +328,10 @@ def route_value(
 
     For an already loaded current cargo, procurement and loading are added
     back because they are sunk and cannot distinguish the remaining route
-    alternatives.
+    alternatives. first_cargo_state (Section 3a) refines this for the
+    *current* cargo only -- see cost_policy() for the three-state
+    semantics; leave it None for future programme cargoes (future_cargo
+    always wins regardless).
     """
 
     route = _normalise_route(route)
@@ -295,8 +343,12 @@ def route_value(
     else:
         duration_days, full = _physical_route_value(row, params, route)
 
-    proc_treatment = cost_policy(mode, "procurement", future_cargo=future_cargo)
-    loading_treatment = cost_policy(mode, "loading", future_cargo=future_cargo)
+    proc_treatment = cost_policy(
+        mode, "procurement", future_cargo=future_cargo, first_cargo_state=first_cargo_state
+    )
+    loading_treatment = cost_policy(
+        mode, "loading", future_cargo=future_cargo, first_cargo_state=first_cargo_state
+    )
 
     incremental = full
     if proc_treatment == CostTreatment.SUNK:
@@ -323,12 +375,16 @@ def isolated_route_values(
     *,
     month_index: int = 0,
     routes: Sequence[str] = ("Europe", "Asia"),
+    first_cargo_state: FirstCargoState | None = None,
 ) -> tuple[RouteValue, ...]:
     if not 0 <= month_index < len(strip_df):
         raise IndexError("month_index outside strip")
     row = strip_df.iloc[month_index]
     return tuple(
-        route_value(row, params, r, mode, month_index=month_index, future_cargo=False)
+        route_value(
+            row, params, r, mode, month_index=month_index, future_cargo=False,
+            first_cargo_state=first_cargo_state,
+        )
         for r in routes
     )
 
@@ -354,6 +410,7 @@ def optimise_programme(
     horizon_days: float,
     current_month_index: int = 0,
     current_mode: DecisionMode = DecisionMode.POST_LIFT_DIVERSION,
+    current_first_cargo_state: FirstCargoState | None = None,
     max_additional_cargoes: int = 1,
     residual_value_per_day: float = 0.0,
     routes: Sequence[str] = ("Europe", "Asia"),
@@ -361,10 +418,13 @@ def optimise_programme(
 ) -> ProgrammeResult:
     """Enumerate deterministic one-vessel programmes on a continuous day grid.
 
-    The current cargo is mandatory and valued under ``current_mode``.  Every
-    later cargo is optional and valued pre-lift using the strip row matching
-    its representative start month.  A voyage is admitted only when the whole
-    route fits inside ``horizon_days``; fractional cargoes are impossible.
+    The current cargo is mandatory and valued under ``current_mode``
+    (refined by ``current_first_cargo_state``, Section 3a -- applies only
+    to this first leg). Every later cargo is optional and valued pre-lift
+    using the strip row matching its representative start month (always
+    ``future_cargo=True``, so ``current_first_cargo_state`` never applies
+    to them, by design). A voyage is admitted only when the whole route
+    fits inside ``horizon_days``; fractional cargoes are impossible.
     """
 
     if horizon_days <= 0:
@@ -445,6 +505,7 @@ def optimise_programme(
             current_mode,
             month_index=current_month_index,
             future_cargo=False,
+            first_cargo_state=current_first_cargo_state,
         )
         if current.duration_days > horizon_days + tolerance:
             continue

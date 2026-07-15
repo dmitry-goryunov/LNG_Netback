@@ -115,20 +115,23 @@ this phase (it is not, under this recommendation -- it becomes unused by the
 new decision modes but stays as the legacy screen's input) or removed
 outright.
 
-## 3a. Related small increment: three-state first-cargo model **[v2.4 brief]**
+## 3a. Related small increment: three-state first-cargo model **[v2.4 brief]** -- **DONE**
 
-Independent of the physical engine and safe to do first (`decision.py`
-only, no `model.py`/physical dependency, small diff): `decision.py`'s
-`RouteValue` already carries `procurement_treatment` and `loading_treatment`
-as *separate* `CostTreatment` fields, but `cost_policy()` currently only
-ever produces two combinations -- both `SUNK` (`POST_LIFT_DIVERSION`,
-`VESSEL_PROGRAMME`'s current cargo) or both `INCLUDED` (`PRE_LIFT_CARGO`,
-any `future_cargo=True`). There is no way to represent a cargo that is
-already bought (procurement sunk) but not yet loaded (loading still
-avoidable) -- a real, distinct commercial state (DES/FOB-purchased cargo
-sitting pre-loading).
+Landed after Section 8 step 8 rather than before it (independent of the
+physical engine, but there was no reason to block on sequencing once step
+8 was already in flight) -- `decision.py` only, additive, no `model.py`/
+physical dependency, small diff.
 
-Add:
+The gap: `decision.py`'s `RouteValue` already carried `procurement_treatment`
+and `loading_treatment` as *separate* `CostTreatment` fields, but
+`cost_policy()` only ever produced two combinations -- both `SUNK`
+(`POST_LIFT_DIVERSION`/`VESSEL_PROGRAMME`'s current cargo) or both
+`INCLUDED` (`PRE_LIFT_CARGO`, any `future_cargo=True`). There was no way to
+represent a cargo that is already bought (procurement sunk) but not yet
+loaded (loading still avoidable) -- a real, distinct commercial state
+(a DES/FOB-purchased cargo sitting pre-loading).
+
+Added exactly as specified, `decision.py`:
 
 ```python
 class FirstCargoState(str, Enum):
@@ -137,15 +140,49 @@ class FirstCargoState(str, Enum):
     FULLY_PRE_LIFT = "fully_pre_lift"                                    # both avoidable (== today's PRE_LIFT_CARGO)
 ```
 
-`cost_policy()` gains an optional `first_cargo_state` parameter (default
-`None`, preserving today's two-combination behaviour exactly when omitted
--- this is additive, not a breaking change to the existing signature or
-any existing call site); when supplied it independently sets
-`procurement_treatment`/`loading_treatment` per the state. Surfaces as a
-third radio option (or extends the existing mode selector) on the Decision
-page for `POST_LIFT_DIVERSION`/`VESSEL_PROGRAMME`'s *current* cargo only --
-future programme cargoes stay `FULLY_PRE_LIFT` always, per existing
-`route_value(..., future_cargo=True)` semantics.
+`cost_policy()` gained an optional `first_cargo_state` parameter (default
+`None`, preserving the original two-combination behaviour exactly when
+omitted -- additive, not a breaking change to the existing signature or any
+existing call site; `test_first_cargo_state_none_preserves_original_two_state_behaviour`
+pins this). When supplied (and `future_cargo` is `False` -- a future
+programme cargo is always fully pre-lift regardless of this argument, per
+existing `route_value(..., future_cargo=True)` semantics;
+`test_first_cargo_state_ignored_when_future_cargo` pins this too),
+procurement and loading are set independently per state.
+`route_value()`/`isolated_route_values()` gained the same optional
+parameter; `optimise_programme()` gained `current_first_cargo_state`,
+threaded into the first leg's valuation only -- proven scoped correctly by
+`test_optimise_programme_current_first_cargo_state_affects_only_first_leg`
+(switching to `PROCUREMENT_COMMITTED_LOADING_REQUIRED` changes cargo 1's
+value by exactly one loading add-back and leaves cargo 2 untouched).
+
+Surfaces on the Decision page (`app.py`) as a "Current cargo state" radio
+(Already loaded / Procured, not yet loaded / Fully pre-lift), shown for
+`POST_LIFT_DIVERSION`'s current cargo in both the isolated view and the
+vessel-programme view, defaulting to "Already loaded" so nothing changes
+in the app's behaviour unless a user picks otherwise. Verified live:
+switching to "Procured, not yet loaded" dropped the programme value by
+exactly `loading * cargo_size` ($210,000 at defaults, $73,360,415 ->
+$73,150,415) and the waterfall's Sunk cost add-back bar from +7.01 to
++6.95 (procurement only, loading no longer reversed); switching to "Fully
+pre-lift" dropped cargo 1 to $24,047,892 -- exactly the physical engine's
+own full_cargo_value for that row with zero sunk add-back, matching
+`decision.DecisionMode.PRE_LIFT_CARGO`'s value for the same row/route
+exactly (`test_route_value_fully_pre_lift_current_cargo_matches_pre_lift_cargo_mode`).
+
+**Bug caught and fixed while wiring this in, not by inspection:**
+`app.py`'s `_decision_waterfall_lines()` took one combined `sunk: bool`
+flag, assuming procurement and loading are always sunk together -- true
+under the old two-state model, false the moment
+`PROCUREMENT_COMMITTED_LOADING_REQUIRED` exists. Left as a single bool, it
+would have silently added back *both* costs (or neither) instead of just
+procurement, overstating or understating the decision value by exactly
+`loading * cargo_size` for that one state. Fixed by taking two independent
+flags (`proc_sunk`, `loading_sunk`) and summing only the lines that are
+actually sunk; both waterfall call sites (isolated post-lift/pre-lift view
+and the programme's per-cargo view) updated together, and their captions/
+titles now name exactly which cost(s) are being reversed instead of a
+hardcoded "Procurement and loading."
 
 ## 4. New module: `physical.py`
 
@@ -437,10 +474,10 @@ with everything else in Sections 3/9.
 
 ## 8. Sequencing
 
-0. Section 3a (three-state first-cargo model) can land independently, any
-   time, before or in parallel with the rest of this sequence -- it touches
-   only `decision.py` and is additive to `cost_policy()`'s signature.
-   **Not yet done** (independent of 1-3 below; still open).
+0. **DONE** (see Section 3a). Section 3a (three-state first-cargo model)
+   landed after step 8 rather than before it -- it touches only
+   `decision.py`/`app.py` and is additive to `cost_policy()`'s signature,
+   so sequencing it earlier was never required, just permitted.
 1. **DONE** (`physical.py`, `tests/test_physical_engine.py`): enums,
    `VesselPerformance`, `VoyageSegment`, segment-balance function,
    `run_voyage`, unit-tested against hand-computed numbers. One design
@@ -500,9 +537,17 @@ with everything else in Sections 3/9.
    the time step 4 landed this was exactly zero in every scenario
    exercised -- **step 6 below changed that, and the gap was closed the
    same day** (see step 6's writeup and Section 10 item 1).
-5. Physical/emissions invariant tests (Section 7, items 1-10) -- partially
-   covered already by `test_emissions.py` (items 7-10) and
-   `test_physical_engine.py` (items 2, 4, 6); items 1, 3, 5 remain.
+5. Physical/emissions invariant tests (Section 7, items 1-10) -- see
+   Section 7's own status table for the current per-item detail (it is
+   the more current source; this line is a summary, not a duplicate
+   ledger). As of step 6 landing, item 3 (queue demand rate below sea
+   rate) is exercised by a real route for the first time
+   (`physical.asia_route_segments`' congested case), though still without
+   a dedicated named test asserting it end-to-end through a route builder
+   rather than at the bare `VesselPerformance` level. Item 1 (a
+   dedicated, named, all-three-routes-in-one-place reconciliation
+   assertion, as opposed to the generic version plus the equivalence
+   suite's real-route coverage) remains the one genuinely open item here.
 6. **DONE** (`physical.asia_route_segments`, 7 tests added/rewritten in
    `tests/test_physical_legacy_equivalence.py`). No `congested` parameter,
    per Section 4.3/8-step-2's note -- congestion is derived as whatever

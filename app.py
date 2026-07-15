@@ -70,6 +70,17 @@ STRIP_METRIC_OPTIONS = {
     "Gap: JKM - JKM* ($/MMBtu)": "gap",
 }
 
+# Current-cargo commercial state (decision.FirstCargoState, Section 3a of
+# docs/PHASE2_PLAN.md) -- a finer-grained refinement of POST_LIFT_DIVERSION/
+# VESSEL_PROGRAMME's current cargo only. "Already loaded" reproduces this
+# app's original behaviour exactly (both procurement and loading sunk);
+# it stays the default so nothing changes unless a user picks otherwise.
+FIRST_CARGO_STATE_LABELS = {
+    "Already loaded": decision.FirstCargoState.ALREADY_LOADED,
+    "Procured, not yet loaded": decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED,
+    "Fully pre-lift": decision.FirstCargoState.FULLY_PRE_LIFT,
+}
+
 # ===========================================================================
 # Waterfall / flow chart builders (pure Plotly; read model.waterfall_
 # breakdown() output only -- no recalculation here). This is the netback
@@ -140,20 +151,25 @@ def _plotly_flow_sankey(title: str, revenue: float, lines: list, margin: float):
     return fig
 
 
-def _decision_waterfall_lines(bd: dict, sunk: bool) -> tuple[list, float]:
+def _decision_waterfall_lines(bd: dict, proc_sunk: bool, loading_sunk: bool) -> tuple[list, float]:
     """Adapts model.waterfall_breakdown()'s $/MMBtu lines/margin to a
     decision-state view. Procurement and loading are always shown as real
-    cost bars -- gas was actually bought and loaded, and hiding that cost
-    reads as a mistake, not a decision-state simplification. When those
-    costs are sunk (an already-loaded current cargo), one extra "Sunk cost
-    add-back" bar is appended that exactly cancels them, so the chart foots
-    to the *incremental* decision value shown in the metrics above it, not
-    the full-cargo P&L, while still showing where that value came from.
-    margin + addback == incremental value / cargo_size, matching
-    decision.route_value()'s sunk-cost add-back exactly."""
-    if not sunk:
+    cost bars -- gas was actually bought and/or loaded, and hiding that
+    cost reads as a mistake, not a decision-state simplification. Either
+    can be sunk independently (decision.FirstCargoState, Section 3a: a
+    cargo can be procured but not yet loaded), so this takes two
+    independent flags rather than one combined bool -- a single bool would
+    silently show the wrong add-back amount for that mixed state. When
+    either is sunk, one "Sunk cost add-back" bar is appended that exactly
+    cancels the sunk line(s), so the chart foots to the *incremental*
+    decision value shown in the metrics above it, not the full-cargo P&L,
+    while still showing where that value came from. margin + addback ==
+    incremental value / cargo_size, matching decision.route_value()'s
+    sunk-cost add-back exactly."""
+    addback_names = {n for n, sunk in (("Procurement", proc_sunk), ("Loading", loading_sunk)) if sunk}
+    if not addback_names:
         return bd["lines"], bd["margin"]
-    addback = sum(v for n, v in bd["lines"] if n in {"Procurement", "Loading"})
+    addback = sum(v for n, v in bd["lines"] if n in addback_names)
     lines = bd["lines"] + [("Sunk cost add-back", -addback)]
     return lines, bd["margin"] + addback
 
@@ -423,8 +439,16 @@ if PAGE == "0 Decision":
         st.caption("Use the Forward strip page for the full 12-month legacy analysis.")
 
     elif decision_mode in {decision.DecisionMode.POST_LIFT_DIVERSION, decision.DecisionMode.PRE_LIFT_CARGO}:
+        isolated_first_cargo_state = None
+        if decision_mode == decision.DecisionMode.POST_LIFT_DIVERSION:
+            state_label = st.radio(
+                "Current cargo state", list(FIRST_CARGO_STATE_LABELS),
+                horizontal=True, key="isolated_first_cargo_state",
+            )
+            isolated_first_cargo_state = FIRST_CARGO_STATE_LABELS[state_label]
         values = decision.isolated_route_values(
-            strip_df, params, decision_mode, month_index=month_index
+            strip_df, params, decision_mode, month_index=month_index,
+            first_cargo_state=isolated_first_cargo_state,
         )
         ranked = sorted(values, key=lambda x: x.incremental_value, reverse=True)
         best = ranked[0]
@@ -453,34 +477,44 @@ if PAGE == "0 Decision":
             width="stretch", hide_index=True,
         )
         if decision_mode == decision.DecisionMode.POST_LIFT_DIVERSION:
-            st.caption(
-                "Procurement and completed loading are sunk in incremental value, "
-                "but remain in full-cargo P&L."
-            )
+            st.caption({
+                decision.FirstCargoState.ALREADY_LOADED:
+                    "Procurement and loading are both sunk in incremental value (cargo already "
+                    "loaded), but remain in full-cargo P&L.",
+                decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED:
+                    "Procurement is sunk (gas already committed/bought); loading is still "
+                    "included since it has not been incurred and remains avoidable.",
+                decision.FirstCargoState.FULLY_PRE_LIFT:
+                    "Procurement and loading are both included -- treated as fully pre-lift "
+                    "despite the post-lift diversion mode.",
+            }[isolated_first_cargo_state])
 
         st.subheader("How the decision value is calculated")
         wf_route = st.radio("Route", [v.route for v in ranked], horizontal=True, key="isolated_wf_route")
         wf_value = next(v for v in ranked if v.route == wf_route)
-        wf_sunk = wf_value.procurement_treatment == decision.CostTreatment.SUNK
+        wf_proc_sunk = wf_value.procurement_treatment == decision.CostTreatment.SUNK
+        wf_loading_sunk = wf_value.loading_treatment == decision.CostTreatment.SUNK
+        wf_any_sunk = wf_proc_sunk or wf_loading_sunk
         wf_bd_all = decision.physical_waterfall_breakdown(strip_df.iloc[month_index], params)
-        wf_lines, wf_margin = _decision_waterfall_lines(wf_bd_all[wf_route], wf_sunk)
+        wf_lines, wf_margin = _decision_waterfall_lines(wf_bd_all[wf_route], wf_proc_sunk, wf_loading_sunk)
         st.plotly_chart(
             _plotly_waterfall(
-                f"{wf_route} {'post-lift decision' if wf_sunk else 'full-cargo'} "
+                f"{wf_route} {'post-lift decision' if wf_any_sunk else 'full-cargo'} "
                 f"waterfall ({wf_value.load_month.strftime('%b-%y')})",
                 wf_bd_all[wf_route]["revenue"], wf_lines, wf_margin,
             ),
             width="stretch",
         )
+        wf_addback_names = [n for n, s in (("Procurement", wf_proc_sunk), ("Loading", wf_loading_sunk)) if s]
         st.caption(
             f"$/MMBtu margin x cargo size ({params.cargo_size:,.0f} MMBtu) = "
             f"${wf_margin * params.cargo_size:,.0f}, matching the decision value above "
             "(subject to rounding)." + (
-                " Procurement and loading are shown as real costs (gas was actually bought "
-                "and loaded), then reversed on the Sunk cost add-back bar because they were "
-                "incurred before this decision point -- that is the incremental view, not "
-                "the full-cargo P&L."
-                if wf_sunk else ""
+                f" {' and '.join(wf_addback_names)} {'is' if len(wf_addback_names) == 1 else 'are'} "
+                "shown as real cost(s) (already incurred), then reversed on the Sunk cost "
+                "add-back bar because they were incurred before this decision point -- that is "
+                "the incremental view, not the full-cargo P&L."
+                if wf_addback_names else ""
             )
         )
 
@@ -496,6 +530,11 @@ if PAGE == "0 Decision":
             ["Use sidebar route", "Base 46.7436 days", "Congested 54.7436 days"],
             horizontal=True,
         )
+        programme_state_label = st.radio(
+            "Current cargo state", list(FIRST_CARGO_STATE_LABELS),
+            horizontal=True, key="programme_first_cargo_state",
+        )
+        programme_first_cargo_state = FIRST_CARGO_STATE_LABELS[programme_state_label]
         programme_params = copy.deepcopy(params)
         if asia_case == "Base 46.7436 days":
             programme_params.asia_rt_days = model.ASIA_RT_BASE
@@ -515,6 +554,7 @@ if PAGE == "0 Decision":
                 programme_strip, programme_params, horizon_days=float(horizon),
                 current_month_index=month_index,
                 current_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+                current_first_cargo_state=programme_first_cargo_state,
                 max_additional_cargoes=int(max_additional),
                 residual_value_per_day=float(residual_value),
             )
@@ -576,6 +616,7 @@ if PAGE == "0 Decision":
                 decision.route_value(
                     programme_strip.iloc[leg.month_index], programme_params, leg.route, leg.decision_mode,
                     month_index=leg.month_index, future_cargo=(leg.cargo_number > 1),
+                    first_cargo_state=(programme_first_cargo_state if leg.cargo_number == 1 else None),
                 )
                 for leg in best.legs
             ]
@@ -626,15 +667,17 @@ if PAGE == "0 Decision":
             leg_pick = st.selectbox("Cargo", options=list(range(len(best.legs))),
                                      format_func=lambda i: leg_labels[i], key="programme_leg_pick")
             sel_leg, sel_rv = best.legs[leg_pick], leg_values[leg_pick]
-            sel_sunk = sel_rv.procurement_treatment == decision.CostTreatment.SUNK
+            sel_proc_sunk = sel_rv.procurement_treatment == decision.CostTreatment.SUNK
+            sel_loading_sunk = sel_rv.loading_treatment == decision.CostTreatment.SUNK
+            sel_any_sunk = sel_proc_sunk or sel_loading_sunk
             sel_bd_all = decision.physical_waterfall_breakdown(
                 programme_strip.iloc[sel_leg.month_index], programme_params
             )
-            sel_lines, sel_margin = _decision_waterfall_lines(sel_bd_all[sel_leg.route], sel_sunk)
+            sel_lines, sel_margin = _decision_waterfall_lines(sel_bd_all[sel_leg.route], sel_proc_sunk, sel_loading_sunk)
             st.plotly_chart(
                 _plotly_waterfall(
                     f"Cargo {sel_leg.cargo_number}: {sel_leg.route} "
-                    f"{'post-lift decision' if sel_sunk else 'pre-lift'} "
+                    f"{'post-lift decision' if sel_any_sunk else 'pre-lift'} "
                     f"waterfall ({sel_leg.load_month.strftime('%b-%y')})",
                     sel_bd_all[sel_leg.route]["revenue"], sel_lines, sel_margin,
                 ),
@@ -670,6 +713,7 @@ if PAGE == "0 Decision":
                                 programme_strip, programme_params, horizon_days=float(horizon),
                                 current_month_index=i,
                                 current_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+                                current_first_cargo_state=programme_first_cargo_state,
                                 max_additional_cargoes=int(max_additional),
                                 residual_value_per_day=float(residual_value),
                             )

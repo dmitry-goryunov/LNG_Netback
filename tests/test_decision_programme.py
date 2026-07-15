@@ -296,3 +296,147 @@ def test_congested_asia_physical_value_exceeds_legacy_flat_rate_fuel_assumption(
         f"expected the physical engine's congested-Asia full_cargo_value ({physical_full:,.0f}) to exceed "
         f"legacy's flat-rate asia_cargo ({legacy_full:,.0f}) by a modest margin; got ratio {ratio:.4f}"
     )
+
+
+# --- Section 3a: three-state first-cargo model (docs/PHASE2_PLAN.md) ---
+
+
+def test_first_cargo_state_already_loaded_sinks_both_regardless_of_mode():
+    """first_cargo_state overrides mode's own default when supplied --
+    proven here by passing it under PRE_LIFT_CARGO, which would normally
+    give INCLUDED/INCLUDED with no first_cargo_state at all."""
+    for cost_type in ("procurement", "loading"):
+        assert decision.cost_policy(
+            decision.DecisionMode.PRE_LIFT_CARGO, cost_type,
+            first_cargo_state=decision.FirstCargoState.ALREADY_LOADED,
+        ) == decision.CostTreatment.SUNK
+
+
+def test_first_cargo_state_procurement_committed_loading_required_splits_treatment():
+    """The whole point of Section 3a: a cargo can be procured (sunk) but
+    not yet loaded (still avoidable) -- a combination mode/future_cargo
+    alone cannot express."""
+    assert decision.cost_policy(
+        decision.DecisionMode.POST_LIFT_DIVERSION, "procurement",
+        first_cargo_state=decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED,
+    ) == decision.CostTreatment.SUNK
+    assert decision.cost_policy(
+        decision.DecisionMode.POST_LIFT_DIVERSION, "loading",
+        first_cargo_state=decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED,
+    ) == decision.CostTreatment.INCLUDED
+
+
+def test_first_cargo_state_fully_pre_lift_includes_both():
+    for cost_type in ("procurement", "loading"):
+        assert decision.cost_policy(
+            decision.DecisionMode.POST_LIFT_DIVERSION, cost_type,
+            first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT,
+        ) == decision.CostTreatment.INCLUDED
+
+
+def test_first_cargo_state_ignored_when_future_cargo():
+    """Future programme cargoes stay fully pre-lift always, per
+    docs/PHASE2_PLAN.md Section 3a -- future_cargo wins even if a caller
+    also supplies a contradictory first_cargo_state."""
+    for cost_type in ("procurement", "loading"):
+        assert decision.cost_policy(
+            decision.DecisionMode.POST_LIFT_DIVERSION, cost_type, future_cargo=True,
+            first_cargo_state=decision.FirstCargoState.ALREADY_LOADED,
+        ) == decision.CostTreatment.INCLUDED
+
+
+def test_first_cargo_state_none_preserves_original_two_state_behaviour():
+    """Omitting first_cargo_state (the default) must be byte-identical to
+    cost_policy() before Section 3a existed -- additive, not breaking."""
+    assert decision.cost_policy(decision.DecisionMode.POST_LIFT_DIVERSION, "procurement") == decision.CostTreatment.SUNK
+    assert decision.cost_policy(decision.DecisionMode.POST_LIFT_DIVERSION, "loading") == decision.CostTreatment.SUNK
+    assert decision.cost_policy(decision.DecisionMode.PRE_LIFT_CARGO, "procurement") == decision.CostTreatment.INCLUDED
+    assert decision.cost_policy(decision.DecisionMode.PRE_LIFT_CARGO, "loading") == decision.CostTreatment.INCLUDED
+
+
+def test_first_cargo_state_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        decision.cost_policy(
+            decision.DecisionMode.POST_LIFT_DIVERSION, "procurement", first_cargo_state="not_a_real_state"
+        )
+
+
+def test_route_value_procurement_committed_loading_required_adds_back_only_procurement(tables, params):
+    df = model.strip("2026-07-08", tables, params)
+    row = df.iloc[0]
+    value = decision.route_value(
+        row, params, "Europe", decision.DecisionMode.POST_LIFT_DIVERSION, month_index=0,
+        first_cargo_state=decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED,
+    )
+    assert value.procurement_treatment == decision.CostTreatment.SUNK
+    assert value.loading_treatment == decision.CostTreatment.INCLUDED
+    expected_addback = float(row["proc"]) * params.cargo_size
+    assert value.incremental_value - value.full_cargo_value == pytest.approx(expected_addback)
+
+
+def test_route_value_fully_pre_lift_current_cargo_matches_pre_lift_cargo_mode(tables, params):
+    """Choosing FULLY_PRE_LIFT for the current cargo under
+    POST_LIFT_DIVERSION should be economically identical to evaluating the
+    same row/route under PRE_LIFT_CARGO mode outright -- both mean
+    "nothing sunk yet"."""
+    df = model.strip("2026-07-08", tables, params)
+    row = df.iloc[0]
+    via_state = decision.route_value(
+        row, params, "Europe", decision.DecisionMode.POST_LIFT_DIVERSION, month_index=0,
+        first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT,
+    )
+    via_mode = decision.route_value(
+        row, params, "Europe", decision.DecisionMode.PRE_LIFT_CARGO, month_index=0,
+    )
+    assert via_state.incremental_value == pytest.approx(via_mode.incremental_value)
+    assert via_state.full_cargo_value == pytest.approx(via_mode.full_cargo_value)
+
+
+def test_optimise_programme_current_first_cargo_state_affects_only_first_leg(tables):
+    """current_first_cargo_state must change cargo 1's value but leave
+    later (always-future) cargoes' values untouched -- proves the
+    parameter is scoped to the first leg only, not threaded everywhere."""
+    params = model.Params(asia_rt_days=model.ASIA_RT_BASE)
+    df = model.strip("2026-07-08", tables, params)
+
+    already_loaded = decision.optimise_programme(
+        df, params, horizon_days=52.0, max_additional_cargoes=1,
+        current_first_cargo_state=decision.FirstCargoState.ALREADY_LOADED,
+    )
+    procurement_only = decision.optimise_programme(
+        df, params, horizon_days=52.0, max_additional_cargoes=1,
+        current_first_cargo_state=decision.FirstCargoState.PROCUREMENT_COMMITTED_LOADING_REQUIRED,
+    )
+    plan_a = next(p for p in already_loaded.alternatives if p.sequence == "Europe -> Europe")
+    plan_b = next(p for p in procurement_only.alternatives if p.sequence == "Europe -> Europe")
+    first_a, second_a = plan_a.legs
+    first_b, second_b = plan_b.legs
+
+    # Cargo 1 differs by exactly one loading add-back (loading is no
+    # longer sunk when only procurement is committed).
+    expected_diff = params.loading * params.cargo_size
+    assert first_a.value - first_b.value == pytest.approx(expected_diff)
+    # Cargo 2 (future, always fully pre-lift) is untouched.
+    assert second_a.value == pytest.approx(second_b.value)
+
+
+def test_physical_waterfall_lines_split_addback_for_mixed_sunk_state(tables, params):
+    """decision.physical_waterfall_breakdown() itself has no notion of
+    sunk/included (that's app.py's _decision_waterfall_lines(), a
+    Streamlit-side concern) -- this test instead pins the underlying
+    identity that UI layer relies on: the Procurement and Loading lines
+    are independently addressable by name, so a caller can reverse just
+    one of them for the mixed PROCUREMENT_COMMITTED_LOADING_REQUIRED
+    state without touching the other."""
+    df = model.strip("2026-07-08", tables, params)
+    row = df.iloc[0]
+    bd = decision.physical_waterfall_breakdown(row, params)["Europe"]
+    lines = dict(bd["lines"])
+    assert "Procurement" in lines and "Loading" in lines
+    assert lines["Procurement"] == pytest.approx(float(row["proc"]))
+    assert lines["Loading"] == pytest.approx(params.loading)
+    # Independently addressable and different-valued -- a caller can sum
+    # just {"Procurement"} for the mixed state instead of always summing
+    # both, which is the whole reason app.py's _decision_waterfall_lines()
+    # takes two flags rather than one combined bool since Section 3a.
+    assert lines["Procurement"] != pytest.approx(lines["Loading"])

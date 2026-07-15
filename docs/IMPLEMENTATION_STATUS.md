@@ -152,3 +152,31 @@ engine work specifically.
   still "Europe -> Europe", still 51.8803 used vessel-days -- step 8
   changed the $ values, not (at least at this snapshot) which discrete
   schedule wins.
+
+- Phase 2 Section 3a: the three-state first-cargo model
+  (`decision.FirstCargoState`: `ALREADY_LOADED`/
+  `PROCUREMENT_COMMITTED_LOADING_REQUIRED`/`FULLY_PRE_LIFT`), letting
+  `cost_policy()` represent a cargo that is procured (sunk) but not yet
+  loaded (still avoidable) -- a real commercial state the prior two-state
+  model (both sunk or both included) couldn't express. Additive: an
+  optional `first_cargo_state` parameter on `cost_policy()`/
+  `route_value()`/`isolated_route_values()`, and `current_first_cargo_state`
+  on `optimise_programme()` (applied to the first/current leg only,
+  proven by test), all default to `None`/unset and reproduce prior
+  behaviour exactly when omitted. Surfaces as a "Current cargo state"
+  radio on the Decision page (isolated post-lift view and vessel-
+  programme view), defaulting to "Already loaded." Verified live:
+  switching to "Procured, not yet loaded" dropped the programme value by
+  exactly `loading * cargo_size` ($210,000 at defaults) and the
+  waterfall's sunk-cost add-back bar from +7.01 to +6.95/MMBtu
+  (procurement only); "Fully pre-lift" reproduced `PRE_LIFT_CARGO`
+  mode's value for the same row exactly, with zero add-back.
+
+  **Bug caught and fixed while wiring this in:** `app.py`'s
+  `_decision_waterfall_lines()` took one combined `sunk` bool, assuming
+  procurement and loading are always sunk together -- true under the old
+  two-state model, false for the new middle state. Fixed to take two
+  independent flags before it could ever silently misstate a mixed-state
+  decision value in the waterfall.
+
+  93 tests total (10 new), full pytest suite and legacy 64/64 both green.
