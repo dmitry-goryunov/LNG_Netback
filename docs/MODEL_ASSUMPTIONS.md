@@ -19,12 +19,15 @@ Two named parameter sets now exist:
   legacy ETS tonnes from the physical fuel balance at uniform 50% scope
   (~3,182 t at 17 kn, vs 4,425.9 t at 19.5 kn).
 
-Consequence worth knowing: at the operating case the default 52-day
-programme flips from "Europe -> Europe" (two fast round trips) to a
-single "Asia" voyage -- two 27.0-day Europe runs no longer fit a 52-day
-horizon, while one 50.6-day Asia run does. Loading-berth time is charged
-charter + port-rate fuel on both routes and sits OUTSIDE EU ETS scope
-(US berth); it is inert at the legacy 0.0-day default.
+The default programme horizon is DERIVED as two Europe round trips at
+the current geometry, rounded up to 0.1 d (user instruction, 16-Jul-2026:
+"make it fit 2x Europe") -- 54.1 d at 17 kn, since one Europe RT is
+27.0196 d, not a clean 27 (a literal 54.0 would exclude the second
+voyage by ~56 minutes). At that horizon the best programme is
+"Europe -> Europe" again; at the earlier fixed 52-day horizon the same
+geometry produced a single "Asia" voyage instead. Loading-berth time is
+charged charter + port-rate fuel on both routes and sits OUTSIDE EU ETS
+scope (US berth); it is inert at the legacy 0.0-day default.
 
 ## Decision-state assumptions
 

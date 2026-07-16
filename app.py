@@ -680,11 +680,25 @@ if PAGE == "0 Decision":
     else:
         st.subheader("Discrete one-vessel programme")
         c1, c2, c3 = st.columns(3)
-        horizon = _num_input("Programme horizon (days)", container=c1, min_value=1.0, value=52.0, step=1.0)
+        # Default horizon: two Europe round trips at the CURRENT geometry,
+        # rounded up to 0.1 d (user instruction: "make it fit 2x Europe").
+        # Derived, not hardcoded 54 -- at 17 kn two Europe RTs are
+        # 54.039 d, so a literal 54.0 would exclude the second voyage by
+        # ~56 minutes; and the default keeps fitting if speed or port
+        # days change again.
+        _europe_rt_now = (params.europe_laden_days + params.europe_ballast_days
+                          + params.europe_port_days + params.loading_days)
+        _default_horizon = float(np.ceil(2.0 * _europe_rt_now * 10.0) / 10.0)
+        horizon = _num_input("Programme horizon (days)", container=c1, min_value=1.0,
+                             value=_default_horizon, step=1.0)
         max_additional = _num_input("Additional cargoes available", container=c2, min_value=0,
                                     max_value=STRIP_MONTHS - 1, value=1, step=1)
         residual_value = _num_input("Residual vessel value ($/day)", container=c3, value=0.0,
                                     step=10_000.0, format="%.0f")
+        st.caption(
+            f"Default horizon = two Europe round trips ({_europe_rt_now:.2f} d each -> "
+            f"{_default_horizon:.1f} d), derived from the current speed/port settings. Edit freely."
+        )
         # Base/Congested derived from the sidebar's speed + loading/unloading
         # days, not the 19.5-kn module constants (frozen-suite-only now).
         _prog_base_rt = (2.0 * model.asia_leg_days(params.vessel_speed_knots)
