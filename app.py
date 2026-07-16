@@ -347,12 +347,31 @@ p = st.session_state.params
 st.sidebar.header("Cost parameters (Step 5)")
 
 with st.sidebar.expander("Vessel schedule"):
+    # key= makes the widget's identity stable across reruns. Without it,
+    # the id is hashed from value=, which this widget's own return
+    # mutates -- the id then flips on every edit and the NEXT edit lands
+    # on a dead id and is silently dropped (found by an AppTest
+    # round-trip: 17 -> 19.5 worked, 19.5 -> 17 was eaten).
     _new_speed = _num_input("Service speed (knots)", value=float(p.vessel_speed_knots),
-                            min_value=8.0, max_value=21.0, step=0.5, format="%.1f")
+                            min_value=8.0, max_value=21.0, step=0.5, format="%.1f",
+                            key="vessel_speed_kn")
     if abs(_new_speed - p.vessel_speed_knots) > 1e-9:
         # Re-derive everything that was calibrated to the old speed. Fuel
         # rates rescale from the 19.5-kn design constants (cube law), not
         # from their current values, so repeated changes never compound.
+        # The Asia RT must migrate too, or the stored round trip no longer
+        # matches the new base and the Asia RT radio silently flips to
+        # "Custom" pinned at the OLD speed's days (caught by an AppTest
+        # interaction check). Base/Congestion selections carry over to the
+        # new speed's equivalents; a genuine Custom RT is left alone.
+        _old_base_rt = (2.0 * model.asia_leg_days(p.vessel_speed_knots)
+                        + p.asia_port_days + p.loading_days)
+        _new_base_rt = (2.0 * model.asia_leg_days(_new_speed)
+                        + p.asia_port_days + p.loading_days)
+        if abs(p.asia_rt_days - _old_base_rt) < 0.01:
+            p.asia_rt_days = _new_base_rt
+        elif abs(p.asia_rt_days - _old_base_rt - 8.0) < 0.01:
+            p.asia_rt_days = _new_base_rt + 8.0
         p.vessel_speed_knots = _new_speed
         p.europe_laden_days = p.europe_ballast_days = model.europe_leg_days(_new_speed)
         p.laden_fuel_requirement = model.sea_fuel_at_speed(model.Params.laden_fuel_requirement, _new_speed)
@@ -479,6 +498,9 @@ with st.sidebar.expander("Charter", expanded=True):
 
 if st.sidebar.button("Reset to operating defaults (17 kn / 1.5 d)"):
     st.session_state.params = model.operating_default_params()
+    # The speed widget keeps its state under a stable key (see the
+    # Vessel schedule expander) -- drop it so the reset actually resets.
+    st.session_state.pop("vessel_speed_kn", None)
     st.rerun()
 
 params = st.session_state.params
