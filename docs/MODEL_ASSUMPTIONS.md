@@ -19,6 +19,18 @@ Two named parameter sets now exist:
   legacy ETS tonnes from the physical fuel balance at uniform 50% scope
   (~3,182 t at 17 kn, vs 4,425.9 t at 19.5 kn).
 
+Heel (operating case): 2% of cargo retained at discharge
+(Params.heel_fraction; legacy default 0.0). The ballast leg burns heel
+before buying VLSFO (physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL);
+the terminal remainder keeps tanks cold back to the loading port,
+uncredited. Net effect at current prices is a COST (delivered LNG is
+worth more per MMBtu than VLSFO-equivalent), i.e. realism the zero-heel
+model omitted, not an optimisation. Ballast LNG combustion is now
+counted in emissions (previously laden-gated, which was only correct
+while ballast inventory was always zero). Turnaround days between
+programme voyages default to 0 (knob on the programme page; the derived
+horizon includes one gap).
+
 The default programme horizon is DERIVED as two Europe round trips at
 the current geometry, rounded up to 0.1 d (user instruction, 16-Jul-2026:
 "make it fit 2x Europe") -- 54.1 d at 17 kn, since one Europe RT is

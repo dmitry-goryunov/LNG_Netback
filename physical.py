@@ -52,6 +52,12 @@ BALLAST_STATES = frozenset({
 class ShortfallSource(str, Enum):
     LIQUID_FUEL = "liquid_fuel"
     FORCED_VAPORISATION = "forced_vaporisation"
+    # Burn whatever inventory (heel) is available first, buy liquid fuel
+    # for the remainder -- how a ballast leg actually runs when a heel is
+    # retained at discharge. Unlike FORCED_VAPORISATION it never errors
+    # on insufficient inventory, and at zero inventory it degrades to
+    # exactly LIQUID_FUEL (the frozen-equivalence guarantee).
+    HEEL_THEN_LIQUID_FUEL = "heel_then_liquid_fuel"
 
 
 def _default_demand_table() -> dict:
@@ -132,7 +138,12 @@ class VesselPerformance:
     demand_mmbtu_per_day: Mapping[OperatingState, float] = field(default_factory=_default_demand_table)
     bor_fraction_per_day: Mapping[OperatingState, float] = field(default_factory=_default_bor_table)
     reliq_capacity_mmbtu_per_day: float = 0.0
-    shortfall_source: ShortfallSource = ShortfallSource.LIQUID_FUEL
+    # Either one ShortfallSource for every state (the original API, kept
+    # for backward compatibility) or a Mapping[OperatingState,
+    # ShortfallSource] -- per-state matters because ballast legs burn
+    # retained heel first (HEEL_THEN_LIQUID_FUEL) while laden legs must
+    # stay LIQUID_FUEL to preserve the legacy fuel equivalence.
+    shortfall_source: ShortfallSource | Mapping[OperatingState, "ShortfallSource"] = ShortfallSource.LIQUID_FUEL
 
     def demand_for(self, state: OperatingState) -> float:
         try:
@@ -145,6 +156,11 @@ class VesselPerformance:
             return self.bor_fraction_per_day[state]
         except KeyError as exc:
             raise ValueError(f"no boil-off rate configured for operating state {state!r}") from exc
+
+    def shortfall_source_for(self, state: OperatingState) -> ShortfallSource:
+        if isinstance(self.shortfall_source, Mapping):
+            return self.shortfall_source.get(state, ShortfallSource.LIQUID_FUEL)
+        return self.shortfall_source
 
 
 @dataclass(frozen=True)
@@ -206,6 +222,15 @@ class VoyageLedger:
             + self.other_loss_mmbtu + self.heel_at_discharge_mmbtu
         )
 
+    @property
+    def heel_burned_mmbtu(self) -> float:
+        """Heel consumed on the ballast portion (natural BOG burned or
+        vented from the heel plus forced heel vaporisation under
+        HEEL_THEN_LIQUID_FUEL): what was retained at discharge minus what
+        was still in the tanks at the end. Zero whenever heel_target was
+        zero."""
+        return self.heel_at_discharge_mmbtu - self.terminal_heel_mmbtu
+
 
 def simulate_segment(segment: VoyageSegment, vessel: VesselPerformance, opening_inventory_mmbtu: float) -> SegmentResult:
     """One segment's mass balance (docs/PHASE2_PLAN.md Section 4.4):
@@ -234,9 +259,19 @@ def simulate_segment(segment: VoyageSegment, vessel: VesselPerformance, opening_
     vented = surplus - reliquefied
     shortfall = max(demand - natural_bog, 0.0)
 
-    if vessel.shortfall_source == ShortfallSource.FORCED_VAPORISATION:
+    source = vessel.shortfall_source_for(segment.state)
+    if source == ShortfallSource.FORCED_VAPORISATION:
         forced_lng = shortfall
         liquid_fuel_t = 0.0
+    elif source == ShortfallSource.HEEL_THEN_LIQUID_FUEL:
+        # Burn what inventory can cover (never letting closing go
+        # negative), buy liquid fuel for the rest. At zero opening
+        # inventory this is exactly the LIQUID_FUEL branch, which is what
+        # keeps the frozen legacy equivalence intact for zero-heel runs.
+        available = max(opening_inventory_mmbtu - natural_bog + reliquefied, 0.0)
+        forced_lng = min(shortfall, available)
+        remainder = shortfall - forced_lng
+        liquid_fuel_t = remainder / vessel.energy_factor_mmbtu_per_t if remainder else 0.0
     else:
         forced_lng = 0.0
         liquid_fuel_t = shortfall / vessel.energy_factor_mmbtu_per_t if shortfall else 0.0
@@ -470,7 +505,18 @@ def vessel_performance_from_params(params: model.Params) -> VesselPerformance:
         state: (0.0 if state in (OperatingState.LOADING, OperatingState.DISCHARGE) else params.boil_off_rate)
         for state in OperatingState
     }
+    # Ballast states burn retained heel before buying liquid fuel (how a
+    # ballast passage actually runs when a heel is kept); laden states
+    # stay LIQUID_FUEL so the legacy fuel equivalence is untouched. With
+    # zero heel the ballast branch degrades to LIQUID_FUEL exactly, so
+    # the frozen-default behavior is bit-identical.
+    shortfall = {
+        state: (ShortfallSource.HEEL_THEN_LIQUID_FUEL if state in BALLAST_STATES
+                else ShortfallSource.LIQUID_FUEL)
+        for state in OperatingState
+    }
     return VesselPerformance(
         energy_factor_mmbtu_per_t=f, demand_mmbtu_per_day=demand, bor_fraction_per_day=bor,
         reliq_capacity_mmbtu_per_day=DEFAULT_RELIQ_CAPACITY_MMBTU_PER_DAY,
+        shortfall_source=shortfall,
     )

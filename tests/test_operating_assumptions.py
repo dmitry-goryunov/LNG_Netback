@@ -166,6 +166,124 @@ def test_legacy_uniform_scope_ets_derivation_reproduces_the_hand_constant():
     assert at_17 < derived * 0.80
 
 
+# --- Heel (Params.heel_fraction + HEEL_THEN_LIQUID_FUEL) ---
+
+
+def test_heel_then_liquid_burns_inventory_first_then_buys_fuel():
+    """Hand-checked hybrid segment: 10,000 MMBtu heel, demand 8,000 --
+    heel covers it all, no liquid fuel. Demand 15,000 -- heel covers
+    ~10k, the remainder is bought as VLSFO."""
+    vessel = physical.VesselPerformance(
+        demand_mmbtu_per_day={physical.OperatingState.BALLAST_SEA: 8_000.0},
+        bor_fraction_per_day={physical.OperatingState.BALLAST_SEA: 0.0},
+        shortfall_source={physical.OperatingState.BALLAST_SEA: physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL},
+    )
+    seg = physical.VoyageSegment("ballast_sea", physical.OperatingState.BALLAST_SEA, duration_days=1.0)
+    r = physical.simulate_segment(seg, vessel, opening_inventory_mmbtu=10_000.0)
+    assert r.forced_lng_mmbtu == pytest.approx(8_000.0)
+    assert r.shortfall_liquid_fuel_tonnes == pytest.approx(0.0)
+    assert r.closing_inventory_mmbtu == pytest.approx(2_000.0)
+
+    vessel_hungry = physical.VesselPerformance(
+        demand_mmbtu_per_day={physical.OperatingState.BALLAST_SEA: 15_000.0},
+        bor_fraction_per_day={physical.OperatingState.BALLAST_SEA: 0.0},
+        shortfall_source={physical.OperatingState.BALLAST_SEA: physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL},
+    )
+    r2 = physical.simulate_segment(seg._replace() if hasattr(seg, "_replace") else seg, vessel_hungry, 10_000.0)
+    assert r2.forced_lng_mmbtu == pytest.approx(10_000.0)
+    assert r2.shortfall_liquid_fuel_tonnes == pytest.approx(5_000.0 / vessel_hungry.energy_factor_mmbtu_per_t)
+    assert r2.closing_inventory_mmbtu == pytest.approx(0.0)
+
+
+def test_zero_heel_is_bit_identical_through_the_decision_path(tables):
+    """The frozen-equivalence guarantee: with heel_fraction at the 0.0
+    Params default, the ballast HEEL_THEN_LIQUID_FUEL branch degrades to
+    LIQUID_FUEL exactly and every decision value matches a run made
+    before heel support existed (pinned via the step-8 identity that
+    base-Asia physical == legacy to float noise, plus Europe's value at
+    known ETS-delta distance -- both already asserted elsewhere; here we
+    assert the direct invariant that a 0.0-heel breakdown has no Heel
+    line and delivered+burned+vented reconciles with zero heel)."""
+    p = model.Params()
+    vessel = physical.vessel_performance_from_params(p)
+    ledger = physical.run_voyage(physical.europe_route_segments(p), vessel, loaded_mmbtu=p.cargo_size)
+    assert ledger.heel_at_discharge_mmbtu == 0.0
+    assert ledger.heel_burned_mmbtu == 0.0
+    df = model.strip("2026-07-08", tables, p)
+    bd = decision.physical_waterfall_breakdown(df.iloc[0], p)
+    assert "Heel" not in dict(bd["Europe"]["lines"])
+    assert "Heel" not in dict(bd["Asia"]["lines"])
+
+
+def test_heel_fuels_ballast_and_reconciles(tables):
+    """2% heel on the operating case: the ballast leg burns heel instead
+    of buying VLSFO (bunkers drop by the energy-equivalent), the
+    remainder arrives as terminal heel, mass reconciles, and the
+    breakdown identity revenue - lines == margin still holds with the
+    new Heel line present."""
+    p = model.operating_default_params()
+    assert p.heel_fraction == 0.02
+    vessel = physical.vessel_performance_from_params(p)
+    heel_target = p.heel_fraction * p.cargo_size
+
+    no_heel = physical.run_voyage(physical.europe_route_segments(p), vessel, loaded_mmbtu=p.cargo_size)
+    with_heel = physical.run_voyage(physical.europe_route_segments(p), vessel,
+                                    loaded_mmbtu=p.cargo_size, heel_target_mmbtu=heel_target)
+
+    assert with_heel.heel_at_discharge_mmbtu == pytest.approx(heel_target)
+    assert with_heel.reconciliation_error_mmbtu == pytest.approx(0.0, abs=1e-6)
+    # ballast liquid fuel drops by (energy burned from heel)/energy factor
+    fuel_saved_t = no_heel.total_liquid_fuel_tonnes - with_heel.total_liquid_fuel_tonnes
+    assert fuel_saved_t > 0
+    assert fuel_saved_t == pytest.approx(with_heel.heel_burned_mmbtu / vessel.energy_factor_mmbtu_per_t, rel=1e-6)
+    assert with_heel.terminal_heel_mmbtu == pytest.approx(heel_target - with_heel.heel_burned_mmbtu)
+    # delivered drops by exactly the retained heel (laden legs unchanged)
+    assert no_heel.delivered_mmbtu - with_heel.delivered_mmbtu == pytest.approx(heel_target)
+
+    df = model.strip("2026-07-08", tables, p)
+    bd = decision.physical_waterfall_breakdown(df.iloc[0], p)["Europe"]
+    lines = dict(bd["lines"])
+    assert "Heel" in lines
+    assert bd["revenue"] - sum(v for _, v in bd["lines"]) == pytest.approx(bd["margin"])
+
+
+def test_ballast_heel_combustion_is_counted_in_emissions():
+    """Removing segment_emissions' laden-only gate: a ballast segment
+    burning heel must emit CO2 at the LNG factor; at zero heel it emits
+    only its liquid-fuel CO2, exactly as before."""
+    p = model.operating_default_params()
+    vessel = physical.vessel_performance_from_params(p)
+    heel_target = p.heel_fraction * p.cargo_size
+    ledger = physical.run_voyage(physical.europe_route_segments(p), vessel,
+                                 loaded_mmbtu=p.cargo_size, heel_target_mmbtu=heel_target)
+    ballast = next(r for r in ledger.segments if r.segment.name == "ballast_sea")
+    assert ballast.forced_lng_mmbtu > 0
+    em = emissions.segment_emissions(ballast)
+    expected_lng_co2 = (ballast.bog_burned_mmbtu + ballast.forced_lng_mmbtu) / emissions.LNG_MMBTU_PER_T \
+        * emissions.CO2_T_PER_T_LNG
+    expected = expected_lng_co2 + ballast.shortfall_liquid_fuel_tonnes * emissions.CO2_T_PER_T_VLSFO
+    assert em.co2_tonnes == pytest.approx(expected)
+
+
+def test_heel_net_cost_is_negative_at_current_prices(tables):
+    """Honest economics check: with delivered LNG worth ~$15-17/MMBtu and
+    VLSFO at ~$13/MMBtu-equivalent, burning cargo instead of oil plus
+    writing off the terminal remainder is a net COST -- adding heel
+    lowers cargo values. This is realism the zero-heel model omitted
+    (heel is operationally required to keep tanks cold), not an
+    optimisation."""
+    p0 = model.operating_default_params()
+    p0.heel_fraction = 0.0
+    p1 = model.operating_default_params()  # 2% heel
+    df0 = model.strip("2026-07-08", tables, p0)
+    df1 = model.strip("2026-07-08", tables, p1)
+    _, v0 = decision._physical_route_value(df0.iloc[0], p0, "Europe")
+    _, v1 = decision._physical_route_value(df1.iloc[0], p1, "Europe")
+    assert v1 < v0
+    # bounded: the loss cannot exceed the full sale value of the heel
+    assert v0 - v1 < p1.heel_fraction * p1.cargo_size * float(df1.iloc[0]["ttf_usd"])
+
+
 def test_operating_case_decision_path_runs_end_to_end(tables):
     """Belt-and-braces: the physical decision path and programme run
     clean at the operating case (this geometry is what the app now shows

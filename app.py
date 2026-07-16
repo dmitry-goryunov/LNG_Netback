@@ -161,7 +161,7 @@ def _flow_buckets(lines: list) -> list:
     buckets = [
         ("Procurement", d.get("Procurement", 0.0), "#c66b4e"),
         ("Shipping", d.get("Charter", 0.0) + d.get("Bunkers", 0.0) + d.get("Canal", 0.0), "#b3563a"),
-        ("Boil-off", d.get("Boil-off", 0.0), "#d9a05b"),
+        ("Boil-off", d.get("Boil-off", 0.0) + d.get("Heel", 0.0), "#d9a05b"),
         ("Discharge/Port", d.get("Discharge", 0.0) + d.get("Port", 0.0), "#8a6d5c"),
         ("Loading + Other + ETS", d.get("Loading", 0.0) + d.get("Other", 0.0) + d.get("ETS", 0.0), "#9aa4ae"),
     ]
@@ -393,6 +393,15 @@ with st.sidebar.expander("Cargo / boil-off"):
                               step=50_000.0, format="%.0f")
     p.boil_off_rate = _num_input("Boil-off rate (fraction/day)", value=float(p.boil_off_rate),
                                  min_value=0.0, max_value=0.1, step=0.0001, format="%.4f")
+    p.heel_fraction = _num_input("Heel retained at discharge (fraction of cargo)",
+                                 value=float(p.heel_fraction), min_value=0.0, max_value=0.10,
+                                 step=0.005, format="%.3f")
+    st.caption(
+        "Heel fuels the ballast leg (burned before any VLSFO is bought -- physical "
+        "decision path only; the legacy screening formula has no heel concept) and the "
+        "remainder keeps the tanks cold back to the loading port, uncredited. "
+        "2% is an industry-typical assumption, not a vessel spec."
+    )
 
 with st.sidebar.expander("Europe route"):
     p.europe_laden_days = _num_input("Europe laden days", value=float(p.europe_laden_days), min_value=0.0, step=1.0)
@@ -972,7 +981,10 @@ if PAGE == "0 Decision":
                 physical.europe_route_segments(recon_params) if recon_route_choice == "Europe"
                 else physical.asia_route_segments(recon_params)
             )
-            recon_ledger = physical.run_voyage(recon_segments, recon_vessel, loaded_mmbtu=recon_params.cargo_size)
+            recon_ledger = physical.run_voyage(
+                recon_segments, recon_vessel, loaded_mmbtu=recon_params.cargo_size,
+                heel_target_mmbtu=recon_params.heel_fraction * recon_params.cargo_size,
+            )
             recon_emissions = emissions.voyage_emissions(recon_ledger)
         except ValueError as exc:
             # This expander overrides asia_rt_days to Base/Congested while

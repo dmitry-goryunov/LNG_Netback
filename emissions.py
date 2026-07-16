@@ -100,18 +100,18 @@ def segment_emissions(
     consumed (and gas vented) in that segment -- not a static per-voyage
     constant.
 
-    LNG is only counted as burned in laden-state segments
-    (physical.LADEN_STATES): physical.py never burns LNG during ballast,
-    only heel BOG, which is either vented or met by liquid fuel under the
-    same shortfall rules as any other segment. Vented gas is not
-    state-gated the same way: physical.py's own reconciliation only ever
-    produces a nonzero vented_mmbtu on a laden-state segment today (ballast
-    starts at zero/near-zero heel, so has nothing to vent), but this
-    function does not assume that will always hold -- it reads whatever
-    vented_mmbtu the ledger actually reports.
+    LNG combustion is counted in EVERY state. An earlier version gated it
+    to laden segments because ballast legs then always ran at zero
+    inventory and could not burn gas; since heel support landed
+    (Params.heel_fraction + ShortfallSource.HEEL_THEN_LIQUID_FUEL),
+    ballast segments genuinely combust heel BOG and forced heel
+    vaporisation, and those emissions are as real as the laden ones. At
+    zero heel every ballast segment's bog_burned/forced_lng are exactly
+    0.0, so removing the gate changes nothing for zero-heel runs (the
+    frozen-equivalence guarantee). Vented gas is likewise read from
+    whatever the ledger reports, in any state.
     """
-    is_laden = result.segment.state in physical.LADEN_STATES
-    lng_burned_tonnes = (result.bog_burned_mmbtu + result.forced_lng_mmbtu) / LNG_MMBTU_PER_T if is_laden else 0.0
+    lng_burned_tonnes = (result.bog_burned_mmbtu + result.forced_lng_mmbtu) / LNG_MMBTU_PER_T
     vlsfo_tonnes = result.shortfall_liquid_fuel_tonnes
     vented_tonnes = result.vented_mmbtu / LNG_MMBTU_PER_T
 

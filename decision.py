@@ -234,11 +234,13 @@ def _physical_route_breakdown(row: Mapping, params: model.Params, route: str) ->
     construction (same invariant model.waterfall_breakdown() documents),
     and margin * cargo == _physical_route_value()'s full_cargo_value.
 
-    heel_target_mmbtu=0.0: the legacy model has no heel concept and treats
-    100% of ballast/discharge fuel demand as purchased VLSFO with no BOG
-    offset (docs/PHASE2_PLAN.md Section 10 item 5/7); zero heel reproduces
-    that assumption exactly rather than silently changing it as a side
-    effect of this wiring.
+    Heel: heel_target = params.heel_fraction * cargo_size is retained at
+    discharge; ballast states then burn that heel before buying liquid
+    fuel (physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL via
+    vessel_performance_from_params), and the terminal remainder returns
+    to the loading port uncredited (tank cool-down gas). The legacy
+    formula has no heel concept, so Params()'s 0.0 default reproduces it
+    exactly -- the app's operating case uses 2%.
     """
     route = _normalise_route(route)
     vessel = physical.vessel_performance_from_params(params)
@@ -255,10 +257,22 @@ def _physical_route_breakdown(row: Mapping, params: model.Params, route: str) ->
         segments = physical.asia_route_segments(params)
         price = float(row["JKM"])
 
-    ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=cargo, heel_target_mmbtu=0.0)
+    heel_target = params.heel_fraction * cargo
+    ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=cargo, heel_target_mmbtu=heel_target)
     voyage_em = emissions.voyage_emissions(ledger)
 
-    boiloff = price * (cargo - ledger.delivered_mmbtu) / cargo
+    # Boil-off = revenue foregone on gas burned/vented on the LADEN legs;
+    # the heel retained at discharge is shown as its own line (below)
+    # rather than lumped in, because economically it is a different thing:
+    # part of it substitutes for ballast liquid fuel (that saving shows up
+    # automatically in the smaller Bunkers line -- physical.py burns heel
+    # before buying VLSFO on ballast states), and the terminal remainder
+    # is kept for tank cool-down (conservatively not credited). Both
+    # pieces are charged here at the destination sale price, preserving
+    # revenue - sum(lines) == margin exactly. At heel_fraction == 0 the
+    # Heel line is omitted and every number is bit-identical to before
+    # heel support existed.
+    boiloff = price * (cargo - ledger.delivered_mmbtu - ledger.heel_at_discharge_mmbtu) / cargo
     bunkers = ledger.total_liquid_fuel_tonnes * params.vlsfo_price / cargo
     charter_line = charter_rate * ledger.total_days / cargo
 
@@ -269,6 +283,8 @@ def _physical_route_breakdown(row: Mapping, params: model.Params, route: str) ->
         ("Bunkers", bunkers),
         ("Boil-off", boiloff),
     ]
+    if ledger.heel_at_discharge_mmbtu > 0:
+        lines.append(("Heel", price * ledger.heel_at_discharge_mmbtu / cargo))
     if route == "Europe":
         ets_line = emissions.ets_cost_usd(voyage_em, params.eua_price, fx_l) * phase / cargo
         lines += [("Discharge", params.eu_regas_port), ("ETS", ets_line), ("Other", params.other_cost)]

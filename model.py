@@ -68,6 +68,7 @@ def operating_default_params(speed_knots: float = 17.0, loading_days: float = 1.
     p.laden_fuel_requirement = sea_fuel_at_speed(Params.laden_fuel_requirement, speed_knots)
     p.ballast_fuel = sea_fuel_at_speed(Params.ballast_fuel, speed_knots)
     p.residual_laden_vlsfo = derived_residual_laden_vlsfo(p)
+    p.heel_fraction = 0.02
     return p
 
 
@@ -118,6 +119,18 @@ class Params:
     # inert at 0.0, keeping the frozen 12-month strip byte-identical. The
     # app's operating defaults set this to 1.5 d.
     loading_days: float = 0.0
+
+    # Heel retained at discharge, as a fraction of cargo_size. NOT read by
+    # strip() (the legacy formula has no heel concept -- 0.0 default keeps
+    # it that way); consumed by the physical decision path, where the
+    # ballast leg burns the heel before buying liquid fuel
+    # (physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL) and any remainder
+    # arrives back at the loading port as terminal heel (kept for tank
+    # cool-down, conservatively not credited). The app's operating
+    # defaults set 2% -- an industry-typical low-single-digit figure
+    # (~3,300 m3 on a 174k vessel), an assumption rather than a vessel
+    # spec (docs/PHASE2_PLAN.md Section 10 item 7).
+    heel_fraction: float = 0.0
 
     # Asia route (base 46.74 d / congestion 54.74 d). WORKBOOK PARITY: laden days
     # default to symmetric legs, laden = (RT - port - loading)/2, exactly as
