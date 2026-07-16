@@ -298,6 +298,58 @@ def test_congested_asia_physical_value_exceeds_legacy_flat_rate_fuel_assumption(
     )
 
 
+# --- Turnaround days between programme voyages ---
+
+
+def test_turnaround_zero_default_is_identical(tables):
+    params = model.Params(asia_rt_days=model.ASIA_RT_BASE)
+    df = model.strip("2026-07-08", tables, params)
+    a = decision.optimise_programme(df, params, horizon_days=52.0, max_additional_cargoes=1)
+    b = decision.optimise_programme(df, params, horizon_days=52.0, max_additional_cargoes=1,
+                                    turnaround_days=0.0)
+    assert [(p.sequence, p.total_value, p.residual_days) for p in a.alternatives] == \
+           [(p.sequence, p.total_value, p.residual_days) for p in b.alternatives]
+
+
+def test_turnaround_shifts_second_leg_and_counts_as_residual(tables):
+    """1 turnaround day: the second voyage starts one day after the first
+    ends, and that gap is residual/idle time (uniformly priced by
+    residual_value_per_day), not sailing time."""
+    params = model.Params(asia_rt_days=model.ASIA_RT_BASE)
+    df = model.strip("2026-07-08", tables, params)
+    rate = 100_000.0
+    result = decision.optimise_programme(
+        df, params, horizon_days=53.0, max_additional_cargoes=1,
+        turnaround_days=1.0, residual_value_per_day=rate,
+    )
+    plan = next(p for p in result.alternatives if p.sequence == "Europe -> Europe")
+    first, second = plan.legs
+    assert second.start_day == pytest.approx(first.end_day + 1.0)
+    # residual = horizon - sailing days (gap + tail), NOT horizon - last end
+    assert plan.residual_days == pytest.approx(53.0 - plan.used_days)
+    assert plan.residual_value == pytest.approx(plan.residual_days * rate)
+
+
+def test_turnaround_makes_second_voyage_infeasible_when_it_no_longer_fits(tables):
+    """Two Europe RTs (51.88 d) + a 1-day gap need 52.88 d: feasible at a
+    53-day horizon, infeasible at 52.5."""
+    params = model.Params(asia_rt_days=model.ASIA_RT_BASE)
+    df = model.strip("2026-07-08", tables, params)
+    fits = decision.optimise_programme(df, params, horizon_days=53.0,
+                                       max_additional_cargoes=1, turnaround_days=1.0)
+    assert "Europe -> Europe" in {p.sequence for p in fits.alternatives}
+    tight = decision.optimise_programme(df, params, horizon_days=52.5,
+                                        max_additional_cargoes=1, turnaround_days=1.0)
+    assert "Europe -> Europe" not in {p.sequence for p in tight.alternatives}
+
+
+def test_turnaround_negative_rejected(tables):
+    params = model.Params()
+    df = model.strip("2026-07-08", tables, params)
+    with pytest.raises(ValueError):
+        decision.optimise_programme(df, params, horizon_days=52.0, turnaround_days=-1.0)
+
+
 # --- Fuel-knob coherence (review finding: two sidebar fuel fields each
 # silently fed only one of the two valuation paths) ---
 

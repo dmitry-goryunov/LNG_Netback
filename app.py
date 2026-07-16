@@ -679,16 +679,21 @@ if PAGE == "0 Decision":
 
     else:
         st.subheader("Discrete one-vessel programme")
-        c1, c2, c3 = st.columns(3)
-        # Default horizon: two Europe round trips at the CURRENT geometry,
-        # rounded up to 0.1 d (user instruction: "make it fit 2x Europe").
-        # Derived, not hardcoded 54 -- at 17 kn two Europe RTs are
-        # 54.039 d, so a literal 54.0 would exclude the second voyage by
-        # ~56 minutes; and the default keeps fitting if speed or port
-        # days change again.
+        c1, c2, c3, c4 = st.columns(4)
+        # Turnaround is read first (even though it displays last) because
+        # the derived default horizon must include the gap between the
+        # two Europe voyages it is sized to fit.
+        turnaround = _num_input("Turnaround days between voyages", container=c4,
+                                min_value=0.0, value=0.0, step=0.5)
+        # Default horizon: two Europe round trips at the CURRENT geometry
+        # plus one turnaround gap, rounded up to 0.1 d (user instruction:
+        # "make it fit 2x Europe"). Derived, not hardcoded 54 -- at 17 kn
+        # two Europe RTs are 54.039 d, so a literal 54.0 would exclude
+        # the second voyage by ~56 minutes; and the default keeps fitting
+        # if speed, port days or turnaround change again.
         _europe_rt_now = (params.europe_laden_days + params.europe_ballast_days
                           + params.europe_port_days + params.loading_days)
-        _default_horizon = float(np.ceil(2.0 * _europe_rt_now * 10.0) / 10.0)
+        _default_horizon = float(np.ceil((2.0 * _europe_rt_now + float(turnaround)) * 10.0) / 10.0)
         horizon = _num_input("Programme horizon (days)", container=c1, min_value=1.0,
                              value=_default_horizon, step=1.0)
         max_additional = _num_input("Additional cargoes available", container=c2, min_value=0,
@@ -696,8 +701,9 @@ if PAGE == "0 Decision":
         residual_value = _num_input("Residual vessel value ($/day)", container=c3, value=0.0,
                                     step=10_000.0, format="%.0f")
         st.caption(
-            f"Default horizon = two Europe round trips ({_europe_rt_now:.2f} d each -> "
-            f"{_default_horizon:.1f} d), derived from the current speed/port settings. Edit freely."
+            f"Default horizon = two Europe round trips ({_europe_rt_now:.2f} d each) plus one "
+            f"turnaround gap ({float(turnaround):.1f} d) -> {_default_horizon:.1f} d, derived "
+            "from the current speed/port/turnaround settings. Edit freely."
         )
         # Base/Congested derived from the sidebar's speed + loading/unloading
         # days, not the 19.5-kn module constants (frozen-suite-only now).
@@ -735,6 +741,7 @@ if PAGE == "0 Decision":
                 current_first_cargo_state=programme_first_cargo_state,
                 max_additional_cargoes=int(max_additional),
                 residual_value_per_day=float(residual_value),
+                turnaround_days=float(turnaround),
             )
         except ValueError as exc:
             st.error(str(exc))
@@ -777,11 +784,13 @@ if PAGE == "0 Decision":
             st.caption(
                 "Charter and every other running cost are only charged for the "
                 f"{best.used_days:,.4f} used_days above -- the "
-                f"{best.residual_days:,.4f} residual/idle day(s) are not charged "
+                f"{best.residual_days:,.4f} residual/idle day(s) (turnaround gaps "
+                "between voyages plus the end-of-horizon tail) are not charged "
                 "ongoing hire. If this is a real time charter where hire continues "
                 "during idle time, enter a negative Residual vessel value (e.g. "
                 f"-\\${snap_info.charter_rate:,.0f}/day, this curve's snapped charter "
-                "rate) instead of the default \\$0 credit to model that cost."
+                "rate) instead of the default \\$0 credit -- it applies uniformly to "
+                "gaps and tail alike."
             )
 
             # --- How the programme value is calculated -----------------------
@@ -894,6 +903,7 @@ if PAGE == "0 Decision":
                                 current_first_cargo_state=programme_first_cargo_state,
                                 max_additional_cargoes=int(max_additional),
                                 residual_value_per_day=float(residual_value),
+                                turnaround_days=float(turnaround),
                             )
                         except ValueError:
                             row.update(sequence="(infeasible)", programme_value=None,

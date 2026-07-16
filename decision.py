@@ -413,6 +413,7 @@ def optimise_programme(
     current_first_cargo_state: FirstCargoState | None = None,
     max_additional_cargoes: int = 1,
     residual_value_per_day: float = 0.0,
+    turnaround_days: float = 0.0,
     routes: Sequence[str] = ("Europe", "Asia"),
     route_feasible: Mapping[str, bool] | None = None,
 ) -> ProgrammeResult:
@@ -425,12 +426,23 @@ def optimise_programme(
     ``future_cargo=True``, so ``current_first_cargo_state`` never applies
     to them, by design). A voyage is admitted only when the whole route
     fits inside ``horizon_days``; fractional cargoes are impossible.
+
+    ``turnaround_days`` is the gap BETWEEN consecutive voyages (fixing the
+    next cargo, positioning, waiting for the loading slot) -- inserted
+    before every additional cargo, never before the first or after the
+    last. At the 0.0 default the schedule is byte-identical to before this
+    parameter existed. ``residual_days`` counts every non-sailing day in
+    the horizon (turnaround gaps plus the end-of-horizon tail), all valued
+    uniformly at ``residual_value_per_day`` -- so pricing idle hire with a
+    negative rate covers the gaps too, not just the tail.
     """
 
     if horizon_days <= 0:
         raise ValueError("horizon_days must be positive")
     if max_additional_cargoes < 0:
         raise ValueError("max_additional_cargoes cannot be negative")
+    if turnaround_days < 0:
+        raise ValueError("turnaround_days cannot be negative")
     if not 0 <= current_month_index < len(strip_df):
         raise IndexError("current_month_index outside strip")
 
@@ -446,7 +458,10 @@ def optimise_programme(
     tolerance = 1e-9
 
     def finish(legs: list[ProgrammeLeg], end_day: float) -> None:
-        residual = max(float(horizon_days) - end_day, 0.0)
+        # Residual = every non-sailing day in the horizon: turnaround gaps
+        # between voyages plus the end-of-horizon tail. At turnaround_days
+        # == 0 this equals the old horizon - end_day exactly (legs butt).
+        residual = max(float(horizon_days) - sum(leg.duration_days for leg in legs), 0.0)
         residual_value = residual * float(residual_value_per_day)
         total = sum(leg.value for leg in legs) + residual_value
         plans.append(
@@ -466,7 +481,8 @@ def optimise_programme(
         if additional_used >= max_additional_cargoes:
             return
 
-        month_index = _month_index_for_start(strip_df, base_date, end_day)
+        next_start = end_day + float(turnaround_days)
+        month_index = _month_index_for_start(strip_df, base_date, next_start)
         if month_index is None:
             return
         row = strip_df.iloc[month_index]
@@ -481,14 +497,14 @@ def optimise_programme(
                 month_index=month_index,
                 future_cargo=True,
             )
-            if end_day + value.duration_days > horizon_days + tolerance:
+            if next_start + value.duration_days > horizon_days + tolerance:
                 continue
             leg = ProgrammeLeg(
                 cargo_number=len(legs) + 1,
                 route=route,
                 month_index=month_index,
                 load_month=value.load_month,
-                start_day=end_day,
+                start_day=next_start,
                 duration_days=value.duration_days,
                 value=value.incremental_value,
                 decision_mode=DecisionMode.PRE_LIFT_CARGO,
