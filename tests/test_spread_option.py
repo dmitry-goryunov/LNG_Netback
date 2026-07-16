@@ -180,22 +180,28 @@ class _FakeTables:
 
 
 def _synthetic_tables(n_days=70, seed=11):
+    """Independent series per column so tenor-alignment tests can tell
+    c1 from c2 apart (c2 as a scalar multiple of c1 would have identical
+    log returns and defeat the purpose)."""
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range("2026-01-01", periods=n_days)
-    ttf = np.cumprod(1 + rng.normal(0, 0.015, n_days)) * 12.0
-    jkm = np.cumprod(1 + rng.normal(0, 0.012, n_days)) * 14.0
-    mkdf = lambda px: pd.DataFrame({"date": dates, "c1": px, "c2": px * 1.01})
-    return _FakeTables(mkdf(ttf), mkdf(jkm)), dates
+
+    def mkdf(base, vol1, vol2):
+        c1 = np.cumprod(1 + rng.normal(0, vol1, n_days)) * base
+        c2 = np.cumprod(1 + rng.normal(0, vol2, n_days)) * base
+        return pd.DataFrame({"date": dates, "c1": c1, "c2": c2})
+
+    return _FakeTables(mkdf(12.0, 0.015, 0.010), mkdf(14.0, 0.030, 0.012)), dates
 
 
 def test_historical_vol_corr_matches_numpy_reference():
     tables, dates = _synthetic_tables()
     D = dates[-1]
-    vc = so.historical_vol_corr(tables, D, months_forward=1, window_days=60)
+    vc = so.historical_vol_corr(tables, D, ttf_contract=1, jkm_contract=2, window_days=60)
 
     dates_window = [d for d in dates if D - pd.Timedelta(days=60) <= d <= D]
     ttf_px = tables.ttf.set_index("date").reindex(dates_window)["c1"].to_numpy()
-    jkm_px = tables.jkm.set_index("date").reindex(dates_window)["c1"].to_numpy()
+    jkm_px = tables.jkm.set_index("date").reindex(dates_window)["c2"].to_numpy()
     ttf_ret = np.diff(np.log(ttf_px))
     jkm_ret = np.diff(np.log(jkm_px))
 
@@ -211,9 +217,49 @@ def test_historical_vol_corr_matches_numpy_reference():
 def test_historical_vol_corr_insufficient_history_returns_none():
     tables, dates = _synthetic_tables(n_days=70)
     D = dates[-1]
-    vc = so.historical_vol_corr(tables, D, months_forward=1, window_days=1)
+    vc = so.historical_vol_corr(tables, D, ttf_contract=1, jkm_contract=2, window_days=1)
     assert vc.vol_jkm is None and vc.correlation is None
     assert "insufficient history" in vc.source_detail
+
+
+def test_month_spread_option_uses_strips_jkm_contract_not_ttf_tenor():
+    """The tenor-alignment regression guard for the review's biggest
+    finding: model.strip() prices the front month's JKM leg at contract
+    c2 (delivery L+1, roll shift s=0 when day(D) <= 15), so the vol used
+    to price the option must come from JKM c2's returns -- an earlier
+    version used JKM c1 (the noisy expiring contract) and overstated
+    front-month extrinsic ~4x on real data. The synthetic tables give c1
+    triple c2's vol, so picking the wrong column fails loudly here."""
+    tables, dates = _synthetic_tables()
+    D = dates[-1]  # a business day; may fall either side of the 15th
+    s = 0 if D.day <= 15 else 1
+    load_month = pd.Timestamp(year=D.year, month=D.month, day=1) + pd.DateOffset(months=1)
+
+    row = {"JKM": 14.0, "ttf_usd": 12.0, "load_month": load_month}
+    result = so.month_spread_option(row, tables, D, "historical", window_days=60)
+
+    expected = so.historical_vol_corr(tables, D, ttf_contract=1, jkm_contract=2 - s, window_days=60)
+    wrong = so.historical_vol_corr(tables, D, ttf_contract=1, jkm_contract=1 + s, window_days=60)
+    assert result.vol_jkm == pytest.approx(expected.vol_jkm)
+    assert result.vol_ttf == pytest.approx(expected.vol_ttf)
+    assert result.correlation == pytest.approx(expected.correlation)
+    assert result.vol_jkm != pytest.approx(wrong.vol_jkm)
+
+
+def test_tab_vol_corr_jkm_read_one_delivery_month_further_out():
+    """Tab mode mirrors the same alignment: the JKM leg delivers L+1, so
+    its vol is read at tenor months_forward+1 while TTF stays at
+    months_forward."""
+    idx = pd.Index([0, 1, 2, 3], name="months_forward")
+    table = pd.DataFrame({
+        "vol_TTF": [0.60, 0.61, 0.62, 0.63],
+        "vol_JKM": [0.50, 0.51, 0.52, 0.53],
+        "corr_TTF_JKM": [0.30, 0.31, 0.32, 0.33],
+    }, index=idx)
+    vc = so.tab_vol_corr(table, months_forward=1)
+    assert vc.vol_ttf == pytest.approx(0.61)   # tenor 1 (TTF delivers L)
+    assert vc.vol_jkm == pytest.approx(0.52)   # tenor 2 (JKM delivers L+1)
+    assert vc.correlation == pytest.approx(0.31)  # nearer (TTF) tenor
 
 
 # --- month_spread_option() / intrinsic_extrinsic_strip(): full wiring ---

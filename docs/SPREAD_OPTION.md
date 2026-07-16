@@ -105,12 +105,26 @@ already used elsewhere in this codebase (`decision._representative_load_date`).
   design, which netted HH-linked cost out of the revenue index). This
   is a deliberate simplification matching the user's explicit formula,
   not an incomplete port of the old design.
-- **Historical mode's tenor mapping (`c{months_forward}`) does not
-  replicate `model.strip()`'s JKM contract-calendar shift** (`s` from
-  `model.contract_calendar`). A deliberate simplification so historical
-  and tab-mode tenors share one convention throughout this module, at
-  the cost of a small, unquantified misalignment against
-  `model.strip()`'s own JKM contract selection on some valuation dates.
+- ~~Historical mode's tenor mapping does not replicate the JKM
+  contract-calendar shift~~ **FIXED after a logic review quantified it
+  as anything but small**: the earlier version computed both legs' vol
+  and their correlation on the same `c{months_forward}` column, but the
+  strip's JKM price is contract `c{i+2-s}` (delivery L+1) while TTF is
+  `c{i+1}` (delivery L). At the front of the curve JKM c1 is the noisy
+  expiring contract: on the 2026-07-08 snapshot its correlation to TTF
+  c1 was 0.25 where the correctly-paired contracts' was 0.80, and since
+  spread variance is dominated by the correlation term, M1 extrinsic was
+  overstated ~4x ($0.74 vs $0.18/MMBtu, ~$2.6M vs ~$0.6M per cargo).
+  Historical mode now takes TTF returns from `c{months_forward}`, JKM
+  returns from `c{months_forward + 1 - s}` (`s` from
+  `model.contract_calendar`, exactly as `model.strip()` selects the
+  priced contract), and correlates those two series. Tab mode reads
+  `Volatility JKM` at delivery tenor `months_forward + 1` and
+  `Volatility TTF` at `months_forward`; the sheet's single
+  `Correlation TTF/JKM` column has no cross-delivery pairing, so it is
+  read at the nearer (TTF) tenor — a documented residual approximation,
+  immaterial while the sheet holds flat placeholder values. Guarded by
+  `test_month_spread_option_uses_strips_jkm_contract_not_ttf_tenor`.
 
 ## Performance
 

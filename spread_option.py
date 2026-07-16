@@ -36,12 +36,24 @@ equal to raw TTF's own fractional vol (FX vol is assumed small relative
 to TTF/JKM vol) -- a stated simplification, not an oversight. JKM needs
 no such approximation; it is already USD.
 
-Historical mode's constant-maturity tenor convention (c{months_forward})
-matches model.strip()'s own c{i+1} indexing for TTF exactly; for JKM it
-does *not* replicate model.strip()'s contract-calendar shift
-(model.contract_calendar's `s`) -- a deliberate simplification so
-historical and tab-mode tenors share one convention throughout this
-module.
+Tenor alignment (fixed after review -- an earlier version used the same
+c{months_forward} column for BOTH legs, which overstated front-month
+extrinsic ~4x): the vol/correlation inputs are taken from the SAME
+contracts the strip's prices come from. model.strip() prices TTF at
+contract c{i+1} (delivery month L) and JKM at c{i+2-s} (delivery L+1,
+with model.contract_calendar's mid-month roll shift s), so historical
+mode computes TTF returns on c{months_forward}, JKM returns on
+c{months_forward + 1 - s}, and the correlation BETWEEN those two series
+-- not two copies of the same column. This matters most at the front of
+the curve, where the expiring JKM c1 is noisy and its correlation to TTF
+is far lower than the correctly-paired contracts' (measured 0.25 vs 0.80
+on the 2026-07-08 snapshot; extrinsic $0.74 -> $0.18/MMBtu for M1). Tab
+mode reads Volatility JKM at delivery tenor months_forward+1 and
+Volatility TTF at months_forward for the same reason; Correlation
+TTF/JKM is read at months_forward (the sheet quotes one correlation per
+tenor row -- the cross-delivery-month pairing doesn't exist as its own
+column, so the nearer tenor's figure is used and this choice is
+documented rather than hidden).
 """
 
 from __future__ import annotations
@@ -52,6 +64,8 @@ from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
+
+import model
 
 TRADING_DAYS_PER_YEAR = 252.0
 DEFAULT_HISTORICAL_WINDOW_DAYS = 60
@@ -145,26 +159,37 @@ def price_exchange_option(
 
 
 def tab_vol_corr(vol_table: Optional[pd.DataFrame], months_forward: int) -> VolCorrInputs:
-    """Reads data.load_volatilities()'s table at one tenor. Clamps
-    months_forward to the table's available tenor range (flat
+    """Reads data.load_volatilities()'s table for a load month
+    `months_forward` calendar months out. The TTF leg delivers that month
+    (tenor = months_forward) but the JKM leg the strip prices delivers
+    L+1 (tenor = months_forward + 1) -- each vol is read at its own leg's
+    delivery tenor, not one shared row (see module docstring). The
+    sheet's Correlation TTF/JKM is one column per tenor row with no
+    cross-delivery-month pairing available, so it is read at the nearer
+    (TTF) tenor. Tenors clamp to the table's available range (flat
     extrapolation beyond the last quoted point, the same convention used
     elsewhere in this app for curves shorter than the 36-month strip)."""
     if vol_table is None or len(vol_table) == 0:
         return VolCorrInputs(None, None, None, "volatilities tab: sheet not loaded")
 
-    tenor = min(max(months_forward, vol_table.index.min()), vol_table.index.max())
-    row = vol_table.loc[tenor]
+    def _tenor(m):
+        return min(max(m, vol_table.index.min()), vol_table.index.max())
+
+    ttf_tenor = _tenor(months_forward)
+    jkm_tenor = _tenor(months_forward + 1)
+    ttf_row = vol_table.loc[ttf_tenor]
+    jkm_row = vol_table.loc[jkm_tenor]
 
     def _clean(x):
         return None if x is None or (isinstance(x, float) and pd.isna(x)) else float(x)
 
-    vol_jkm = _clean(row.get("vol_JKM"))
-    vol_ttf = _clean(row.get("vol_TTF"))
-    corr = row.get("corr_TTF_JKM")
-    corr = corr if corr is not None else row.get("corr_JKM_TTF")
+    vol_jkm = _clean(jkm_row.get("vol_JKM"))
+    vol_ttf = _clean(ttf_row.get("vol_TTF"))
+    corr = ttf_row.get("corr_TTF_JKM")
+    corr = corr if corr is not None else ttf_row.get("corr_JKM_TTF")
     corr = _clean(corr)
 
-    detail = f"volatilities tab, M+{tenor}"
+    detail = f"volatilities tab, TTF M+{ttf_tenor} / JKM M+{jkm_tenor}"
     if vol_jkm is None or vol_ttf is None or corr is None:
         detail += " (missing Volatility JKM / Volatility TTF / Correlation TTF-JKM column)"
     return VolCorrInputs(vol_jkm, vol_ttf, corr, detail)
@@ -179,12 +204,16 @@ def _historical_window_dates(tables, D, window_days: int) -> list:
     return [d for d in inter if start <= d <= D]
 
 
-def _returns_for_column(tables, dates: list, col: str) -> dict:
-    if len(dates) < 3 or col not in tables.ttf.columns or col not in tables.jkm.columns:
+def _paired_returns(tables, dates: list, ttf_col: str, jkm_col: str) -> dict:
+    """Log returns of tables.ttf's `ttf_col` and tables.jkm's `jkm_col`
+    (independent columns -- the two legs live on different contracts, see
+    module docstring), paired on the same trading days so the correlation
+    between them is valid."""
+    if len(dates) < 3 or ttf_col not in tables.ttf.columns or jkm_col not in tables.jkm.columns:
         return {"ttf": np.array([]), "jkm": np.array([])}
 
-    ttf_px = tables.ttf.set_index("date").reindex(dates)[col].to_numpy(dtype=float)
-    jkm_px = tables.jkm.set_index("date").reindex(dates)[col].to_numpy(dtype=float)
+    ttf_px = tables.ttf.set_index("date").reindex(dates)[ttf_col].to_numpy(dtype=float)
+    jkm_px = tables.jkm.set_index("date").reindex(dates)[jkm_col].to_numpy(dtype=float)
     valid = np.isfinite(ttf_px) & np.isfinite(jkm_px)
     ttf_px, jkm_px = ttf_px[valid], jkm_px[valid]
     if len(ttf_px) < 2:
@@ -194,23 +223,26 @@ def _returns_for_column(tables, dates: list, col: str) -> dict:
 
 
 def historical_vol_corr(
-    tables, D, months_forward: int,
+    tables, D, ttf_contract: int, jkm_contract: int,
     window_days: int = DEFAULT_HISTORICAL_WINDOW_DAYS,
     _dates: Optional[list] = None,
 ) -> VolCorrInputs:
-    """Realized (annualised, sqrt(252)) vol/correlation of JKM vs TTF,
-    from the last `window_days` calendar days of actual price history at
-    the M+{months_forward} tenor column.
+    """Realized (annualised, sqrt(252)) vol of TTF contract c{ttf_contract}
+    and JKM contract c{jkm_contract}, plus the correlation BETWEEN those
+    two return series, from the last `window_days` calendar days of actual
+    price history. Callers pass the same contract indices model.strip()
+    prices (TTF c{i+1}, JKM c{i+2-s}) -- see month_spread_option().
 
     _dates: pre-computed _historical_window_dates(tables, D, window_days)
     for callers pricing many tenors at once (avoids recomputing the 2-way
     date intersection on every call); computed fresh if omitted.
     """
-    col = f"c{max(months_forward, 1)}"
+    ttf_col = f"c{max(ttf_contract, 1)}"
+    jkm_col = f"c{max(jkm_contract, 1)}"
     dates = _dates if _dates is not None else _historical_window_dates(tables, D, window_days)
-    rets = _returns_for_column(tables, dates, col)
+    rets = _paired_returns(tables, dates, ttf_col, jkm_col)
     n = len(rets["ttf"])
-    detail = f"historical, {window_days}d window, {col}, n={n} return(s)"
+    detail = f"historical, {window_days}d window, TTF {ttf_col} / JKM {jkm_col}, n={n} return(s)"
     if n < 2:
         return VolCorrInputs(None, None, None, detail + " (insufficient history)")
 
@@ -248,7 +280,16 @@ def month_spread_option(
     if source == "tab":
         vc = tab_vol_corr(tables.vol, months_forward)
     elif source == "historical":
-        vc = historical_vol_corr(tables, D, months_forward, window_days=window_days, _dates=_historical_dates)
+        # The same contract indices model.strip() prices this row from:
+        # strip row i (0-based, load month L = F + i) uses TTF c{i+1} and
+        # JKM c{i+2-s}. F is always month(D)+1 (model.contract_calendar),
+        # so i = months_forward - 1.
+        _, s = model.contract_calendar(D)
+        i = max(months_forward - 1, 0)
+        vc = historical_vol_corr(
+            tables, D, ttf_contract=i + 1, jkm_contract=i + 2 - s,
+            window_days=window_days, _dates=_historical_dates,
+        )
     else:
         raise ValueError(f"unknown vol/correlation source {source!r}")
 
