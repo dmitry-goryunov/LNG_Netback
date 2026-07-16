@@ -19,8 +19,14 @@ app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
 assert not app.exception, [e.message for e in app.exception]
 assert [title.value for title in app.title] == ["LNG cargo and vessel decision"]
 metrics = {metric.label: metric.value for metric in app.metric}
-assert metrics["Best programme"] == "Europe -> Europe"
-assert metrics["Used vessel-days"] == "51.8803"
+# Operating case since 16-Jul-2026: 17 kn / 1.5 d loading / 1.5 d
+# unloading (model.operating_default_params). At that geometry a single
+# 50.6-day Asia round trip beats one 27.0-day Europe run inside the
+# 52-day default horizon (two Europe runs, 54.0 d, no longer fit) --
+# previously 'Europe -> Europe' / 51.8803 used days at the 19.5-kn
+# legacy spec defaults.
+assert metrics["Best programme"] == "Asia"
+assert metrics["Used vessel-days"] == "50.5882"
 # The Decision page now strips out 36 months using fx_curve_multi(), which
 # interpolates through real 2Y/3Y FX anchors instead of extrapolating past
 # 1Y -- so unlike the old 12-month-only strip, nothing in this window should

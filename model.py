@@ -31,6 +31,59 @@ ASIA_LEG_DAYS = 9300.0 / SPEED_NM_PER_DAY + 1.0    # 20.871794...
 ASIA_RT_BASE = 2 * ASIA_LEG_DAYS + 5.0             # 46.743590...
 ASIA_RT_CONG = 2 * (ASIA_LEG_DAYS + 4.0) + 5.0     # 54.743590...
 
+# Design/spec service speed the constants above (and every legacy fuel t/d
+# rate) were calibrated at. The speed-parameterised helpers below reproduce
+# the constants EXACTLY when called at this speed (same distances, same
+# arithmetic), which is what lets the app expose speed as a knob without
+# perturbing the frozen legacy path.
+DESIGN_SPEED_KNOTS = 19.5
+
+
+def europe_leg_days(speed_knots: float) -> float:
+    """One-way USGC -> NWE sea days at a given speed (4,900 nm)."""
+    return 4900.0 / (speed_knots * 24.0)
+
+
+def asia_leg_days(speed_knots: float) -> float:
+    """One-way USGC -> JKM days at a given speed (9,300 nm + 1 d canal)."""
+    return 9300.0 / (speed_knots * 24.0) + 1.0
+
+
+def operating_default_params(speed_knots: float = 17.0, loading_days: float = 1.5,
+                             unloading_days: float = 1.5) -> "Params":
+    """The app's CURRENT OPERATING CASE, as distinct from Params()'s frozen
+    legacy spec defaults (19.5 kn design speed, zero loading time, 5-day
+    port calls -- those stay untouched forever because the 64/64 frozen
+    regression suite is pinned to them). Re-baselined on user instruction
+    (16-Jul-2026): 17 kn service speed, 1.5 d loading, 1.5 d unloading.
+    Geometry and cube-law fuel rates are derived, not asserted, so the
+    whole parameter set stays internally coherent at any speed."""
+    p = Params()
+    p.vessel_speed_knots = speed_knots
+    p.loading_days = loading_days
+    p.europe_port_days = unloading_days
+    p.asia_port_days = unloading_days
+    p.europe_laden_days = p.europe_ballast_days = europe_leg_days(speed_knots)
+    p.asia_rt_days = 2.0 * asia_leg_days(speed_knots) + unloading_days + loading_days
+    p.laden_fuel_requirement = sea_fuel_at_speed(Params.laden_fuel_requirement, speed_knots)
+    p.ballast_fuel = sea_fuel_at_speed(Params.ballast_fuel, speed_knots)
+    p.residual_laden_vlsfo = derived_residual_laden_vlsfo(p)
+    return p
+
+
+def sea_fuel_at_speed(base_t_per_day: float, speed_knots: float) -> float:
+    """Cube-law rescaling of a sea-passage fuel rate calibrated at the
+    19.5-kn design speed: propulsion power scales ~speed^3, so daily burn
+    does too. This is what makes a speed knob economically honest -- the
+    review of the 16-kn question showed that stretching voyage days while
+    holding t/d rates flat books slow steaming's costs (more days of
+    charter and boil-off) with none of its entire purpose (fuel savings).
+    Simplification, stated: the hotel/auxiliary load share does not scale
+    with speed, so a pure cube slightly understates burn at low speeds.
+    Applies to sea rates only -- port/at-berth rates are speed-independent.
+    """
+    return base_t_per_day * (speed_knots / DESIGN_SPEED_KNOTS) ** 3
+
 # ---------------------------------------------------------------------------
 # Step 5 -- static cost parameters (all user-editable in the sidebar)
 # ---------------------------------------------------------------------------
@@ -42,6 +95,14 @@ class Params:
     cargo_size: float = 3_500_000.0          # MMBtu
     boil_off_rate: float = 0.0010            # fraction/day (0.10%/day)
 
+    # Vessel service speed. NOT read by strip() itself (day-count fields
+    # are its interface, so the frozen legacy path is untouched); it is
+    # the reference the app derives day counts and cube-law fuel rates
+    # from, and physical.asia_route_segments uses it to tell "slower sea
+    # passage" apart from "congestion queue time" when decomposing the
+    # Asia round trip. asia_leg_days(19.5) == ASIA_LEG_DAYS exactly.
+    vessel_speed_knots: float = DESIGN_SPEED_KNOTS
+
     # Europe route (distance-derived: 10.47 + 10.47 + 5 = 25.94 d RT)
     europe_laden_days: float = EU_LEG_DAYS
     europe_ballast_days: float = EU_LEG_DAYS
@@ -50,9 +111,18 @@ class Params:
     eu_regas_port: float = 0.41              # $/MMBtu (DES has no regas; hub has cost)
     other_cost: float = 0.07                 # $/MMBtu (insurance, LC, brokerage)
 
+    # Loading-port time (both routes load at the same US terminal). The
+    # legacy spec charged NO vessel time for loading (only the commercial
+    # $/MMBtu loading fee) -- the 0.0 default preserves that exactly, and
+    # every formula below adds loading_days terms that are arithmetically
+    # inert at 0.0, keeping the frozen 12-month strip byte-identical. The
+    # app's operating defaults set this to 1.5 d.
+    loading_days: float = 0.0
+
     # Asia route (base 46.74 d / congestion 54.74 d). WORKBOOK PARITY: laden days
-    # default to symmetric legs, laden = (RT - port)/2, exactly as the xlsx
-    # Assumptions sheet derives B19 = (B20 - B15)/2. Congestion (RT 55)
+    # default to symmetric legs, laden = (RT - port - loading)/2, exactly as
+    # the xlsx Assumptions sheet derives B19 = (B20 - B15)/2 (which had no
+    # loading-time concept; loading_days defaults to 0). Congestion (RT 55)
     # therefore lengthens BOTH legs (laden 25 d: more boil-off, more laden
     # fuel). Set asia_laden_days_override to pin the laden leg instead
     # (e.g. to model waiting as pure ballast/idle time).
@@ -63,7 +133,7 @@ class Params:
     def asia_laden_days(self) -> float:
         if self.asia_laden_days_override is not None:
             return self.asia_laden_days_override
-        return (self.asia_rt_days - self.asia_port_days) / 2.0
+        return (self.asia_rt_days - self.asia_port_days - self.loading_days) / 2.0
 
     @asia_laden_days.setter
     def asia_laden_days(self, v: float | None) -> None:
@@ -329,11 +399,14 @@ def strip(D, tables, params: Params = Params(), n_months: int = 12) -> pd.DataFr
 
     cargo = params.cargo_size
     bo = params.boil_off_rate
+    # loading_days terms are exact no-ops at the 0.0 legacy default
+    # (x + 0.0 == x in IEEE arithmetic), preserving the frozen path.
+    load_days = params.loading_days
     eu_laden, eu_ballast, eu_port = params.europe_laden_days, params.europe_ballast_days, params.europe_port_days
-    europe_rt = eu_laden + eu_ballast + eu_port
+    europe_rt = eu_laden + eu_ballast + eu_port + load_days
     asia_rt = params.asia_rt_days
     asia_laden, asia_port = params.asia_laden_days, params.asia_port_days
-    asia_ballast = asia_rt - asia_laden - asia_port
+    asia_ballast = asia_rt - asia_laden - asia_port - load_days
 
     rows = []
     for i, L in enumerate(months):
@@ -352,12 +425,12 @@ def strip(D, tables, params: Params = Params(), n_months: int = 12) -> pd.DataFr
         eu_ship = (
             charter * europe_rt
             + (params.residual_laden_vlsfo * eu_laden + params.ballast_fuel * eu_ballast
-               + params.port_fuel_rate * eu_port) * params.vlsfo_price
+               + params.port_fuel_rate * (eu_port + load_days)) * params.vlsfo_price
         ) / cargo
         as_ship = (
             charter * asia_rt
             + (params.residual_laden_vlsfo * asia_laden + params.ballast_fuel * asia_ballast
-               + params.port_fuel_rate * asia_port) * params.vlsfo_price
+               + params.port_fuel_rate * (asia_port + load_days)) * params.vlsfo_price
             + params.panama_toll_roundtrip
         ) / cargo
 

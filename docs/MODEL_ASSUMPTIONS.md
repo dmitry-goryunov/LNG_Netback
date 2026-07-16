@@ -1,5 +1,31 @@
 # Model assumptions for v2.3-phase1
 
+## Operating case vs legacy spec case (re-baselined 16-Jul-2026)
+
+Two named parameter sets now exist:
+
+- **Legacy spec case** (`model.Params()` defaults, frozen forever for the
+  64/64 regression suite): 19.5 kn design speed, 0 d loading time,
+  5 d unloading, flat 150/130/25 t/d fuel rates, hand-set 4,425.9 t
+  legacy ETS constant. Europe RT 25.94 d, Asia base RT 46.74 d.
+- **Operating case** (`model.operating_default_params()`, what the app
+  shows by default, set by user instruction): **17 kn service speed,
+  1.5 d loading, 1.5 d unloading.** Everything downstream is DERIVED,
+  not asserted: sea legs from distance/speed (Europe 12.01 d/leg, Asia
+  23.79 d/leg incl. canal), Europe RT 27.02 d, Asia base RT 50.59 d
+  (congested 58.59 d); sea fuel rates from the cube law
+  (laden 99.4 t/d, ballast 86.1 t/d -- at 17 kn the vessel sails almost
+  entirely on natural boil-off, residual purchased fuel ~13 t/d); the
+  legacy ETS tonnes from the physical fuel balance at uniform 50% scope
+  (~3,182 t at 17 kn, vs 4,425.9 t at 19.5 kn).
+
+Consequence worth knowing: at the operating case the default 52-day
+programme flips from "Europe -> Europe" (two fast round trips) to a
+single "Asia" voyage -- two 27.0-day Europe runs no longer fit a 52-day
+horizon, while one 50.6-day Asia run does. Loading-berth time is charged
+charter + port-rate fuel on both routes and sits OUTSIDE EU ETS scope
+(US berth); it is inert at the legacy 0.0-day default.
+
 ## Decision-state assumptions
 
 - Post-lift incremental value excludes procurement and completed loading because they are sunk.

@@ -338,10 +338,36 @@ sel_label = st.sidebar.selectbox(
 D = master_desc[date_labels.index(sel_label)]
 
 if "params" not in st.session_state:
-    st.session_state.params = model.Params()
+    # Operating case (17 kn / 1.5 d loading / 1.5 d unloading), NOT the
+    # frozen legacy spec defaults (19.5 kn / 0 / 5) that Params() itself
+    # keeps for the 64/64 regression suite -- see model.operating_default_params.
+    st.session_state.params = model.operating_default_params()
 p = st.session_state.params
 
 st.sidebar.header("Cost parameters (Step 5)")
+
+with st.sidebar.expander("Vessel schedule"):
+    _new_speed = _num_input("Service speed (knots)", value=float(p.vessel_speed_knots),
+                            min_value=8.0, max_value=21.0, step=0.5, format="%.1f")
+    if abs(_new_speed - p.vessel_speed_knots) > 1e-9:
+        # Re-derive everything that was calibrated to the old speed. Fuel
+        # rates rescale from the 19.5-kn design constants (cube law), not
+        # from their current values, so repeated changes never compound.
+        p.vessel_speed_knots = _new_speed
+        p.europe_laden_days = p.europe_ballast_days = model.europe_leg_days(_new_speed)
+        p.laden_fuel_requirement = model.sea_fuel_at_speed(model.Params.laden_fuel_requirement, _new_speed)
+        p.ballast_fuel = model.sea_fuel_at_speed(model.Params.ballast_fuel, _new_speed)
+    p.loading_days = _num_input("Loading days (both routes)", value=float(p.loading_days),
+                                min_value=0.0, step=0.5)
+    st.caption(
+        f"Sea legs at {p.vessel_speed_knots:.1f} kn: Europe "
+        f"{model.europe_leg_days(p.vessel_speed_knots):.2f} d/leg, Asia "
+        f"{model.asia_leg_days(p.vessel_speed_knots):.2f} d/leg (incl. 1 d canal). "
+        "Changing speed re-derives leg days and cube-law sea fuel rates together "
+        "(slower = longer voyages but ~speed-cubed less fuel/day); each derived "
+        "field below stays individually editable afterwards. Legacy spec case: "
+        "19.5 kn, 0 d loading, 5 d unloading."
+    )
 
 with st.sidebar.expander("Cargo / boil-off"):
     p.cargo_size = _num_input("Cargo size (MMBtu)", value=float(p.cargo_size), min_value=1_000.0,
@@ -352,8 +378,9 @@ with st.sidebar.expander("Cargo / boil-off"):
 with st.sidebar.expander("Europe route"):
     p.europe_laden_days = _num_input("Europe laden days", value=float(p.europe_laden_days), min_value=0.0, step=1.0)
     p.europe_ballast_days = _num_input("Europe ballast days", value=float(p.europe_ballast_days), min_value=0.0, step=1.0)
-    p.europe_port_days = _num_input("Europe port days", value=float(p.europe_port_days), min_value=0.0, step=1.0)
-    st.caption(f"Europe RT = {p.europe_laden_days + p.europe_ballast_days + p.europe_port_days:.0f} d")
+    p.europe_port_days = _num_input("Europe unloading days", value=float(p.europe_port_days), min_value=0.0, step=0.5)
+    st.caption(f"Europe RT = {p.europe_laden_days + p.europe_ballast_days + p.europe_port_days + p.loading_days:.1f} d "
+               "(laden + ballast + unloading + loading)")
     p.loading = _num_input("Loading ($/MMBtu)", value=float(p.loading), min_value=0.0, step=0.01, format="%.2f")
     p.eu_regas_port = _num_input("EU regas + port ($/MMBtu)", value=float(p.eu_regas_port), min_value=0.0,
                                  step=0.01, format="%.2f")
@@ -361,20 +388,25 @@ with st.sidebar.expander("Europe route"):
                               min_value=0.0, step=0.01, format="%.2f")
 
 with st.sidebar.expander("Asia route"):
-    rt_options = ["Base (46.7d)", "Congestion (54.7d)", "Custom"]
-    rt_default = (0 if abs(p.asia_rt_days - model.ASIA_RT_BASE) < 0.01
-                  else (1 if abs(p.asia_rt_days - model.ASIA_RT_CONG) < 0.01 else 2))
+    # Base/Congestion round trips are DERIVED from the current speed,
+    # loading and unloading days -- not the 19.5-kn module constants,
+    # which stay pinned for the frozen legacy suite only.
+    _det_base = 2.0 * model.asia_leg_days(p.vessel_speed_knots) + p.asia_port_days + p.loading_days
+    rt_options = [f"Base ({_det_base:.1f}d)", f"Congestion ({_det_base + 8.0:.1f}d)", "Custom"]
+    rt_default = (0 if abs(p.asia_rt_days - _det_base) < 0.01
+                  else (1 if abs(p.asia_rt_days - _det_base - 8.0) < 0.01 else 2))
     rt_choice = st.radio("Asia RT", rt_options, index=rt_default, horizontal=True)
-    if rt_choice == "Base (46.7d)":
-        p.asia_rt_days = model.ASIA_RT_BASE
-    elif rt_choice == "Congestion (54.7d)":
-        p.asia_rt_days = model.ASIA_RT_CONG
-    else:
+    if rt_choice == "Custom":
         p.asia_rt_days = _num_input("Asia RT custom (days)", value=float(p.asia_rt_days), min_value=1.0, step=1.0)
-    p.asia_port_days = _num_input("Asia port days", value=float(p.asia_port_days), min_value=0.0, step=1.0)
+    p.asia_port_days = _num_input("Asia unloading days", value=float(p.asia_port_days), min_value=0.0, step=0.5)
+    if rt_choice != "Custom":
+        # Re-derive AFTER the unloading input so its edits flow through
+        # in the same rerun instead of lagging one.
+        _base_rt = 2.0 * model.asia_leg_days(p.vessel_speed_knots) + p.asia_port_days + p.loading_days
+        p.asia_rt_days = _base_rt if rt_choice.startswith("Base") else _base_rt + 8.0
     st.caption(f"Symmetric legs (workbook parity): laden = ballast = "
-               f"{p.asia_laden_days:.1f} d. Congestion lengthens both legs "
-               f"(more boil-off and laden fuel).")
+               f"{p.asia_laden_days:.1f} d. Congestion (+8 d) lengthens both legs "
+               f"(more boil-off; queue days burn at the lower queue rate in the physical engine).")
     if st.checkbox("Override laden days (model waiting as ballast/idle)", value=False):
         p.asia_laden_days_override = _num_input(
             "Asia laden days (pinned)", value=float(p.asia_laden_days), min_value=0.0, step=1.0)
@@ -418,8 +450,18 @@ with st.sidebar.expander("Gas cost chain"):
 with st.sidebar.expander("EU ETS"):
     p.eua_price = _num_input("EUA price (EUR/t, static, unverified)", value=float(p.eua_price),
                              min_value=0.0, step=5.0)
-    p.co2_eu_ets_tonnes = _num_input("CO2 in ETS scope per EU RT (t)", value=float(p.co2_eu_ets_tonnes),
-                                     min_value=0.0, step=10.0)
+    # DERIVED, not set (same philosophy as the residual-VLSFO fix): the
+    # old hand-set 4,425.9 t constant was calibrated to the 19.5-kn fuel
+    # picture and silently went stale whenever speed, fuel rates or day
+    # counts changed. Recomputed every run from the physical fuel balance
+    # at the legacy uniform-50% scope; the Decision page's physical path
+    # applies proper per-segment scope on its own and never reads this.
+    p.co2_eu_ets_tonnes = emissions.legacy_uniform_scope_ets_tonnes(p)
+    st.caption(
+        f"CO2 in legacy ETS scope per EU RT: {p.co2_eu_ets_tonnes:,.1f} t (derived from the "
+        "current speed/fuel/day-count settings at uniform 50% scope -- replaces the hand-set "
+        "4,425.9 t constant, which was only valid at 19.5 kn)."
+    )
     snap_L = model.contract_calendar(D)[0]
     st.caption(f"Phase factor for {snap_L.strftime('%b-%y')} (M1): {model.phase_for_year(snap_L.year)}  "
                "(0 before 2024, 0.4 in 2024, 0.7 in 2025, 1.0 from 2026)")
@@ -435,8 +477,8 @@ with st.sidebar.expander("Charter", expanded=True):
     else:
         p.charter_override = None
 
-if st.sidebar.button("Reset parameters to spec defaults"):
-    st.session_state.params = model.Params()
+if st.sidebar.button("Reset to operating defaults (17 kn / 1.5 d)"):
+    st.session_state.params = model.operating_default_params()
     st.rerun()
 
 params = st.session_state.params
@@ -446,13 +488,14 @@ params = st.session_state.params
 # booked it as negative fuel, a phantom credit, and the physical engine
 # raised an uncaught ValueError that crashed the Decision page). Fail
 # loudly at the source instead of downstream in either engine.
-_asia_ballast_implied = params.asia_rt_days - params.asia_laden_days - params.asia_port_days
+_asia_ballast_implied = (params.asia_rt_days - params.asia_laden_days
+                         - params.asia_port_days - params.loading_days)
 if _asia_ballast_implied < 0:
     st.sidebar.error(
-        f"Asia day-counts are inconsistent: laden ({params.asia_laden_days:.1f}d) + port "
-        f"({params.asia_port_days:.1f}d) exceed the round trip ({params.asia_rt_days:.1f}d) "
-        f"by {-_asia_ballast_implied:.1f}d, so the implied ballast leg is negative. "
-        "Fix the Asia route inputs to continue."
+        f"Asia day-counts are inconsistent: laden ({params.asia_laden_days:.1f}d) + unloading "
+        f"({params.asia_port_days:.1f}d) + loading ({params.loading_days:.1f}d) exceed the round "
+        f"trip ({params.asia_rt_days:.1f}d) by {-_asia_ballast_implied:.1f}d, so the implied "
+        "ballast leg is negative. Fix the Asia route / vessel schedule inputs to continue."
     )
     st.stop()
 if params.europe_laden_days + params.europe_ballast_days + params.europe_port_days <= 0:
@@ -484,10 +527,11 @@ PAGE = st.sidebar.radio(
 )
 
 CAVEATS = (
-    "Caveats (LNG_Diversion_Logic.md v2): 47d Asia RT assumes ~19.5 kn and 1-day canal transit "
-    "(55d = congestion case); FuelEU, CH4 slip, heel, demurrage, backhaul are not modelled; VLSFO "
-    "and EUA are static for all dates including historical ones; margin/day comparison assumes the "
-    "vessel is the binding constraint."
+    "Caveats (LNG_Diversion_Logic.md v2): voyage days derive from 4,900/9,300 nm at the selected "
+    "service speed plus a 1-day canal transit (congestion = +4 waiting days per Asia leg); sea "
+    "fuel rates rescale from the 19.5-kn design constants by the cube law; FuelEU, CH4 slip, "
+    "heel, demurrage, backhaul are not modelled; VLSFO and EUA are static for all dates including "
+    "historical ones; margin/day comparison assumes the vessel is the binding constraint."
 )
 
 # ===========================================================================
@@ -619,9 +663,13 @@ if PAGE == "0 Decision":
                                     max_value=STRIP_MONTHS - 1, value=1, step=1)
         residual_value = _num_input("Residual vessel value ($/day)", container=c3, value=0.0,
                                     step=10_000.0, format="%.0f")
+        # Base/Congested derived from the sidebar's speed + loading/unloading
+        # days, not the 19.5-kn module constants (frozen-suite-only now).
+        _prog_base_rt = (2.0 * model.asia_leg_days(params.vessel_speed_knots)
+                         + params.asia_port_days + params.loading_days)
         asia_case = st.radio(
             "Asia route case for programme",
-            ["Use sidebar route", "Base 46.7436 days", "Congested 54.7436 days"],
+            ["Use sidebar route", f"Base {_prog_base_rt:.1f} days", f"Congested {_prog_base_rt + 8.0:.1f} days"],
             horizontal=True,
         )
         programme_state_label = st.radio(
@@ -630,10 +678,10 @@ if PAGE == "0 Decision":
         )
         programme_first_cargo_state = FIRST_CARGO_STATE_LABELS[programme_state_label]
         programme_params = copy.deepcopy(params)
-        if asia_case == "Base 46.7436 days":
-            programme_params.asia_rt_days = model.ASIA_RT_BASE
-        elif asia_case == "Congested 54.7436 days":
-            programme_params.asia_rt_days = model.ASIA_RT_CONG
+        if asia_case.startswith("Base"):
+            programme_params.asia_rt_days = _prog_base_rt
+        elif asia_case.startswith("Congested"):
+            programme_params.asia_rt_days = _prog_base_rt + 8.0
         # Rebuild strip because Asia value and laden duration depend on the selected RT.
         programme_strip, programme_fallback_error = _safe_strip(D, tables, programme_params, STRIP_MONTHS)
         if programme_fallback_error is not None:
@@ -859,14 +907,18 @@ if PAGE == "0 Decision":
             format_func=lambda i: f"M{i + 1} = {strip_df.iloc[i]['month_label']}",
             key="recon_month",
         )
+        _recon_base_rt = (2.0 * model.asia_leg_days(params.vessel_speed_knots)
+                          + params.asia_port_days + params.loading_days)
         recon_route_choice = st.radio(
-            "Route", ["Europe", "Asia (base, 46.7436 days)", "Asia (congested, 54.7436 days)"],
+            "Route",
+            ["Europe", f"Asia (base, {_recon_base_rt:.1f} days)",
+             f"Asia (congested, {_recon_base_rt + 8.0:.1f} days)"],
             horizontal=True, key="recon_route",
         )
         recon_params = copy.deepcopy(params)
         if recon_route_choice.startswith("Asia"):
             recon_params.asia_rt_days = (
-                model.ASIA_RT_CONG if "congested" in recon_route_choice else model.ASIA_RT_BASE
+                _recon_base_rt + 8.0 if "congested" in recon_route_choice else _recon_base_rt
             )
         try:
             recon_vessel = physical.vessel_performance_from_params(recon_params)
@@ -1193,8 +1245,10 @@ elif PAGE == "2 Sensitivities":
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     st.subheader("Asia RT breakeven")
+    _sens_base_rt = (2.0 * model.asia_leg_days(params.vessel_speed_knots)
+                     + params.asia_port_days + params.loading_days)
     rt_df = risk.asia_rt_breakeven(D, tables, params, month_index=mi,
-                                    rt_values=(model.ASIA_RT_BASE, model.ASIA_RT_BASE + 4, model.ASIA_RT_CONG))
+                                    rt_values=(_sens_base_rt, _sens_base_rt + 4, _sens_base_rt + 8))
     st.dataframe(rt_df, width="stretch", hide_index=True)
 
     st.subheader("TTF shock x Asia-RT breakeven grid (Gap = JKM - JKM*)")

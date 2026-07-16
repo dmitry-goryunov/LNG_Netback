@@ -162,6 +162,24 @@ def voyage_emissions(
     )
 
 
+def legacy_uniform_scope_ets_tonnes(params) -> float:
+    """CO2 tonnes per Europe round trip at the LEGACY uniform-50%-scope
+    convention, derived from the physical fuel balance instead of the
+    hand-set model.Params.co2_eu_ets_tonnes constant (4,425.9 t, which
+    was hand-derived from the 19.5-kn design-speed fuel picture and goes
+    stale the moment speed, fuel rates or day counts change -- the same
+    parameter-staleness class as the residual-VLSFO review finding). At
+    Params() defaults this reproduces the constant to ~0.06% (verified in
+    tests). Uniform 0.5 scope deliberately, because this feeds the
+    LEGACY strip's ets line; the physical decision path applies the
+    correct per-segment scope on its own and never reads this."""
+    vessel = physical.vessel_performance_from_params(params)
+    ledger = physical.run_voyage(
+        physical.europe_route_segments(params), vessel, loaded_mmbtu=params.cargo_size
+    )
+    return voyage_emissions(ledger).total_co2_tonnes * 0.5
+
+
 def ets_cost_usd(
     voyage: VoyageEmissions,
     eua_price_eur_per_t: float,

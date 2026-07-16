@@ -349,13 +349,21 @@ def run_voyage(
 
 
 def europe_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
-    """Europe round trip: loading (zero duration -- the legacy model has no
-    separate loading time or loading fuel, only a commercial $/MMBtu
-    loading cost applied elsewhere) -> laden sea -> discharge/port ->
-    ballast sea. Total duration equals params.europe_laden_days +
-    europe_port_days + europe_ballast_days, i.e. model.py's europe_rt."""
+    """Europe round trip: loading (params.loading_days at the US export
+    terminal; the legacy spec charged no vessel time here and the 0.0
+    Params default preserves that) -> laden sea -> discharge/port ->
+    ballast sea. Total duration equals model.py's europe_rt (laden +
+    ballast + port + loading).
+
+    Loading-berth ETS scope is 0.0, not the sea legs' 0.5: EU ETS
+    maritime covers 50% of voyages between a non-EU and an EU port and
+    100% of at-berth time in EU ports -- at-berth time in a NON-EU port
+    (Sabine Pass) is outside scope entirely. This was set to 0.5 while
+    the segment had zero duration (harmless); it matters the moment
+    loading_days is non-zero, so it is corrected alongside."""
     return (
-        VoyageSegment("loading", OperatingState.LOADING, duration_days=0.0, ets_scope_fraction=0.5),
+        VoyageSegment("loading", OperatingState.LOADING, duration_days=params.loading_days,
+                      ets_scope_fraction=0.0),
         VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=params.europe_laden_days,
                       ets_scope_fraction=0.5),
         VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=params.europe_port_days,
@@ -392,15 +400,25 @@ def asia_route_segments(params: model.Params) -> tuple[VoyageSegment, ...]:
     """
     asia_laden_total = params.asia_laden_days
     asia_port = params.asia_port_days
-    asia_ballast_total = params.asia_rt_days - asia_laden_total - asia_port
+    asia_ballast_total = params.asia_rt_days - asia_laden_total - asia_port - params.loading_days
 
-    laden_sea = min(asia_laden_total, model.ASIA_LEG_DAYS)
-    laden_queue = max(asia_laden_total - model.ASIA_LEG_DAYS, 0.0)
-    ballast_sea = min(asia_ballast_total, model.ASIA_LEG_DAYS)
-    ballast_queue = max(asia_ballast_total - model.ASIA_LEG_DAYS, 0.0)
+    # The base one-way sea time that congestion is measured against must
+    # scale with the vessel speed the day counts were built from --
+    # measuring a 17-kn voyage against the 19.5-kn constant would
+    # misclassify ordinary (slower) sea time as "queue" waiting burned at
+    # the low queue fuel rate. model.asia_leg_days(19.5) reproduces
+    # model.ASIA_LEG_DAYS exactly, so the frozen-default decomposition is
+    # bit-identical to before this parameterisation.
+    base_leg = model.asia_leg_days(params.vessel_speed_knots)
+
+    laden_sea = min(asia_laden_total, base_leg)
+    laden_queue = max(asia_laden_total - base_leg, 0.0)
+    ballast_sea = min(asia_ballast_total, base_leg)
+    ballast_queue = max(asia_ballast_total - base_leg, 0.0)
 
     return (
-        VoyageSegment("loading", OperatingState.LOADING, duration_days=0.0, ets_scope_fraction=0.0),
+        VoyageSegment("loading", OperatingState.LOADING, duration_days=params.loading_days,
+                      ets_scope_fraction=0.0),
         VoyageSegment("laden_sea", OperatingState.LADEN_SEA, duration_days=laden_sea, ets_scope_fraction=0.0),
         VoyageSegment("laden_queue", OperatingState.LADEN_QUEUE, duration_days=laden_queue, ets_scope_fraction=0.0),
         VoyageSegment("discharge", OperatingState.DISCHARGE, duration_days=asia_port, ets_scope_fraction=0.0),
