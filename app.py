@@ -15,6 +15,7 @@ Data: set LNG_HISTORY_XLSX to the workbook path, or upload it in the
 from __future__ import annotations
 
 import copy
+import importlib
 import os
 
 import altair as alt
@@ -32,6 +33,40 @@ import risk
 import spread_option
 
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
+
+# --- Module-freshness guard ------------------------------------------------
+# Streamlit hot-reload re-executes THIS script on every deploy/rerun, but
+# modules it imports stay cached in the running process. After a deploy
+# that adds a new function to a first-party module, this (fresh) script can
+# reference a symbol the (stale) cached module lacks -- observed twice as an
+# AttributeError: once locally (decision.physical_waterfall_breakdown) and
+# once in production (model.derived_residual_laden_vlsfo, redacted crash on
+# Streamlit Cloud). Each sentinel below is the newest app.py-referenced
+# symbol of its module; if any is missing, every first-party module is
+# reloaded IN DEPENDENCY ORDER (importlib.reload mutates the module object
+# in place, so cross-module references pick up the new code too). Add a
+# sentinel entry whenever app.py starts using a newly added symbol.
+_FRESHNESS_SENTINELS = [
+    (data, "load_volatilities"),
+    (model, "derived_residual_laden_vlsfo"),
+    (physical, "vessel_performance_from_params"),
+    (emissions, "voyage_emissions"),
+    (decision, "physical_waterfall_breakdown"),
+    (spread_option, "month_spread_option"),
+    (risk, "run_stress_tests"),
+]
+if any(not hasattr(_mod, _attr) for _mod, _attr in _FRESHNESS_SENTINELS):
+    for _mod, _ in _FRESHNESS_SENTINELS:
+        importlib.reload(_mod)
+    _still_stale = [f"{_mod.__name__}.{_attr}" for _mod, _attr in _FRESHNESS_SENTINELS
+                    if not hasattr(_mod, _attr)]
+    if _still_stale:
+        st.error(
+            "The running process has stale copies of: " + ", ".join(_still_stale) +
+            ". Reload did not resolve it -- restart the app (Streamlit Cloud: "
+            "Manage app -> Reboot)."
+        )
+        st.stop()
 
 # Decision and Forward-strip pages show this many forward months. HH/TTF
 # have 64 forward columns and JKM 44 in the real workbook (comfortably
