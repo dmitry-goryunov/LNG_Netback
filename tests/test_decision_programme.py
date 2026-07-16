@@ -298,6 +298,52 @@ def test_congested_asia_physical_value_exceeds_legacy_flat_rate_fuel_assumption(
     )
 
 
+# --- Fuel-knob coherence (review finding: two sidebar fuel fields each
+# silently fed only one of the two valuation paths) ---
+
+
+def test_derived_residual_reproduces_legacy_default_exactly():
+    """At Params() defaults the derivation must return the frozen legacy
+    constant bit-for-bit, so wiring the sidebar through it changes
+    nothing until a user actually edits a physical input."""
+    assert model.derived_residual_laden_vlsfo(model.Params()) == model.Params().residual_laden_vlsfo == 63.6
+
+
+def test_laden_fuel_requirement_moves_legacy_and_physical_together(tables):
+    """With residual_laden_vlsfo derived (as the sidebar now wires it),
+    one laden-fuel edit must move BOTH the legacy strip margin and the
+    physical-engine decision value -- the review measured the old wiring
+    moving exactly one of the two (-$91k legacy-only or -$137k
+    physical-only) depending on which of two lookalike fields was
+    edited."""
+    p0 = model.Params()
+    p0.residual_laden_vlsfo = model.derived_residual_laden_vlsfo(p0)
+    df0 = model.strip("2026-07-08", tables, p0)
+    _, phys0 = decision._physical_route_value(df0.iloc[0], p0, "Europe")
+
+    p1 = model.Params(laden_fuel_requirement=170.0)
+    p1.residual_laden_vlsfo = model.derived_residual_laden_vlsfo(p1)
+    assert p1.residual_laden_vlsfo == pytest.approx(83.6)
+    df1 = model.strip("2026-07-08", tables, p1)
+    _, phys1 = decision._physical_route_value(df1.iloc[0], p1, "Europe")
+
+    legacy_delta = (df1.iloc[0]["eu_margin"] - df0.iloc[0]["eu_margin"]) * p0.cargo_size
+    phys_delta = phys1 - phys0
+    expected_fuel = -20.0 * p0.europe_laden_days * p0.vlsfo_price  # 20 t/d extra burn
+    assert legacy_delta == pytest.approx(expected_fuel, rel=1e-9)
+    # The physical engine prices the same extra fuel PLUS the ETS on its
+    # combustion (~24% on top at defaults) -- same direction, same fuel
+    # core, physically richer.
+    assert phys_delta < 0
+    assert phys_delta == pytest.approx(expected_fuel, rel=0.30)
+    assert phys_delta < expected_fuel  # strictly more negative: fuel + ETS
+
+
+def test_derived_residual_clamps_at_zero_when_bog_exceeds_demand():
+    p = model.Params(boil_off_rate=0.01)  # BOG ~864 t/d-eq >> 150 t/d demand
+    assert model.derived_residual_laden_vlsfo(p) == 0.0
+
+
 # --- Section 3a: three-state first-cargo model (docs/PHASE2_PLAN.md) ---
 
 

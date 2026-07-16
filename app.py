@@ -335,12 +335,22 @@ with st.sidebar.expander("Asia route"):
                                                step=50_000.0, format="%.0f")
 
 with st.sidebar.expander("Fuel"):
-    p.laden_fuel_requirement = st.number_input("Laden fuel requirement (t/d, reference)",
+    p.laden_fuel_requirement = st.number_input("Laden fuel requirement (t/d, total laden energy demand)",
                                                 value=float(p.laden_fuel_requirement), step=1.0)
-    p.natural_bog_offset_t = st.number_input("Natural BOG offset (t/d VLSFO-eq, reference)",
-                                              value=float(p.natural_bog_offset_t), step=0.1)
-    p.residual_laden_vlsfo = st.number_input("Residual laden VLSFO (t/d, used in ship cost)",
-                                              value=float(p.residual_laden_vlsfo), step=0.1)
+    # Residual laden VLSFO and the natural BOG offset are DERIVED, not
+    # set: an earlier version exposed residual_laden_vlsfo (feeding only
+    # the legacy ship-cost formula) and laden_fuel_requirement (feeding
+    # only the physical engine) as two independent inputs that coincided
+    # at defaults -- editing either silently moved just one of the two
+    # valuation paths (review finding). One knob now drives both.
+    p.residual_laden_vlsfo = model.derived_residual_laden_vlsfo(p)
+    _bog_offset = model.natural_bog_offset_t_per_day(p)
+    st.caption(
+        f"Natural BOG offset (boil-off x cargo): {_bog_offset:.1f} t/d VLSFO-eq -> "
+        f"residual laden VLSFO {p.residual_laden_vlsfo:.1f} t/d (derived; feeds the "
+        "legacy screening formula, while the Decision page's physical engine uses "
+        "the laden requirement and boil-off rate directly -- both move together)."
+    )
     p.ballast_fuel = st.number_input("Ballast fuel (t/d, used in ship cost)", value=float(p.ballast_fuel), step=1.0)
     p.port_fuel_rate = st.number_input("Port fuel (t/d, used in ship cost)", value=float(p.port_fuel_rate), step=1.0)
     p.vlsfo_price = st.number_input("VLSFO ($/t, static for ALL dates)", value=float(p.vlsfo_price), step=5.0)

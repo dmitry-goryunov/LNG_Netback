@@ -114,6 +114,39 @@ def phase_for_year(year: int) -> float:
     return 1.0
 
 
+def natural_bog_offset_t_per_day(params: Params) -> float:
+    """Natural boil-off gas generation implied by the physical inputs
+    (boil_off_rate x cargo_size), expressed in t/d VLSFO-equivalent via
+    the reference ratio already embedded in Params (3,500 MMBtu/d ==
+    86.4 t/d). At Params() defaults this reproduces the hand-set
+    natural_bog_offset_t reference constant (86.4) exactly."""
+    return params.boil_off_rate * params.cargo_size * (
+        params.natural_bog_offset_t / params.natural_bog_offset_mmbtu
+    )
+
+
+def derived_residual_laden_vlsfo(params: Params) -> float:
+    """Laden-leg purchased-fuel rate implied by the physical fuel
+    picture: total laden energy demand (laden_fuel_requirement) minus
+    the natural BOG offset from boil_off_rate x cargo_size. At Params()
+    defaults this reproduces the legacy residual_laden_vlsfo constant
+    (150 - 86.4 = 63.6 t/d) exactly, so deriving it changes nothing
+    until a user edits one of the physical inputs -- at which point the
+    legacy ship-cost formula and the segment-level physical engine
+    finally move together, instead of reading two independent sidebar
+    fields that only coincided at defaults (a review finding: editing
+    one silently moved only one of the two valuation paths).
+
+    Clamped at zero: if natural BOG alone exceeds the laden demand, the
+    vessel buys no liquid fuel (the physical engine reliquefies or vents
+    the surplus; a negative purchased-fuel rate would be a phantom
+    credit in the legacy formula). Does not touch strip() itself -- the
+    frozen legacy path still reads params.residual_laden_vlsfo, whatever
+    the caller set it to; this is the coherent way for a UI to set it."""
+    residual = params.laden_fuel_requirement - natural_bog_offset_t_per_day(params)
+    return max(round(residual, 6), 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Step 1 -- snap
 # ---------------------------------------------------------------------------
