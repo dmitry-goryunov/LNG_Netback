@@ -223,3 +223,44 @@ engine work specifically.
   already uses elsewhere on this page). `tests/app_smoke_check.py` now
   also navigates to the Forward-strip page (previously untested by the
   smoke check entirely) and asserts it loads clean.
+
+- **Full logic review of everything above, with fixes** (four commits,
+  every finding verified with direct numeric evidence before touching
+  code):
+  1. *JKM tenor misalignment in the spread option -- front-month
+     extrinsic overstated ~4x.* The historical vol/correlation used the
+     same `c{months_forward}` column for both legs, but the strip prices
+     the JKM leg at contract `c{i+2-s}` (delivery L+1). JKM c1 is the
+     noisy expiring contract: measured correlation to TTF 0.25 vs the
+     correctly-paired 0.80, M1 extrinsic $0.742 -> $0.183/MMBtu. Fixed
+     to use the strip's exact contract selection and cross-contract
+     correlation; tab mode reads Volatility JKM one delivery tenor
+     further out. What the docs had called "a small, unquantified
+     misalignment" was neither -- quantify before waving.
+  2. *Two lookalike laden-fuel sidebar fields each silently fed only one
+     valuation path* ("Residual laden VLSFO" moved legacy only, -$91k;
+     "Laden fuel requirement" moved physical only, -$137k = fuel + ETS
+     verified to the dollar). `residual_laden_vlsfo` is now DERIVED
+     (`model.derived_residual_laden_vlsfo()`: requirement minus
+     boil-off x cargo at the reference 3500-MMBtu/d == 86.4-t/d ratio,
+     clamped at zero), reproducing the frozen 63.6 default bit-for-bit;
+     one knob moves both engines together.
+  3. *Two crash classes hardened*: (a) custom Asia RT + pinned laden
+     days implying a negative ballast leg -- legacy silently booked a
+     phantom fuel credit, physical crashed the Decision page; now a
+     sidebar day-count gate plus ValueError containment in the isolated
+     branch and the reconciliation expander. (b) The number_input
+     None-mid-edit class generalised from the one patched input to all
+     ~25 via a `_num_input()` helper with physical bounds.
+  4. *Cross-page value-basis disclosure*: the Forward strip (legacy
+     basis) now says so and quantifies the deltas vs the Decision page
+     (physical basis); the intrinsic/extrinsic section now states it is
+     a pure price spread that can legitimately disagree with the
+     cost-netted JKM* verdict. Smoke checks extended to all five pages
+     (Sensitivities and Hedging were never visited by any test).
+
+  Verified clean in the same review: physical mass-balance and
+  reconciliation identities, decision-breakdown algebra (margin x cargo
+  == price x delivered - costs, to the cent; no boil-off/bunkers double
+  count), ETS phase/FX wiring vs legacy, Margrabe formula vs closed
+  form, FirstCargoState scoping.

@@ -50,3 +50,13 @@ assert not app.exception, [e.message for e in app.exception]
 assert any("Intrinsic / extrinsic value" in h.value for h in app.subheader), \
     "Forward-strip page should render the JKM-vs-TTF diversion option section"
 print("PASS forward-strip page: loads clean, intrinsic/extrinsic section present")
+
+# The remaining two pages were never smoke-covered at all (review gap):
+# an import-time or render-time break there would only surface in
+# production. Load-clean assertions are deliberately minimal.
+for page_name in ("2 Sensitivities", "3 Hedging"):
+    page = next(widget for widget in app.sidebar.radio if widget.label == "Page")
+    page.set_value(page_name)
+    app.run(timeout=120)
+    assert not app.exception, [f"{page_name}: {e.message}" for e in app.exception]
+    print(f"PASS {page_name.split(' ', 1)[1].lower()} page: loads clean")

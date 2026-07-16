@@ -938,6 +938,14 @@ elif PAGE == "1 Forward strip":
         "JKM* $/MMBtu": "{:.3f}", "Gap $/MMBtu": "{:+.3f}",
     })
     st.dataframe(styled, width="stretch", hide_index=True)
+    st.caption(
+        "Value basis: everything on this page (and the Sensitivities/Hedging/VaR pages) uses the "
+        "legacy screening formula -- flat fuel rates and the uniform-scope ETS constant. The "
+        "Decision page's Post-lift/Pre-lift/Programme values use the segment-level physical "
+        "engine instead, so its dollar figures differ slightly by design (about -0.05% for "
+        "Europe from the corrected EU ETS berth scope, and about +1.9% for congested Asia from "
+        "queue-rate fuel and reliquefaction; docs/PHASE2_PLAN.md step 8 quantifies both)."
+    )
 
     both_neg = strip_df[(strip_df["eu_day"] < 0) & (strip_df["asia_day"] < 0)]
     if not both_neg.empty:
@@ -991,6 +999,14 @@ elif PAGE == "1 Forward strip":
         "Margrabe exchange option between JKM and TTF), from the volatility/correlation "
         "source below. FX volatility is not modelled as a separate risk factor "
         "(see spread_option.py)."
+    )
+    st.caption(
+        "This is a pure PRICE spread (strike 0): it does not net the extra shipping, canal and "
+        "port cost of actually diverting -- the JKM* breakeven in the table above does. The two "
+        "can legitimately disagree: a month can show positive intrinsic here (JKM above TTF) "
+        "while the verdict column still says Europe, because JKM hasn't cleared the full "
+        "diversion cost. Read this section as the value of destination flexibility in the "
+        "price pair, not as a route recommendation."
     )
     vol_source_label = st.radio(
         "Volatility / correlation source",
