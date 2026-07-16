@@ -279,6 +279,20 @@ for w in tables.warnings:
 # Sidebar: curve date + Section 2 Step 5 parameters
 # ===========================================================================
 
+
+def _num_input(label: str, *, container=None, **kwargs):
+    """st.number_input that can never hand back None: on some Streamlit
+    versions an emptied field returns None mid-edit rather than the
+    widget default, and every consumer here does arithmetic on the value
+    immediately -- a None reaching model.strip() crashed the deployed
+    app with a redacted TypeError once already (the vol-window input got
+    a one-off guard then; this is the systematic version, since the same
+    class applies to every one of the ~25 inputs below). Falls back to
+    the call's own value= default."""
+    out = (container or st).number_input(label, **kwargs)
+    return kwargs.get("value") if out is None else out
+
+
 st.sidebar.header("Curve date")
 master_desc = list(pd.DatetimeIndex(tables.master_dates).sort_values(ascending=False))
 date_labels = [d.strftime("%Y-%m-%d (%a)") for d in master_desc]
@@ -295,19 +309,21 @@ p = st.session_state.params
 st.sidebar.header("Cost parameters (Step 5)")
 
 with st.sidebar.expander("Cargo / boil-off"):
-    p.cargo_size = st.number_input("Cargo size (MMBtu)", value=float(p.cargo_size), step=50_000.0, format="%.0f")
-    p.boil_off_rate = st.number_input("Boil-off rate (fraction/day)", value=float(p.boil_off_rate),
-                                       step=0.0001, format="%.4f")
+    p.cargo_size = _num_input("Cargo size (MMBtu)", value=float(p.cargo_size), min_value=1_000.0,
+                              step=50_000.0, format="%.0f")
+    p.boil_off_rate = _num_input("Boil-off rate (fraction/day)", value=float(p.boil_off_rate),
+                                 min_value=0.0, max_value=0.1, step=0.0001, format="%.4f")
 
 with st.sidebar.expander("Europe route"):
-    p.europe_laden_days = st.number_input("Europe laden days", value=float(p.europe_laden_days), step=1.0)
-    p.europe_ballast_days = st.number_input("Europe ballast days", value=float(p.europe_ballast_days), step=1.0)
-    p.europe_port_days = st.number_input("Europe port days", value=float(p.europe_port_days), step=1.0)
+    p.europe_laden_days = _num_input("Europe laden days", value=float(p.europe_laden_days), min_value=0.0, step=1.0)
+    p.europe_ballast_days = _num_input("Europe ballast days", value=float(p.europe_ballast_days), min_value=0.0, step=1.0)
+    p.europe_port_days = _num_input("Europe port days", value=float(p.europe_port_days), min_value=0.0, step=1.0)
     st.caption(f"Europe RT = {p.europe_laden_days + p.europe_ballast_days + p.europe_port_days:.0f} d")
-    p.loading = st.number_input("Loading ($/MMBtu)", value=float(p.loading), step=0.01, format="%.2f")
-    p.eu_regas_port = st.number_input("EU regas + port ($/MMBtu)", value=float(p.eu_regas_port), step=0.01, format="%.2f")
-    p.other_cost = st.number_input("Other: insurance/LC/brokerage ($/MMBtu)", value=float(p.other_cost),
-                                    step=0.01, format="%.2f")
+    p.loading = _num_input("Loading ($/MMBtu)", value=float(p.loading), min_value=0.0, step=0.01, format="%.2f")
+    p.eu_regas_port = _num_input("EU regas + port ($/MMBtu)", value=float(p.eu_regas_port), min_value=0.0,
+                                 step=0.01, format="%.2f")
+    p.other_cost = _num_input("Other: insurance/LC/brokerage ($/MMBtu)", value=float(p.other_cost),
+                              min_value=0.0, step=0.01, format="%.2f")
 
 with st.sidebar.expander("Asia route"):
     rt_options = ["Base (46.7d)", "Congestion (54.7d)", "Custom"]
@@ -319,24 +335,24 @@ with st.sidebar.expander("Asia route"):
     elif rt_choice == "Congestion (54.7d)":
         p.asia_rt_days = model.ASIA_RT_CONG
     else:
-        p.asia_rt_days = st.number_input("Asia RT custom (days)", value=float(p.asia_rt_days), step=1.0)
-    p.asia_port_days = st.number_input("Asia port days", value=float(p.asia_port_days), step=1.0)
+        p.asia_rt_days = _num_input("Asia RT custom (days)", value=float(p.asia_rt_days), min_value=1.0, step=1.0)
+    p.asia_port_days = _num_input("Asia port days", value=float(p.asia_port_days), min_value=0.0, step=1.0)
     st.caption(f"Symmetric legs (workbook parity): laden = ballast = "
                f"{p.asia_laden_days:.1f} d. Congestion lengthens both legs "
                f"(more boil-off and laden fuel).")
     if st.checkbox("Override laden days (model waiting as ballast/idle)", value=False):
-        p.asia_laden_days_override = st.number_input(
-            "Asia laden days (pinned)", value=float(p.asia_laden_days), step=1.0)
+        p.asia_laden_days_override = _num_input(
+            "Asia laden days (pinned)", value=float(p.asia_laden_days), min_value=0.0, step=1.0)
     else:
         p.asia_laden_days_override = None
-    p.asia_port_cost = st.number_input("Asia port, DES no regas ($/MMBtu)", value=float(p.asia_port_cost),
-                                        step=0.01, format="%.2f")
-    p.panama_toll_roundtrip = st.number_input("Panama toll x2 ($)", value=float(p.panama_toll_roundtrip),
-                                               step=50_000.0, format="%.0f")
+    p.asia_port_cost = _num_input("Asia port, DES no regas ($/MMBtu)", value=float(p.asia_port_cost),
+                                  min_value=0.0, step=0.01, format="%.2f")
+    p.panama_toll_roundtrip = _num_input("Panama toll x2 ($)", value=float(p.panama_toll_roundtrip),
+                                         min_value=0.0, step=50_000.0, format="%.0f")
 
 with st.sidebar.expander("Fuel"):
-    p.laden_fuel_requirement = st.number_input("Laden fuel requirement (t/d, total laden energy demand)",
-                                                value=float(p.laden_fuel_requirement), step=1.0)
+    p.laden_fuel_requirement = _num_input("Laden fuel requirement (t/d, total laden energy demand)",
+                                          value=float(p.laden_fuel_requirement), min_value=0.0, step=1.0)
     # Residual laden VLSFO and the natural BOG offset are DERIVED, not
     # set: an earlier version exposed residual_laden_vlsfo (feeding only
     # the legacy ship-cost formula) and laden_fuel_requirement (feeding
@@ -351,19 +367,24 @@ with st.sidebar.expander("Fuel"):
         "legacy screening formula, while the Decision page's physical engine uses "
         "the laden requirement and boil-off rate directly -- both move together)."
     )
-    p.ballast_fuel = st.number_input("Ballast fuel (t/d, used in ship cost)", value=float(p.ballast_fuel), step=1.0)
-    p.port_fuel_rate = st.number_input("Port fuel (t/d, used in ship cost)", value=float(p.port_fuel_rate), step=1.0)
-    p.vlsfo_price = st.number_input("VLSFO ($/t, static for ALL dates)", value=float(p.vlsfo_price), step=5.0)
+    p.ballast_fuel = _num_input("Ballast fuel (t/d, used in ship cost)", value=float(p.ballast_fuel),
+                                min_value=0.0, step=1.0)
+    p.port_fuel_rate = _num_input("Port fuel (t/d, used in ship cost)", value=float(p.port_fuel_rate),
+                                  min_value=0.0, step=1.0)
+    p.vlsfo_price = _num_input("VLSFO ($/t, static for ALL dates)", value=float(p.vlsfo_price),
+                               min_value=0.0, step=5.0)
 
 with st.sidebar.expander("Gas cost chain"):
-    p.hh_grossup = st.number_input("HH gross-up", value=float(p.hh_grossup), step=0.01, format="%.2f")
-    p.liquefaction_toll = st.number_input("Liquefaction toll ($/MMBtu)", value=float(p.liquefaction_toll),
-                                           step=0.05, format="%.2f")
-    p.pipeline = st.number_input("Pipeline ($/MMBtu)", value=float(p.pipeline), step=0.01, format="%.2f")
+    p.hh_grossup = _num_input("HH gross-up", value=float(p.hh_grossup), min_value=0.0, step=0.01, format="%.2f")
+    p.liquefaction_toll = _num_input("Liquefaction toll ($/MMBtu)", value=float(p.liquefaction_toll),
+                                     min_value=0.0, step=0.05, format="%.2f")
+    p.pipeline = _num_input("Pipeline ($/MMBtu)", value=float(p.pipeline), min_value=0.0, step=0.01, format="%.2f")
 
 with st.sidebar.expander("EU ETS"):
-    p.eua_price = st.number_input("EUA price (EUR/t, static, unverified)", value=float(p.eua_price), step=5.0)
-    p.co2_eu_ets_tonnes = st.number_input("CO2 in ETS scope per EU RT (t)", value=float(p.co2_eu_ets_tonnes), step=10.0)
+    p.eua_price = _num_input("EUA price (EUR/t, static, unverified)", value=float(p.eua_price),
+                             min_value=0.0, step=5.0)
+    p.co2_eu_ets_tonnes = _num_input("CO2 in ETS scope per EU RT (t)", value=float(p.co2_eu_ets_tonnes),
+                                     min_value=0.0, step=10.0)
     snap_L = model.contract_calendar(D)[0]
     st.caption(f"Phase factor for {snap_L.strftime('%b-%y')} (M1): {model.phase_for_year(snap_L.year)}  "
                "(0 before 2024, 0.4 in 2024, 0.7 in 2025, 1.0 from 2026)")
@@ -374,8 +395,8 @@ with st.sidebar.expander("Charter", expanded=True):
     override_on = st.checkbox("Override charter rate", value=p.charter_override is not None)
     if override_on:
         default_val = p.charter_override if p.charter_override is not None else float(snap_ch["rate174"])
-        p.charter_override = st.number_input("Charter override ($/day)", value=float(default_val),
-                                              step=5_000.0, format="%.0f")
+        p.charter_override = _num_input("Charter override ($/day)", value=float(default_val),
+                                        min_value=0.0, step=5_000.0, format="%.0f")
     else:
         p.charter_override = None
 
@@ -384,6 +405,25 @@ if st.sidebar.button("Reset parameters to spec defaults"):
     st.rerun()
 
 params = st.session_state.params
+
+# Day-count sanity gate (review finding: custom Asia RT + pinned laden
+# days can imply a NEGATIVE ballast leg -- the legacy formula silently
+# booked it as negative fuel, a phantom credit, and the physical engine
+# raised an uncaught ValueError that crashed the Decision page). Fail
+# loudly at the source instead of downstream in either engine.
+_asia_ballast_implied = params.asia_rt_days - params.asia_laden_days - params.asia_port_days
+if _asia_ballast_implied < 0:
+    st.sidebar.error(
+        f"Asia day-counts are inconsistent: laden ({params.asia_laden_days:.1f}d) + port "
+        f"({params.asia_port_days:.1f}d) exceed the round trip ({params.asia_rt_days:.1f}d) "
+        f"by {-_asia_ballast_implied:.1f}d, so the implied ballast leg is negative. "
+        "Fix the Asia route inputs to continue."
+    )
+    st.stop()
+if params.europe_laden_days + params.europe_ballast_days + params.europe_port_days <= 0:
+    st.sidebar.error("Europe round-trip days must be positive. Fix the Europe route inputs to continue.")
+    st.stop()
+
 st.sidebar.caption(f"Data source: {tables.source or '(uploaded file)'}")
 
 # ===========================================================================
@@ -457,10 +497,17 @@ if PAGE == "0 Decision":
                 horizontal=True, key="isolated_first_cargo_state",
             )
             isolated_first_cargo_state = FIRST_CARGO_STATE_LABELS[state_label]
-        values = decision.isolated_route_values(
-            strip_df, params, decision_mode, month_index=month_index,
-            first_cargo_state=isolated_first_cargo_state,
-        )
+        try:
+            values = decision.isolated_route_values(
+                strip_df, params, decision_mode, month_index=month_index,
+                first_cargo_state=isolated_first_cargo_state,
+            )
+        except ValueError as exc:
+            # Same containment the programme branch already has: a params
+            # combination the physical engine rejects must read as an
+            # input problem, not crash the page (review finding).
+            st.error(str(exc))
+            st.stop()
         ranked = sorted(values, key=lambda x: x.incremental_value, reverse=True)
         best = ranked[0]
         next_best = ranked[1]
@@ -532,10 +579,11 @@ if PAGE == "0 Decision":
     else:
         st.subheader("Discrete one-vessel programme")
         c1, c2, c3 = st.columns(3)
-        horizon = c1.number_input("Programme horizon (days)", min_value=1.0, value=52.0, step=1.0)
-        max_additional = c2.number_input("Additional cargoes available", min_value=0,
-                                          max_value=STRIP_MONTHS - 1, value=1, step=1)
-        residual_value = c3.number_input("Residual vessel value ($/day)", value=0.0, step=10_000.0, format="%.0f")
+        horizon = _num_input("Programme horizon (days)", container=c1, min_value=1.0, value=52.0, step=1.0)
+        max_additional = _num_input("Additional cargoes available", container=c2, min_value=0,
+                                    max_value=STRIP_MONTHS - 1, value=1, step=1)
+        residual_value = _num_input("Residual vessel value ($/day)", container=c3, value=0.0,
+                                    step=10_000.0, format="%.0f")
         asia_case = st.radio(
             "Asia route case for programme",
             ["Use sidebar route", "Base 46.7436 days", "Congested 54.7436 days"],
@@ -785,13 +833,21 @@ if PAGE == "0 Decision":
             recon_params.asia_rt_days = (
                 model.ASIA_RT_CONG if "congested" in recon_route_choice else model.ASIA_RT_BASE
             )
-        recon_vessel = physical.vessel_performance_from_params(recon_params)
-        recon_segments = (
-            physical.europe_route_segments(recon_params) if recon_route_choice == "Europe"
-            else physical.asia_route_segments(recon_params)
-        )
-        recon_ledger = physical.run_voyage(recon_segments, recon_vessel, loaded_mmbtu=recon_params.cargo_size)
-        recon_emissions = emissions.voyage_emissions(recon_ledger)
+        try:
+            recon_vessel = physical.vessel_performance_from_params(recon_params)
+            recon_segments = (
+                physical.europe_route_segments(recon_params) if recon_route_choice == "Europe"
+                else physical.asia_route_segments(recon_params)
+            )
+            recon_ledger = physical.run_voyage(recon_segments, recon_vessel, loaded_mmbtu=recon_params.cargo_size)
+            recon_emissions = emissions.voyage_emissions(recon_ledger)
+        except ValueError as exc:
+            # This expander overrides asia_rt_days to Base/Congested while
+            # keeping any pinned laden-days override, so it can produce a
+            # day-count combination the sidebar gate never saw (e.g. pinned
+            # laden 50d against the Base 46.7d round trip). Contain it here.
+            st.error(f"Cannot simulate this route with the current day-count overrides: {exc}")
+            st.stop()
 
         rc1, rc2, rc3, rc4 = st.columns(4)
         rc1.metric("Loaded", f"{recon_ledger.loaded_mmbtu:,.0f} MMBtu")
@@ -944,16 +1000,12 @@ elif PAGE == "1 Forward strip":
     vol_source = "historical" if vol_source_label == "Historical" else "tab"
     window_days = spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS
     if vol_source == "historical":
-        window_days = st.number_input(
+        # _num_input handles the None-mid-edit case that crashed the
+        # deployed app at exactly this call site once already.
+        window_days = _num_input(
             "Historical window (calendar days)", min_value=10, max_value=1000,
             value=spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS, step=10, key="vol_window_days",
         )
-        if window_days is None:
-            # st.number_input returns None (not the widget default) while the
-            # field is momentarily empty mid-edit -- a real Streamlit Cloud
-            # crash this session (int(None) -> TypeError right at this call
-            # site). Fall back rather than let one keystroke break the page.
-            window_days = spread_option.DEFAULT_HISTORICAL_WINDOW_DAYS
     elif tables.vol is None:
         st.warning(
             "This workbook has no 'volatilities' sheet -- switch to Historical, or add one "
