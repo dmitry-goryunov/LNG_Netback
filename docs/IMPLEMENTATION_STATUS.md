@@ -264,3 +264,75 @@ engine work specifically.
   == price x delivered - costs, to the cent; no boil-off/bunkers double
   count), ETS phase/FX wiring vs legacy, Margrabe formula vs closed
   form, FirstCargoState scoping.
+
+- **Module-freshness guard for Streamlit hot-reload staleness**
+  (`a5df274`): production crashed with a redacted AttributeError because
+  a deploy re-executes app.py while imported modules stay cached from
+  the pre-deploy process. app.py now carries a sentinel per first-party
+  module (its newest app.py-referenced symbol) and reloads all modules
+  in dependency order if any is missing; if reload can't resolve it, a
+  clear on-page error names the stale modules instead of a redacted
+  traceback. Mechanism verified by simulating the exact production
+  state. One post-deploy Reboot was still needed for the incident
+  itself.
+
+- **Operating-case re-baseline: 17 kn / 1.5 d loading / 1.5 d unloading**
+  (`ccb2875`, `3c28dec`; user instruction 16-Jul-2026). Two named
+  parameter sets now exist: `Params()` keeps the frozen legacy spec case
+  (19.5 kn / 0 / 5) bit-for-bit for the 64/64 suite;
+  `model.operating_default_params()` is what the app shows. Speed is a
+  first-class sidebar knob for the first time -- sea legs derive from
+  distance/speed (Europe RT 27.02 d, Asia base 50.59 d), sea fuel rates
+  rescale by the cube law (laden 99.4 t/d at 17 kn -- the vessel sails
+  almost entirely on natural boil-off), the congestion queue split
+  measures against the speed-consistent base leg, and the legacy ETS
+  tonnes knob is now DERIVED from the physical fuel balance
+  (`emissions.legacy_uniform_scope_ets_tonnes`, ~3,182 t at 17 kn vs
+  the hand-set 4,425.9 t that was only valid at 19.5 kn).
+  `Params.loading_days` threads through strip() (arithmetically inert
+  at the 0.0 legacy default), the physical route builders (Europe
+  loading berth's ETS scope corrected 0.5 -> 0.0 -- a US berth is
+  outside EU ETS scope, observable only once the segment had duration)
+  and the day-count gate. An AppTest interaction round-trip then caught
+  and fixed two live speed-knob bugs: the Asia RT radio silently
+  flipping to "Custom" pinned at the old speed's days, and every other
+  speed edit being dropped (widget identity hashed from its own
+  mutating value=; fixed with a stable key). 10 new tests
+  (tests/test_operating_assumptions.py).
+
+- **Derived programme horizon** (`422226b`; user instruction "make it
+  54 days, so to fit in 2x to Europe"): a literal 54.0 would exclude
+  the second Europe voyage by ~56 minutes (one RT is 27.0196 d), so the
+  default horizon is derived -- two Europe round trips plus one
+  turnaround gap, rounded up to 0.1 d (54.1 at current settings), with
+  an on-page caption stating the derivation. Best programme back to
+  "Europe -> Europe" ($74.17M, 54.0392 used days).
+
+- **Turnaround days between programme voyages** (`2771c3d`):
+  `optimise_programme(turnaround_days=0.0)` inserts a gap before every
+  additional cargo (never before the first or after the last);
+  residual_days redefined as ALL non-sailing days in the horizon (gaps
+  + tail), priced uniformly by residual_value_per_day so the
+  negative-rate idle-hire convention covers gaps too. Byte-identical at
+  the 0.0 default (equality-tested). Fourth input on the programme
+  page; the derived horizon includes one gap.
+
+- **Non-zero heel** (`3675c5f`): `Params.heel_fraction` (0.0 frozen
+  default; 2% operating case, an industry-typical assumption, not a
+  vessel spec). New `physical.ShortfallSource.HEEL_THEN_LIQUID_FUEL`
+  (per-state mapping; ballast states burn retained heel before buying
+  VLSFO, laden states untouched); ballast LNG combustion now counted in
+  emissions (the laden-only gate was correct only while ballast
+  inventory was always zero); separate "Heel" line in the decision
+  breakdown; reconciliation expander passes the heel target. Stated
+  honestly: at current prices heel is a net COST (delivered LNG is
+  worth more per MMBtu than VLSFO-equivalent) -- realism the zero-heel
+  model omitted, since heel is operationally required to keep tanks
+  cold. 5 new tests incl. a hand-checked hybrid segment and a zero-heel
+  bit-identity guard. 138 pytest total.
+
+- **GitHub Actions CI** (`46c4220`): every push byte-compiles all
+  modules and runs the 89 pure tests; the 49 workbook-backed tests
+  self-skip (LNG history.xlsx is proprietary and not in the repo) and
+  the frozen 64/64 suite remains local-only. Verified green without the
+  workbook before enabling.

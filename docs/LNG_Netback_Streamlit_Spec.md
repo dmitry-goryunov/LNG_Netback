@@ -1,5 +1,17 @@
 # LNG Forward Netback: Streamlit App Specification (v2, re-baselined)
 
+> **Scope note (17-Jul-2026):** this document defines the FROZEN LEGACY
+> SPEC CASE -- the exact assumptions (19.5 kn design speed, 0-day
+> loading, 5-day port calls, hand-set fuel/ETS constants) that the
+> 64-check regression suite (`tests/test_model.py`) pins forever and
+> that `model.Params()` defaults reproduce bit-for-bit. It does NOT
+> describe the app's current behavior: the operating case (17 kn,
+> 1.5 d loading/unloading, 2% heel, derived fuel/ETS -- see
+> `docs/MODEL_ASSUMPTIONS.md`) and the physical decision engine
+> (`docs/PHASE2_PLAN.md`) have superseded several sections, and the
+> "headline v2 roadmap item" below (the decision-mode switch) shipped
+> in v2.3-phase1. Read this as the baseline definition, not the manual.
+
 **Purpose:** implementation-ready description of `LNG_Forward_Netback.xlsx` and the diversion logic behind it (`LNG_Diversion_Logic.md` v2.2), extended with sensitivity, hedging and VaR modules. The reference implementation is `lng_netback_app/` (built 13-Jul-2026, re-baselined the same day after the notes.md review); its test suite encodes every fixture below.
 
 **Decision mode (state this first):** the model implements ONE economic problem: repeated fleet deployment — a vessel permanently cycling USGC round trips, choosing the basin that maximises margin per vessel-day, with procurement incurred for every successive cargo. It does not price post-lift diversion (procurement and loading would then be sunk) nor pre-lift cargo NPV under slack vessel capacity. A `decision_mode` switch (POST_LIFT_DIVERSION / PRE_LIFT_CARGO / FLEET_PROGRAMME) with mode-specific cost inclusion is the headline v2 roadmap item.

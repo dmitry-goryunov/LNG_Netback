@@ -1,5 +1,10 @@
 # Review of IMPROVEMENT_PLAN.md
 
+> **Historical document:** this reviewed plan v1.0; its accepted points
+> were folded into plan v1.2 (the version `docs/IMPROVEMENT_PLAN.md` now
+> carries), so nothing here is open feedback. Kept as provenance for why
+> the plan says what it says.
+
 **Document reviewed:** IMPROVEMENT_PLAN.md (plan version 1.0, 15 July 2026)
 **Review date:** 15 July 2026
 **Method:** every "current issue" claim in the plan was checked against the actual

@@ -1,8 +1,13 @@
 # Phase 2 implementation plan: unified physical and emissions engine
 
 **Governing plan:** `docs/IMPROVEMENT_PLAN.md` v1.2, Improvements 3-5, Phase 2.
-**Status:** in progress -- see `docs/IMPLEMENTATION_STATUS.md` for exactly
-what has been built against this plan so far.
+**Status:** COMPLETE (all sequencing steps 0-9 and Section 3a done; the
+physical engine now drives the three non-screen decision modes). The
+only live content left in this document is **Section 10's open
+decisions** (unconfirmed methane slip, queue/canal demand-rate
+placeholders, FuelEU, GWP vintage) -- everything else is a historical
+record of how the phase was built and verified. See
+`docs/IMPLEMENTATION_STATUS.md` for the running project tracker.
 **Builds on:** current `main`, which by now includes `v2.3-phase1`
 (`0be26cc`) plus later same-day work not reflected in that release's own
 docs: the 36-month forward strip and multi-tenor FX curve (`312e7b8`,
@@ -14,9 +19,13 @@ actual `main`, not trust any single commit's own snapshot of "current
 state" -- including this document's, which will itself go stale the moment
 more work lands.
 
-## 0. Incorporated from `docs/AGENT_TASK_V2_4_PHYSICAL_ENGINE.md`
+## 0. Incorporated from the v2.4 task brief
 
-A separately-authored task brief for the same phase landed in this repo.
+A separately-authored task brief for the same phase
+(`AGENT_TASK_V2_4_PHYSICAL_ENGINE.md`) landed in this repo as an
+untracked file; it was never committed and no longer exists on disk --
+this section is the surviving record of what it contained and what was
+taken from it.
 Reviewed against this plan; three genuinely better ideas were merged in
 (marked inline below with **[v2.4 brief]**): a three-state first-cargo
 model instead of two, an explicit terminal-heel reconciliation, and a
