@@ -64,8 +64,10 @@ def analytic_deltas(D, tables, params: Params, month_index: int = 0) -> list[Sen
     """
     ctx = _base_context(D, tables, params, month_index)
     cargo = params.cargo_size
+    load_days = params.loading_days
     eu_laden = params.europe_laden_days
-    europe_rt = params.europe_laden_days + params.europe_ballast_days + params.europe_port_days
+    europe_rt = (params.europe_laden_days + params.europe_ballast_days
+                 + params.europe_port_days + load_days)
     asia_rt = params.asia_rt_days
     asia_laden = params.asia_laden_days
     eu_bo = params.boil_off_rate * eu_laden
@@ -73,11 +75,11 @@ def analytic_deltas(D, tables, params: Params, month_index: int = 0) -> list[Sen
 
     fixed_fuel_eu = (params.residual_laden_vlsfo * params.europe_laden_days
                       + params.ballast_fuel * params.europe_ballast_days
-                      + params.port_fuel_rate * params.europe_port_days)
-    asia_ballast = asia_rt - asia_laden - params.asia_port_days
+                      + params.port_fuel_rate * (params.europe_port_days + load_days))
+    asia_ballast = asia_rt - asia_laden - params.asia_port_days - load_days
     fixed_fuel_asia = (params.residual_laden_vlsfo * asia_laden
                         + params.ballast_fuel * asia_ballast
-                        + params.port_fuel_rate * params.asia_port_days)
+                        + params.port_fuel_rate * (params.asia_port_days + load_days))
 
     out = []
 
@@ -511,8 +513,8 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
                          charter, params: Params) -> dict:
     """Numpy-vectorised re-implementation of model.strip's Step 6 maths,
     batched over all scenarios x all 12 load months at once. Kept
-    numerically identical to model.strip (cross-checked in
-    tests/test_model.py on the base case) -- exists purely for VaR/backtest
+    numerically identical to model.strip for both frozen legacy and current
+    operating defaults (cross-checked by zero-shock tests) -- exists purely for VaR/backtest
     performance, since a pure-Python model.strip call per scenario would
     be ~500x (or, for the backtest tab, ~50,000x) slower.
     """
@@ -543,11 +545,12 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     fx_l = np.where(t_col <= 6.0, fx_near, fx_far)   # (n,12)
 
     cargo = params.cargo_size
+    load_days = params.loading_days
     eu_laden, eu_ballast, eu_port = params.europe_laden_days, params.europe_ballast_days, params.europe_port_days
-    europe_rt = eu_laden + eu_ballast + eu_port
+    europe_rt = eu_laden + eu_ballast + eu_port + load_days
     asia_rt = params.asia_rt_days
     asia_laden, asia_port = params.asia_laden_days, params.asia_port_days
-    asia_ballast = asia_rt - asia_laden - asia_port
+    asia_ballast = asia_rt - asia_laden - asia_port - load_days
     eu_bo = params.boil_off_rate * eu_laden
     asia_bo = params.boil_off_rate * asia_laden
 
@@ -561,9 +564,9 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     ttf_usd = ttf_L * fx_l / 3.412
 
     fixed_fuel_eu = (params.residual_laden_vlsfo * eu_laden + params.ballast_fuel * eu_ballast
-                      + params.port_fuel_rate * eu_port)
+                      + params.port_fuel_rate * (eu_port + load_days))
     fixed_fuel_asia = (params.residual_laden_vlsfo * asia_laden + params.ballast_fuel * asia_ballast
-                        + params.port_fuel_rate * asia_port)
+                        + params.port_fuel_rate * (asia_port + load_days))
     eu_ship = (charter * europe_rt + fixed_fuel_eu * params.vlsfo_price) / cargo
     as_ship = (charter * asia_rt + fixed_fuel_asia * params.vlsfo_price + params.panama_toll_roundtrip) / cargo
 

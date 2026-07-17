@@ -71,3 +71,49 @@ def test_interim_backtest_skips_roll_pairs(tables):
 def test_legacy_function_default_remains_naive(tables):
     scen = risk.build_scenarios(tables, "2026-07-08", lookback=10)
     assert scen.method == "naive"
+
+
+def _zero_scenario() -> risk.ScenarioSet:
+    return risk.ScenarioSet(
+        dates=[pd.Timestamp("2026-07-07")],
+        hh_ret=np.zeros((1, 13)),
+        ttf_ret=np.zeros((1, 13)),
+        jkm_ret=np.zeros((1, 13)),
+        fx_ret=np.zeros(1),
+        end_date=pd.Timestamp("2026-07-07"),
+        lookback=1,
+        method="naive",
+    )
+
+
+@pytest.mark.parametrize(
+    ("portfolio", "basin"),
+    [
+        ("single", "Europe"),
+        ("single", "Asia"),
+        ("spread", "Europe"),
+        ("12cargo", "Europe"),
+    ],
+)
+def test_operating_default_zero_shock_pnl_is_zero(tables, portfolio, basin):
+    """R1.2: the risk repricer must reproduce the deterministic base exactly."""
+    result = risk.historical_var(
+        "2026-07-08",
+        tables,
+        model.operating_default_params(),
+        portfolio=portfolio,
+        basin=basin,
+        month_index=0,
+        scen=_zero_scenario(),
+    )
+    assert abs(float(result.pnl[0])) <= 0.01
+
+
+@pytest.mark.parametrize("shock_name", ["Charter +$10k/day", "VLSFO +$50/t"])
+def test_operating_default_analytic_sensitivities_match_finite_difference(tables, shock_name):
+    """R1.5/R1.6: operating-case analytic deltas must match full repricing."""
+    params = model.operating_default_params()
+    analytic = {d.name: d for d in risk.analytic_deltas("2026-07-08", tables, params)}[shock_name]
+    finite = {d.name: d for d in risk.finite_difference_deltas("2026-07-08", tables, params)}[shock_name]
+    assert analytic.eu_cargo_delta == pytest.approx(finite.eu_cargo_delta, rel=1e-10, abs=0.01)
+    assert analytic.asia_cargo_delta == pytest.approx(finite.asia_cargo_delta, rel=1e-10, abs=0.01)

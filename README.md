@@ -84,7 +84,7 @@ python3 tests/test_model.py
 ```
 
 Full pytest suite (decision modes, physical engine, emissions, spread
-option, operating assumptions, risk containment -- 138 tests; ~49 of them
+option, operating assumptions, risk containment -- 144 tests; ~55 of them
 need the workbook and self-skip without it):
 
 ```bash
@@ -118,6 +118,11 @@ As of the 08-Jul-2026 workbook: **64/64 checks pass, zero failures**
 pre-rebaseline spec). These 64 checks are frozen exactly as-is under the
 `v2.2-renewal-rate` tag and must remain green throughout the migration
 described in `docs/IMPROVEMENT_PLAN.md`.
+
+
+## v2.4.1 risk-equivalence correction (17-Jul-2026)
+
+The vectorised risk repricer and analytic charter/VLSFO sensitivities now include loading time and loading-port fuel consistently with `model.strip()`. Under the 17-kn operating defaults, zero shocks now produce zero P&L for Europe, Asia, the diversion spread and the legacy 12-cargo portfolio. The frozen 64-check suite remains unchanged; the full pytest suite is 144/144. See `docs/RISK_EQUIVALENCE_FIX.md`. This fixes base-value equivalence only; the risk module remains on the legacy 12-month economics and is not yet programme-based.
 
 ## v2.3-phase1: decision modes and vessel programme (15-Jul-2026)
 

@@ -336,3 +336,17 @@ engine work specifically.
   self-skip (LNG history.xlsx is proprietary and not in the repo) and
   the frozen 64/64 suite remains local-only. Verified green without the
   workbook before enabling.
+
+- **v2.4.1 risk-equivalence correction (17-Jul-2026):** fixed a live
+  operating-default divergence between `risk._vectorized_reprice()` and
+  `model.strip()`. The vectorised Europe path had omitted 1.5 loading days
+  and loading-port fuel; the Asia path had not subtracted loading time from
+  ballast days. `analytic_deltas()` repeated the same omissions for charter
+  and VLSFO sensitivities. Four operating-default zero-shock tests and two
+  sensitivity-equivalence tests were added. Pre-fix zero-shock P&L was
+  +$151,125 Europe, -$48,603 Asia, -$199,728 spread and +$1,813,500 for the
+  12-cargo portfolio; all are now below $0.01 absolute. Validation: frozen
+  64/64, pytest 144/144 and five-page Streamlit smoke all green. See
+  `docs/RISK_EQUIVALENCE_FIX.md`. This corrects base-value equivalence; it
+  does not yet migrate risk to the physical engine or a feasible vessel
+  programme.
