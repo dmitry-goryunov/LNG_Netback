@@ -15,6 +15,7 @@ Data: set LNG_HISTORY_XLSX to the workbook path, or upload it in the
 from __future__ import annotations
 
 import copy
+import dataclasses
 import importlib
 import os
 
@@ -342,6 +343,16 @@ if "params" not in st.session_state:
     # frozen legacy spec defaults (19.5 kn / 0 / 5) that Params() itself
     # keeps for the 64/64 regression suite -- see model.operating_default_params.
     st.session_state.params = model.operating_default_params()
+elif any(not hasattr(st.session_state.params, f.name) for f in dataclasses.fields(model.Params)):
+    # A browser session that stayed open across a deploy adding a new
+    # Params field carries an already-constructed instance of the OLD
+    # dataclass shape -- the module-freshness guard above reloads stale
+    # CODE, but reload doesn't retroactively add fields to an existing
+    # instance. Redacted AttributeError in production at p.heel_fraction
+    # was this: the instance simply predated that field.
+    st.session_state.params = model.operating_default_params()
+    st.session_state.pop("vessel_speed_kn", None)
+    st.info("Your session predated a cost parameter added since -- reset to operating defaults.")
 p = st.session_state.params
 
 st.sidebar.header("Cost parameters (Step 5)")

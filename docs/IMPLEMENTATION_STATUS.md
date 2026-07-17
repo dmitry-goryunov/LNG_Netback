@@ -350,3 +350,20 @@ engine work specifically.
   `docs/RISK_EQUIVALENCE_FIX.md`. This corrects base-value equivalence; it
   does not yet migrate risk to the physical engine or a feasible vessel
   programme.
+
+- **Stale `session_state.params` guard (17-Jul-2026):** production crash
+  on Streamlit Cloud (`AttributeError` at `p.heel_fraction`, redacted) hit
+  by any browser session that stayed open across a deploy adding a new
+  `Params` field. The existing module-freshness guard (`app.py`, added
+  `a5df274`) reloads stale *module* code but a reload doesn't retroactively
+  add fields to an *already-constructed* instance sitting in
+  `st.session_state` -- that needed a second, data-side check. `app.py` now
+  compares `st.session_state.params` against `dataclasses.fields(model.Params)`
+  on every run and resets to `operating_default_params()` (mirroring the
+  existing "Reset to operating defaults" button) if any current field is
+  missing, with an `st.info` telling the user why their inputs reset. Not
+  independently verifiable end-to-end locally (`tests/app_smoke_check.py`
+  needs the proprietary workbook, not present in this environment); the
+  detection predicate itself was checked directly against `model.Params`
+  with a synthetic old-shaped instance, and `python -m py_compile app.py`
+  plus the full pure pytest suite (89/89) stayed green.
