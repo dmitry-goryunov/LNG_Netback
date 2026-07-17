@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("LNG_HISTORY_XLSX", str(ROOT / "LNG history.xlsx"))
 
+import dataclasses  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import model  # noqa: E402 (after sys.path insert, matches app.py's own import order)
+
 app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
 assert not app.exception, [e.message for e in app.exception]
 assert [title.value for title in app.title] == ["LNG cargo and vessel decision"]
@@ -66,3 +71,31 @@ for page_name in ("2 Sensitivities", "3 Hedging"):
     app.run(timeout=120)
     assert not app.exception, [f"{page_name}: {e.message}" for e in app.exception]
     print(f"PASS {page_name.split(' ', 1)[1].lower()} page: loads clean")
+
+# Regression check for the stale-session-state guard (redacted production
+# AttributeError at p.heel_fraction on Streamlit Cloud, 17-Jul-2026): a
+# browser session that stayed open across a deploy adding a new Params
+# field carries an old-shaped instance forever, since a module reload
+# doesn't retroactively add fields to an already-constructed object.
+# Pre-seed a fresh AppTest's session_state with exactly that shape. A
+# SimpleNamespace, not a Params instance with a deleted attribute: fields
+# with plain literal defaults (e.g. heel_fraction: float = 0.0) leave
+# that default reachable as a *class* attribute, so hasattr() on a
+# same-class instance falls through to it even after `del`, which would
+# never trigger the guard and silently defeat this whole check. A real
+# stale instance predates the field at the class level too (it's bound
+# to the pre-reload Params class), which only an unrelated type reproduces.
+stale_app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+fresh_params = model.operating_default_params()
+stale_params = SimpleNamespace(**{
+    f.name: getattr(fresh_params, f.name) for f in dataclasses.fields(model.Params)
+    if f.name != "heel_fraction"
+})
+stale_app.session_state["params"] = stale_params
+stale_app.run()
+assert not stale_app.exception, [e.message for e in stale_app.exception]
+assert hasattr(stale_app.session_state["params"], "heel_fraction"), \
+    "a stale params instance should be reset to current defaults, not crashed on"
+assert any("predated" in i.value for i in stale_app.info), \
+    "resetting a stale session should tell the user why their inputs changed"
+print("PASS stale-session guard: old-shaped params reset cleanly, no crash")

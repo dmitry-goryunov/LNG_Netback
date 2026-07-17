@@ -361,9 +361,15 @@ engine work specifically.
   compares `st.session_state.params` against `dataclasses.fields(model.Params)`
   on every run and resets to `operating_default_params()` (mirroring the
   existing "Reset to operating defaults" button) if any current field is
-  missing, with an `st.info` telling the user why their inputs reset. Not
-  independently verifiable end-to-end locally (`tests/app_smoke_check.py`
-  needs the proprietary workbook, not present in this environment); the
-  detection predicate itself was checked directly against `model.Params`
-  with a synthetic old-shaped instance, and `python -m py_compile app.py`
-  plus the full pure pytest suite (89/89) stayed green.
+  missing, with an `st.info` telling the user why their inputs reset.
+  `tests/app_smoke_check.py` gained a regression check: a fresh AppTest
+  session pre-seeded with a `SimpleNamespace` missing `heel_fraction` (not
+  a `Params` instance with the attribute `del`-ed -- fields with plain
+  literal defaults leave that default reachable as a *class* attribute, so
+  `hasattr` on a same-class instance falls through to it even post-`del`
+  and would silently defeat the check; only an unrelated type reproduces a
+  real stale instance, which predates the field at the class level too).
+  Fully verified with the real workbook (`H:\My Drive\LNG\LNG history.xlsx`,
+  SHA-256 `4e51a1e6b9...` matching the v2.4.1 evidence exactly): frozen
+  64/64, pytest 144/144, and all six smoke checks including the new one
+  green.
