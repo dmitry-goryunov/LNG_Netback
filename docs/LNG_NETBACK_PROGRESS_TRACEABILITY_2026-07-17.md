@@ -142,6 +142,16 @@ Status: NOT STARTED | Dependency: R4 VERIFIED
 ## RELEASE R6 — risk and hedging rebuild
 
 Status: NOT STARTED | Dependency: stable deterministic commercial engine
+**Prioritisation (owner decision, 17-Jul-2026):** R6 is pulled ahead of
+R2–R5. Implementation plan, deferred-dependency mitigations (minimal
+input-sanity guard in lieu of full R2; undated/undiscounted cash flows
+pending R5; hold-plan-fixed programme VaR pending R4) and data gating
+(workbook has charter history but no VLSFO/EUA/basis sheets):
+`docs/R6_RISK_REBUILD_PLAN.md`. Target version `v2.6-risk-rebuild`.
+Increment order: A cash-flow layer → B formula-free repricer →
+C physical coefficients → D programme portfolio → E new factors →
+F exposure-derived hedges → G contract-ID backtest + uncertainty →
+H close-out.
 
 - R6.1 Generate canonical cash flows from deterministic valuation.
 - R6.2 Cache physical coefficients.
@@ -172,7 +182,14 @@ Status: NOT STARTED
 
 ## Current next action
 
-Start R2.1 physical-ledger validation. R1 is fully VERIFIED: source, tests, evidence and the release note are complete, and the fix is applied to `main` and pushed to `origin/main`.
+Start R6 increment A (canonical cash-flow layer) per
+`docs/R6_RISK_REBUILD_PLAN.md` — R6 prioritised ahead of R2–R5 by owner
+decision, 17-Jul-2026. R2–R5 remain open and unclaimed. Owner action
+that unblocks R6.5b: add VLSFO and EUA daily-history sheets to
+`LNG history.xlsx` (same layout as `charter`).
+
+(Superseded: the previous next action was R2.1 physical-ledger
+validation. R1 is fully VERIFIED and applied to `main`.)
 
 ## Mandatory agent completion report
 
