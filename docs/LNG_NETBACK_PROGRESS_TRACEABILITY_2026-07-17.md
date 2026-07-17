@@ -153,7 +153,13 @@ C physical coefficients → D programme portfolio → E new factors →
 F exposure-derived hedges → G contract-ID backtest + uncertainty →
 H close-out.
 
-- R6.1 Generate canonical cash flows from deterministic valuation.
+- R6.1 Generate canonical cash flows from deterministic valuation. —
+  **IN PROGRESS:** increment A landed 17-Jul-2026 (`cashflows.py` +
+  16 pinning tests; legacy-basis decomposition parity vs `model.strip()`
+  ~1e-8 worst error, all six deltas derived from quantities; built by a
+  Sonnet implementation agent, independently reviewed and full battery
+  re-run before commit). Physical-basis decomposition lands in
+  increment C.
 - R6.2 Cache physical coefficients.
 - R6.3 Vectorise only the price-dependent tail.
 - R6.4 Use delivery-contract IDs.

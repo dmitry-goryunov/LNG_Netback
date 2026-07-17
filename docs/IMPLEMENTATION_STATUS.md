@@ -395,3 +395,23 @@ engine work specifically.
   `historical_var()` takes its base from `model.strip()` while scenarios
   go through `_vectorized_reprice()` -- i.e. the zero-shock tests compare
   two independent implementations and are not circular.
+
+- **R6 increment A: canonical cash-flow layer (17-Jul-2026):** first
+  increment of the risk rebuild (`docs/R6_RISK_REBUILD_PLAN.md`), built
+  by a Sonnet implementation agent and independently reviewed
+  line-by-line before commit (delegation workflow: implementer has no
+  commit rights; reviewer hand-checks the math against `model.strip()`
+  and re-runs the full battery). New pure module `cashflows.py`:
+  `RiskFactor` enum, `CashFlow` with factor-TUPLE products (bilinear
+  TTF x FX today, (EUA, FX)-ready for R6.5b), `CargoExposure` with
+  scalar/vectorised evaluation and `quantity_on()` for delta derivation,
+  and `legacy_cargo_cashflows()` decomposing `model.strip()`'s Step 6
+  into per-factor terms. 16 new tests (10 pure -> CI, 6 workbook-gated):
+  parity vs strip for BOTH parameter sets across all 12 months (worst
+  observed error ~1.1e-8 dollars), and all six analytic deltas re-derived
+  purely from quantities matching `risk.analytic_deltas()` exactly.
+  Purely additive -- no existing file changed by the increment itself;
+  CI compileall/count lines updated at review. Validation: pytest
+  161/161 with workbook, 10 passed/6 skipped without (CI simulation),
+  frozen 64/64, six smoke checks green. Increment B (repricer consumes
+  this layer, duplicate formulas deleted) is next.
