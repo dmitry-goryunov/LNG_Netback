@@ -40,11 +40,35 @@ Prices enter valuation strictly through linear and bilinear terms:
 | Fuel / charter / tolls / fees | constant (today) or `qty × VLSFO`, `qty × charter` (if made stochastic) |
 
 So the physical engine needs to run **once per `Params`** — not per
-scenario and not per date — to produce a coefficient set. Scenario
+scenario and not per date — to produce the quantity set. Scenario
 revaluation and the whole backtest reduce to array products. This is what
 makes physical-engine-based VaR *faster* than the current duplicate, not
-slower, and it is why the coefficient cache (R6.2) is keyed on a `Params`
-hash, not on the curve date.
+slower.
+
+**Two-layer cache, not one (corrected 17-Jul-2026 review):** the
+*quantities* (fuel tonnes, delivered MMBtu, EUA tonnes) are `Params`-only
+and get the expensive, `Params`-hash-keyed cache. But cash-flow *assembly*
+is D-dependent — ETS phase factors follow each load month's YEAR, the JKM
+tenor shift `s` comes from `contract_calendar(D)`, month labels move with
+D, and the charter/price bases are snapped at D. Assembly is arithmetic
+on cached quantities (cheap), recomputed per (D, Params) without caching.
+A single Params-keyed cache of finished cash flows would serve stale
+phase/tenor data as the backtest walks D through time.
+
+**Factor products, not just single factors:** Europe revenue is
+`qty × TTF × FX` — bilinear. The `CashFlow` schema must carry a *tuple*
+of factors (`(TTF, FX)`, `(JKM,)`, `(FX,)`, ...) rather than one enum
+value, because the moment EUA becomes stochastic (R6.5b) the ETS term
+changes shape from FX-linear (EUA price folded into qty) to
+`(EUA, FX)`-bilinear. Building products in from day one means that
+transition is a coefficient re-split, not a schema change.
+
+**Boundary with scenario preparation:** the FX curve interpolation
+(spot/o6/o1 → fx(L) per month), the exp-of-log-returns, and the JKM
+column mapping stay in `risk.py` as scenario *price preparation* — they
+produce per-month factor price matrices. The cash-flow layer consumes
+prepared price matrices and does nothing but Σ qty × Π(prices). Route
+math lives in neither place after increment B.
 
 Known intentional nonlinearity stays OUTSIDE the cash-flow layer, exactly
 as today: verdict switching (12-cargo routes by base-date verdict),
@@ -57,7 +81,12 @@ already-evaluated route values.
    commit. It pins Gate 3 sensitivities, Gate 4 hedge/VaR fixtures and
    the zero-shock identities under legacy defaults through the CURRENT
    public API (`risk.historical_var`, `risk.build_scenarios`, ...), so
-   the public API survives the rebuild.
+   the public API survives the rebuild. Verified fact (17-Jul-2026): the
+   frozen zero-shock assertions use `abs(pnl) < $1.00`
+   (`tests/test_model.py:265`), so increment B's floating-point
+   reassociation (summing per cash flow instead of strip's expression
+   grouping) is safely inside tolerance; no need to mirror strip's exact
+   summation order.
 2. **R1 operating-default tests** (zero-shock ≤ $0.01, analytic = FD to
    1e-10, hedge-leg tonnage) — green at every commit.
 3. **Full pytest suite** (145 and growing) + **six-check Streamlit
@@ -89,8 +118,8 @@ charter, volatilities.
 
 | Factor | History available? | R6 treatment |
 |---|---|---|
-| HH / TTF / JKM / FX | yes (existing) | as today |
-| Charter (rate174) | **yes** — daily series already loaded | NEW stochastic factor (R6.5a), feasible immediately |
+| HH / TTF / JKM / FX | yes (daily, master-date aligned) | as today |
+| Charter (rate174) | **partial** — 459 rows over 2017–2026 (~weekly, not daily; all positive, no NaNs — verified 17-Jul-2026) | R6.5a — CANNOT join the daily joint-historical scenario set honestly; see revised treatment in increment E |
 | VLSFO | **no** | R6.5b — data-gated: add loader that tolerates absence (pattern: `load_volatilities`); until a sheet exists, expose as deterministic stress knob only, disclosed in UI |
 | EUA | **no** | same as VLSFO (R6.5b) |
 | NWE / JKM physical basis | **no** | R6.6 — config-based proxy vol with explicit "not market-calibrated" disclosure, or excluded with disclosure; decide at increment E |
@@ -110,10 +139,12 @@ battery in §3, with evidence saved to `test_results/v2.6/`.
 number.
 
 1. New pure module `cashflows.py` (no Streamlit, no risk imports):
-   - `RiskFactor` enum: `TTF`, `JKM`, `HH`, `FX`, `TTF_X_FX` (bilinear),
-     `CHARTER`, `VLSFO`, `EUA`, `CONST`.
-   - `@dataclass CashFlow`: `factor`, `month_index`, `quantity`,
-     `label`, `settle_date: Optional[...] = None` (reserved for R5).
+   - `RiskFactor` enum: `TTF`, `JKM`, `HH`, `FX`, `CHARTER`, `VLSFO`,
+     `EUA` (no composite members — products are expressed structurally).
+   - `@dataclass CashFlow`: `factors: tuple[RiskFactor, ...]` (empty
+     tuple = constant; `(TTF, FX)` = bilinear product — see §2 for why
+     products must be first-class), `month_index`, `quantity`, `label`,
+     `settle_date: Optional[...] = None` (reserved for R5).
    - `CargoExposure`: list of CashFlows + route/month metadata;
      `value(prices) -> float` and a vectorised
      `value_matrix(price_arrays) -> np.ndarray`.
@@ -123,9 +154,12 @@ number.
 3. **Pinning tests (write first):** for legacy AND operating defaults,
    all 12 months: `CargoExposure.value(base prices) == strip's
    eu_cargo/asia_cargo` to ≤ $0.01 (target: ~1e-9 like R1). Also pin
-   the four analytic deltas (charter, VLSFO, TTF, JKM) as *derived from
-   cash-flow quantities* — the delta IS the summed quantity on that
-   factor, which becomes the single source of truth later.
+   ALL SIX analytic deltas (charter, VLSFO, TTF, JKM, HH, FX) as
+   *derived from cash-flow quantities*: for single-factor terms the
+   delta is the summed quantity; for product terms it is quantity × the
+   co-factor's base price (TTF delta needs base FX; FX delta needs base
+   TTF plus the EUA-constant leg). This derivation becomes the single
+   source of truth later.
 
 **Acceptance:** new tests green; nothing else touched yet.
 
@@ -161,20 +195,45 @@ of three-plus.
    route valuation ONCE, decompose its cash flows onto the factor set
    (delivered MMBtu × destination price, HH procurement, fuel tonnes ×
    VLSFO const, EUA tonnes × phase, heel × destination price, fees).
-2. Parity characterisation (not equality — the bases legitimately
+2. **Exposure follows first-cargo state (added in 17-Jul-2026 review —
+   this is a headline improvement of the physical basis, not a detail):**
+   a sunk leg is a constant, not an exposure. `FirstCargoState.LOADED`
+   means procurement is paid → the HH quantity for that cargo is ZERO;
+   the legacy basis shocks HH on every cargo regardless, overstating
+   commodity risk on committed cargoes. `physical_cargo_cashflows()`
+   must map `cost_policy()`'s sunk flags to dropped factor quantities,
+   with a test per state asserting exactly which factors carry zero
+   quantity. The VaR page inherits the Decision page's first-cargo-state
+   selector for the current cargo (later programme legs are always
+   fully exposed pre-lift).
+3. Parity characterisation (not equality — the bases legitimately
    differ): a test asserting `CargoExposure.value(base) ==` the decision
    page's physical route value to ≤ $0.01, per route, both parameter
-   sets. Document the legacy-vs-physical base-value gap in the release
-   note (it is a feature: same gap the Decision page already discloses).
-3. Coefficient cache keyed on a stable hash of (`Params` fields, route,
-   first_cargo_state) — NOT on `D`. Add a cache-hit test and a
-   staleness test (changing any Params field must miss).
-4. VaR page: "Value basis" radio — `Legacy strip (frozen)` /
+   sets and per first-cargo state. Document the legacy-vs-physical
+   base-value gap in the release note (it is a feature: same gap the
+   Decision page already discloses).
+4. **Two-layer cache per §2 (corrected):** the `Params`-hash-keyed cache
+   stores physical QUANTITIES only (fuel tonnes, delivered, EUA tonnes
+   pre-phase). Cash-flow assembly (phase by load-month year, JKM tenor
+   `s`, month labels, snapped bases) is recomputed per (D, Params) —
+   cheap arithmetic, never cached. Tests: cache hit on repeated D with
+   same Params; changing any Params field misses; and a
+   **backtest-poison test**: walking D across a year boundary with a
+   warm cache must change the ETS phase on the assembled cash flows.
+5. VaR page: "Value basis" radio — `Legacy strip (frozen)` /
    `Physical engine` — defaulting to legacy until R6 closes, reusing the
    existing basis-disclosure caption pattern from the Decision page.
+6. **Stress-path basis awareness:** `run_stress_tests()` reprices via
+   `model.strip()` directly (verified: `risk.py:789-828`), so after this
+   increment the stress tab would silently stay legacy-basis while the
+   VaR tab shows physical numbers. Re-express the deterministic stress
+   shocks as factor-price bumps evaluated on the ACTIVE basis's cash
+   flows; keep the legacy-basis behaviour bit-compatible (regression
+   test — stress is not in the frozen 64, so pin it ourselves).
 
 **Acceptance:** full battery; physical-basis VaR renders on the page and
-its zero-shock P&L is ≤ $0.01 by the same construction as R1.
+its zero-shock P&L is ≤ $0.01 by the same construction as R1; the
+state-exposure and cache-poison tests pass.
 
 ### D. Feasible programme portfolio — [R6.7]
 
@@ -198,13 +257,24 @@ its zero-shock P&L is ≤ $0.01 by the same construction as R1.
 **Goal:** the factor set stops silently excluding what the workbook can
 support.
 
-1. **Charter (R6.5a, feasible now):** log-return scenarios from
-   `tables.charter` rate174, same lookback/method machinery; quantity =
-   RT days per cargo (already on the cash-flow layer). Frozen fixtures:
-   the legacy path must pass ZERO charter shocks — `build_scenarios`
-   grows the factor additively, with the naive/legacy method emitting
-   zeros for new factors. Add a fixture-freeze test proving Gate 4
-   numbers are unchanged with the extended ScenarioSet.
+1. **Charter (R6.5a — REVISED after data check, 17-Jul-2026):** the
+   charter series is 459 rows over 2017–2026 — roughly weekly, not
+   daily. It CANNOT be joined honestly into the 500-day daily
+   joint-historical scenario set: forward-filling to daily produces
+   ~80% zero returns (understates vol and fakes independence from the
+   gas complex on most days), and weekly returns √5-scaled to daily
+   destroys the joint-historical property that is the whole point of
+   HS-VaR. Decision: charter stays DETERMINISTIC inside HS-VaR (as
+   today), and instead (a) charter shock rows are added to the stress
+   table (e.g. ±$25k/day, ±50%, evaluated on the active basis's cash
+   flows — the quantity side already exists), and (b) an OPTIONAL
+   independent-overlay factor (normal, weekly-calibrated vol, zero
+   assumed correlation to gas — both assumptions printed on the page)
+   can be toggled on, clearly labelled as a model overlay rather than
+   historical simulation, default OFF. `ScenarioSet` still grows
+   additively with the naive/legacy method emitting zeros for new
+   factors; add a fixture-freeze test proving Gate 4 numbers are
+   unchanged with the extended ScenarioSet.
 2. **VLSFO / EUA (R6.5b, data-gated):** loaders tolerant of absent
    sheets (return None → factor excluded → UI shows "deterministic, no
    history in workbook"). Wire quantity sides now (they already exist as
@@ -222,8 +292,11 @@ support.
 1. `hedge_legs_from_exposure(CargoExposure) -> DataFrame`: net quantity
    per (factor, month) IS the hedge. The VLSFO-swap tonnage that drifted
    in v2.4.1's blind spot becomes structurally incapable of drifting —
-   it reads the same quantities the repricer prices. Existing hedge-leg
-   test keeps passing, now tautologically.
+   it reads the same quantities the repricer prices. The existing
+   hedge-leg tonnage test stays MEANINGFUL (it recomputes expected
+   tonnage from `Params` independently inside the test, so it still
+   cross-checks the exposure layer against first principles rather than
+   against itself).
 2. Lot rounding via `CONTRACT_SPECS` (round-to-lot with residual shown),
    `verified: False` flags surfaced in the UI as the spec demands, and a
    transaction-cost haircut column (config, default conservative).
@@ -277,8 +350,20 @@ and red against a stub, then B lands them green).
 2. No discounting anywhere in R6 (matches the whole model today; R5's
    job).
 3. `"12cargo"` and the Section 7 mechanical hedge survive as
-   fixture-pinned legacy paths — nothing frozen is deleted.
-4. Charter becomes a stochastic factor in R6.5a; VLSFO/EUA ship
-   data-gated; basis ships disclosed-or-excluded, not silently proxied.
+   fixture-pinned legacy paths — nothing frozen is deleted. Under the
+   PHYSICAL basis the portfolio list is `single` / `spread` /
+   `programme` only; `12cargo` stays legacy-basis-only (it is both
+   infeasible and fixture-bound — no reason to port it).
+4. Charter stays deterministic inside HS-VaR (weekly data cannot join a
+   daily joint-historical set — §5, E.1); it enters via stress rows and
+   an optional, clearly-labelled independent overlay, default OFF.
+   VLSFO/EUA ship data-gated; basis ships disclosed-or-excluded, not
+   silently proxied.
 5. The legacy-vs-physical base-value difference is characterised and
    disclosed, not reconciled away — same policy as the Decision page.
+6. Exposure follows first-cargo state on the physical basis (sunk
+   procurement ⇒ zero HH quantity, etc. — C.2); the legacy basis keeps
+   its always-fully-exposed behaviour because the frozen fixtures pin
+   it.
+7. New pure `cashflows.py` unit tests join the CI pure-test subset (CI
+   count grows; note it in the README's CI line at close-out).
