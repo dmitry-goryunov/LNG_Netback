@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import cashflows
 import data
 import model
 import risk
@@ -145,3 +146,78 @@ def test_operating_default_hedge_leg_vlsfo_tonnage_matches_strip_fuel(tables):
                      + params.ballast_fuel * asia_ballast
                      + params.port_fuel_rate * (params.asia_port_days + params.loading_days))
     assert asia_swap == pytest.approx(asia_expected, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    "params_factory", [model.Params, model.operating_default_params], ids=["legacy", "operating"]
+)
+def test_vectorized_reprice_matches_scalar_cargo_exposure_loop(tables, params_factory):
+    """R6 increment B: the batched _vectorized_reprice() path (12 months x
+    n scenarios, evaluated via CargoExposure.value_matrix()) must agree
+    with an independent per-scenario Python loop calling
+    CargoExposure.value() at the same shocked prices -- the guard that
+    the batched path equals the scalar path through REAL risk wiring
+    (unlike test_cashflows.py's value_matrix test, which checks the
+    cash-flow layer in isolation on synthetic quantities and never
+    touches risk.py). Scenarios are non-zero (small random log-returns,
+    fixed seed) -- a zero-shock check alone cannot distinguish a batched
+    implementation bug from one that only breaks under real dispersion."""
+    D = "2026-07-08"
+    params = params_factory()
+
+    hh_row = model.snap(tables.hh, D)
+    ttf_row = model.snap(tables.ttf, D)
+    jkm_row = model.snap(tables.jkm, D)
+    fx_row = model.snap(tables.fx, D)
+    ch_row = model.snap(tables.charter, D)
+    charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
+
+    cols = [f"c{i}" for i in range(1, risk.N_STRIP_COLS + 1)]
+    base_hh = hh_row[cols].to_numpy(dtype=float)
+    base_ttf = ttf_row[cols].to_numpy(dtype=float)
+    base_jkm = jkm_row[cols].to_numpy(dtype=float)
+    base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
+
+    rng = np.random.default_rng(20260717)
+    n = 6
+    scen = risk.ScenarioSet(
+        dates=[pd.Timestamp("2026-07-07")] * n,
+        hh_ret=rng.normal(0, 0.02, (n, risk.N_STRIP_COLS)),
+        ttf_ret=rng.normal(0, 0.02, (n, risk.N_STRIP_COLS)),
+        jkm_ret=rng.normal(0, 0.02, (n, risk.N_STRIP_COLS)),
+        fx_ret=rng.normal(0, 0.01, n),
+        end_date=pd.Timestamp("2026-07-07"), lookback=n, method="naive",
+    )
+
+    result = risk._vectorized_reprice(scen, D, base_hh, base_ttf, base_jkm,
+                                       base_spot, base_o6, base_o1, charter, params)
+
+    F, s = model.contract_calendar(pd.Timestamp(D))
+    months = model.load_months(F, 12)
+
+    worst = 0.0
+    for i, m in enumerate(months):
+        eu_flows, asia_flows = cashflows.legacy_cargo_quantities(params, m.year)
+        eu_exp = cashflows.CargoExposure(route="Europe", month_index=i, cash_flows=eu_flows)
+        asia_exp = cashflows.CargoExposure(route="Asia", month_index=i, cash_flows=asia_flows)
+        for sc in range(n):
+            eu_prices = {
+                cashflows.RiskFactor.TTF: float(result["ttf_L"][sc, i]),
+                cashflows.RiskFactor.FX: float(result["fx_l"][sc, i]),
+                cashflows.RiskFactor.HH: float(result["hh_L"][sc, i]),
+                cashflows.RiskFactor.CHARTER: charter,
+                cashflows.RiskFactor.VLSFO: params.vlsfo_price,
+            }
+            asia_prices = {
+                cashflows.RiskFactor.JKM: float(result["jkm_L1"][sc, i]),
+                cashflows.RiskFactor.HH: float(result["hh_L"][sc, i]),
+                cashflows.RiskFactor.CHARTER: charter,
+                cashflows.RiskFactor.VLSFO: params.vlsfo_price,
+            }
+            eu_scalar = eu_exp.value(eu_prices)
+            asia_scalar = asia_exp.value(asia_prices)
+            worst = max(worst, abs(eu_scalar - result["eu_cargo"][sc, i]),
+                        abs(asia_scalar - result["asia_cargo"][sc, i]))
+            assert eu_scalar == pytest.approx(result["eu_cargo"][sc, i], rel=1e-9, abs=1e-6)
+            assert asia_scalar == pytest.approx(result["asia_cargo"][sc, i], rel=1e-9, abs=1e-6)
+    print(f"[{params_factory.__name__}] batched-vs-scalar worst abs error: {worst:.3e}")

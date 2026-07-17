@@ -84,8 +84,8 @@ python3 tests/test_model.py
 ```
 
 Full pytest suite (decision modes, physical engine, emissions, spread
-option, operating assumptions, risk containment, cash-flow layer -- 161
-tests; ~62 of them need the workbook and self-skip without it):
+option, operating assumptions, risk containment, cash-flow layer -- 163
+tests; ~64 of them need the workbook and self-skip without it):
 
 ```bash
 export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"

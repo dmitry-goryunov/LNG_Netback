@@ -415,3 +415,30 @@ engine work specifically.
   161/161 with workbook, 10 passed/6 skipped without (CI simulation),
   frozen 64/64, six smoke checks green. Increment B (repricer consumes
   this layer, duplicate formulas deleted) is next.
+
+- **R6 increment B: risk.py consumes the cash-flow layer (18-Jul-2026):**
+  the highest-risk increment of the rebuild, same Sonnet-implements /
+  independent-review workflow. `cashflows.py` gained the plan sect-2
+  two-layer split: `legacy_cargo_quantities(params, load_month_year)` is
+  the pure Params-only quantity producer (arithmetic moved verbatim);
+  `legacy_cargo_cashflows()` is now a thin D-dependent assembly wrapper
+  (snap, phase year, base_prices, month re-tag). `risk.analytic_deltas()`
+  and `risk._vectorized_reprice()` both consume the layer: ~40 lines of
+  duplicated europe_rt/fixed-fuel/eu_ship/as_ship/margin arithmetic
+  DELETED -- that formula now exists exactly once (`cashflows.py`) plus
+  the untouched `model.strip()` ground truth. Scenario price preparation
+  (exp-of-returns, FX interpolation, JKM tenor mapping) unchanged
+  byte-for-byte per the plan boundary; `jkm_star`'s `asia_cost_exbo`
+  intermediate is recovered by exact algebraic rearrangement from the
+  evaluated `asia_cargo` (verified against bumped-table `model.strip()`
+  oracles to ~1e-14, including a verdict-flip case); `europe_rt` is read
+  off the CHARTER quantity rather than re-derived. Minimal finite-value
+  guards added at the evaluation boundary (R2 remains unclaimed). One
+  new parametrized test: batched repricer vs per-scenario scalar
+  `CargoExposure.value()` loop under non-zero random shocks (exact
+  agreement). Review verified independently: full diff read, frozen
+  64/64 (the gate that matters here), pytest 163/163 with workbook,
+  99/64-skip CI simulation, six smoke checks, backtest runtime same
+  order of magnitude (isolated repricer ~2.5x slower pending the
+  increment-C quantities cache; dominated in practice by untouched
+  scenario-building/pandas costs).

@@ -18,6 +18,7 @@ import pandas as pd
 
 import model
 from model import Params, contract_calendar, fx_curve, snap, phase_for_year, _month_add
+from cashflows import CargoExposure, CashFlow, RiskFactor, legacy_cargo_cashflows, legacy_cargo_quantities
 
 # ===========================================================================
 # Section 6 -- Sensitivities
@@ -61,36 +62,31 @@ def analytic_deltas(D, tables, params: Params, month_index: int = 0) -> list[Sen
     destination price -- already absorbed analytically below via the
     (1-boil_off_frac) multipliers -- and (b) ETS x FX, so these are exact
     to machine precision, not first-order approximations.
-    """
-    ctx = _base_context(D, tables, params, month_index)
-    cargo = params.cargo_size
-    load_days = params.loading_days
-    eu_laden = params.europe_laden_days
-    europe_rt = (params.europe_laden_days + params.europe_ballast_days
-                 + params.europe_port_days + load_days)
-    asia_rt = params.asia_rt_days
-    asia_laden = params.asia_laden_days
-    eu_bo = params.boil_off_rate * eu_laden
-    asia_bo = params.boil_off_rate * asia_laden
 
-    fixed_fuel_eu = (params.residual_laden_vlsfo * params.europe_laden_days
-                      + params.ballast_fuel * params.europe_ballast_days
-                      + params.port_fuel_rate * (params.europe_port_days + load_days))
-    asia_ballast = asia_rt - asia_laden - params.asia_port_days - load_days
-    fixed_fuel_asia = (params.residual_laden_vlsfo * asia_laden
-                        + params.ballast_fuel * asia_ballast
-                        + params.port_fuel_rate * (params.asia_port_days + load_days))
+    R6 increment B: derived from cashflows.legacy_cargo_cashflows()'s
+    quantities via CargoExposure.quantity_on(), not an independently
+    maintained day-count/fuel formula -- single-factor terms use the
+    summed quantity directly (times shock size); product terms (TTF x
+    FX) multiply by the co-factor's BASE price. This is the exact
+    derivation tests/test_cashflows.py::
+    test_deltas_derived_from_quantities_match_analytic_deltas re-verifies
+    independently against this function.
+    """
+    eu, asia = legacy_cargo_cashflows(D, tables, params, month_index)
+    base_fx = eu.base_prices[RiskFactor.FX]
+    base_ttf = eu.base_prices[RiskFactor.TTF]
 
     out = []
 
-    d_ttf = cargo * (1 - eu_bo) * ctx["fx_l"] / 3.412
-    out.append(SensitivityDelta("TTF +1 EUR/MWh", d_ttf * 1.0, 0.0))
+    d_ttf_eu = eu.quantity_on((RiskFactor.TTF, RiskFactor.FX)) * base_fx
+    out.append(SensitivityDelta("TTF +1 EUR/MWh", d_ttf_eu * 1.0, 0.0))
 
-    d_jkm = cargo * (1 - asia_bo)
-    out.append(SensitivityDelta("JKM +0.10 $/MMBtu", 0.0, d_jkm * 0.10))
+    d_jkm_asia = asia.quantity_on((RiskFactor.JKM,))
+    out.append(SensitivityDelta("JKM +0.10 $/MMBtu", 0.0, d_jkm_asia * 0.10))
 
-    d_hh = -cargo * params.hh_grossup
-    out.append(SensitivityDelta("HH +0.10 $/MMBtu", d_hh * 0.10, d_hh * 0.10))
+    d_hh_eu = eu.quantity_on((RiskFactor.HH,))
+    d_hh_asia = asia.quantity_on((RiskFactor.HH,))
+    out.append(SensitivityDelta("HH +0.10 $/MMBtu", d_hh_eu * 0.10, d_hh_asia * 0.10))
 
     # Parallel FX shift: bump spot AND the corrected outrights o6/o1 by the
     # same absolute delta (equivalently: bump the *stored* 6M/1Y points by
@@ -98,20 +94,22 @@ def analytic_deltas(D, tables, params: Params, month_index: int = 0) -> list[Sen
     # identical, see fx_curve docstring). fx(L) then shifts by exactly the
     # spot delta for every L, so the effect is a clean, exact partial
     # derivative even though it spans two "raw" columns (spot + points).
-    co2 = params.co2_eu_ets_tonnes
-    phase = phase_for_year(ctx["L"].year)
-    d_fx_eu = cargo * (1 - eu_bo) * ctx["ttf_l"] / 3.412 - co2 * params.eua_price * phase
+    # In cash-flow terms that is the TTF x FX product's co-factor (base
+    # TTF) plus the FX-linear ETS leg (EUA price folded into its
+    # quantity today -- see cashflows.RiskFactor's docstring).
+    d_fx_eu = (eu.quantity_on((RiskFactor.TTF, RiskFactor.FX)) * base_ttf
+               + eu.quantity_on((RiskFactor.FX,)))
     out.append(SensitivityDelta("EURUSD +0.01 (parallel)", d_fx_eu * 0.01, 0.0))
 
-    d_charter_eu = -europe_rt
-    d_charter_asia = -asia_rt
+    d_charter_eu = eu.quantity_on((RiskFactor.CHARTER,))
+    d_charter_asia = asia.quantity_on((RiskFactor.CHARTER,))
     out.append(SensitivityDelta(
         "Charter +$10k/day", d_charter_eu * 10_000, d_charter_asia * 10_000,
         note="margin/day: both -10,000 exactly; JKM* unchanged (structural, Step 7.1)",
     ))
 
-    d_vlsfo_eu = -fixed_fuel_eu
-    d_vlsfo_asia = -fixed_fuel_asia
+    d_vlsfo_eu = eu.quantity_on((RiskFactor.VLSFO,))
+    d_vlsfo_asia = asia.quantity_on((RiskFactor.VLSFO,))
     out.append(SensitivityDelta("VLSFO +$50/t", d_vlsfo_eu * 50, d_vlsfo_asia * 50))
 
     return out
@@ -509,6 +507,28 @@ def _roll_aligned_returns(px: np.ndarray, dates: list, roll_fn) -> np.ndarray:
     return out
 
 
+def _assert_finite_quantities(cash_flows: list[CashFlow], label: str) -> None:
+    """R6 increment B minimal input-sanity guard (plan sect 4, B.3): fail
+    loud rather than let a non-finite Params-derived quantity silently
+    propagate into VaR. Cheap (12 numbers) -- not full R2 validation
+    (reconciliation, sign checks, cross-field consistency), which stays
+    unclaimed by this release."""
+    q = np.array([cf.quantity for cf in cash_flows], dtype=float)
+    if not np.isfinite(q).all():
+        bad = [cf.label for cf, finite in zip(cash_flows, np.isfinite(q)) if not finite]
+        raise ValueError(f"non-finite cash-flow quantity in {label}: {bad}")
+
+
+def _assert_finite_prices(prices: dict, label: str) -> None:
+    """Same boundary guard as _assert_finite_quantities, for the scenario
+    price arrays fed into CargoExposure.value_matrix() -- vectorised
+    (one isfinite pass per factor array), so cheap at backtest scale."""
+    for factor, arr in prices.items():
+        a = np.asarray(arr, dtype=float)
+        if not np.isfinite(a).all():
+            raise ValueError(f"non-finite {factor.value} price(s) in {label}")
+
+
 def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
                          charter, params: Params) -> dict:
     """Numpy-vectorised re-implementation of model.strip's Step 6 maths,
@@ -517,6 +537,17 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     operating defaults (cross-checked by zero-shock tests) -- exists purely for VaR/backtest
     performance, since a pure-Python model.strip call per scenario would
     be ~500x (or, for the backtest tab, ~50,000x) slower.
+
+    R6 increment B: route valuation (eu_cargo/asia_cargo) is delegated to
+    cashflows.legacy_cargo_quantities()/CargoExposure.value_matrix() --
+    the same per-factor decomposition legacy_cargo_cashflows() is pinned
+    against model.strip() in tests/test_cashflows.py -- instead of a
+    third independent copy of the eu_ship/as_ship/margin arithmetic.
+    Scenario PRICE PREPARATION (below: exp-of-log-returns, the FX curve
+    interpolation producing fx_l, the months/phases arrays, the JKM
+    column mapping producing jkm_L1) is UNCHANGED -- plan sect 2's
+    boundary keeps that here, not in the cash-flow layer, which only
+    consumes already-prepared price matrices.
     """
     D = pd.Timestamp(D)
     F, s = contract_calendar(D)
@@ -545,14 +576,8 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     fx_l = np.where(t_col <= 6.0, fx_near, fx_far)   # (n,12)
 
     cargo = params.cargo_size
-    load_days = params.loading_days
-    eu_laden, eu_ballast, eu_port = params.europe_laden_days, params.europe_ballast_days, params.europe_port_days
-    europe_rt = eu_laden + eu_ballast + eu_port + load_days
     asia_rt = params.asia_rt_days
-    asia_laden, asia_port = params.asia_laden_days, params.asia_port_days
-    asia_ballast = asia_rt - asia_laden - asia_port - load_days
-    eu_bo = params.boil_off_rate * eu_laden
-    asia_bo = params.boil_off_rate * asia_laden
+    asia_bo = params.boil_off_rate * params.asia_laden_days
 
     # HH(L), TTF(L) for month i use column i; JKM(L+1) uses column i+2-s-1 (0-based)
     hh_L = hh_scen[:, 0:12] if hh_scen.shape[1] >= 12 else np.pad(hh_scen, ((0, 0), (0, 12 - hh_scen.shape[1])))
@@ -560,26 +585,72 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     jkm_cols_idx = np.array([i + 1 - s for i in range(12)])  # 0-based
     jkm_L1 = jkm_scen[:, jkm_cols_idx]
 
-    proc = hh_L * params.hh_grossup + params.liquefaction_toll + params.pipeline
-    ttf_usd = ttf_L * fx_l / 3.412
+    # --- Route valuation (R6 increment B): the proc/ttf_usd/eu_ship/
+    # as_ship/ets/eu_margin/asia_margin arithmetic that used to live here
+    # is GONE -- eu_cargo/asia_cargo now come from evaluating the same
+    # per-factor CashFlow quantities legacy_cargo_cashflows() decomposes
+    # model.strip()'s Step 6 into (tests/test_cashflows.py group b pins
+    # that decomposition against model.strip() to ~1e-8). `phases` above
+    # is computed but not consumed here: phase_for_year() is applied
+    # INSIDE legacy_cargo_quantities() itself, keyed off each month's
+    # calendar year, folded into the ETS cash flow's quantity -- kept
+    # computed above anyway because the scenario-preparation block it
+    # lives in is not restructured by this increment (plan sect 2).
+    #
+    # Quantities are Params-only (plan sect 2), so they are built ONCE
+    # per call -- 12 months x 2 routes -- not once per scenario; the
+    # n-scenario cost is confined to value_matrix's array arithmetic.
+    charter_arr = np.full(n, charter, dtype=float)
+    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
 
-    fixed_fuel_eu = (params.residual_laden_vlsfo * eu_laden + params.ballast_fuel * eu_ballast
-                      + params.port_fuel_rate * (eu_port + load_days))
-    fixed_fuel_asia = (params.residual_laden_vlsfo * asia_laden + params.ballast_fuel * asia_ballast
-                        + params.port_fuel_rate * (asia_port + load_days))
-    eu_ship = (charter * europe_rt + fixed_fuel_eu * params.vlsfo_price) / cargo
-    as_ship = (charter * asia_rt + fixed_fuel_asia * params.vlsfo_price + params.panama_toll_roundtrip) / cargo
+    eu_cargo = np.empty((n, 12), dtype=float)
+    asia_cargo = np.empty((n, 12), dtype=float)
+    europe_rt = np.empty(12, dtype=float)
 
-    ets = params.co2_eu_ets_tonnes * params.eua_price * phases[None, :] * fx_l / cargo
+    for i in range(12):
+        eu_flows, asia_flows = legacy_cargo_quantities(params, int(years[i]))
+        _assert_finite_quantities(eu_flows, f"Europe month {i} cash-flow quantities")
+        _assert_finite_quantities(asia_flows, f"Asia month {i} cash-flow quantities")
 
-    eu_margin = ttf_usd * (1 - eu_bo) - proc - params.loading - eu_ship - params.eu_regas_port - params.other_cost - ets
-    eu_cargo = eu_margin * cargo
+        eu_exposure = CargoExposure(route="Europe", month_index=i, cash_flows=eu_flows)
+        asia_exposure = CargoExposure(route="Asia", month_index=i, cash_flows=asia_flows)
 
-    asia_cost_exbo = proc + params.loading + as_ship + params.asia_port_cost + params.other_cost
-    asia_margin = jkm_L1 * (1 - asia_bo) - asia_cost_exbo
-    asia_cargo = asia_margin * cargo
+        eu_prices = {
+            RiskFactor.TTF: ttf_L[:, i],
+            RiskFactor.FX: fx_l[:, i],
+            RiskFactor.HH: hh_L[:, i],
+            RiskFactor.CHARTER: charter_arr,
+            RiskFactor.VLSFO: vlsfo_arr,
+        }
+        asia_prices = {
+            RiskFactor.JKM: jkm_L1[:, i],
+            RiskFactor.HH: hh_L[:, i],
+            RiskFactor.CHARTER: charter_arr,
+            RiskFactor.VLSFO: vlsfo_arr,
+        }
+        _assert_finite_prices(eu_prices, f"Europe month {i} scenario prices")
+        _assert_finite_prices(asia_prices, f"Asia month {i} scenario prices")
 
-    eu_day = eu_cargo / europe_rt
+        eu_cargo[:, i] = eu_exposure.value_matrix(eu_prices)
+        asia_cargo[:, i] = asia_exposure.value_matrix(asia_prices)
+        # The CHARTER quantity IS -europe_rt (single source of truth,
+        # plan sect 6.B) -- constant across months since the charter
+        # cash flow has no phase/year dependence -- recovered here
+        # rather than re-deriving eu_laden+eu_ballast+eu_port+load_days
+        # independently a second time.
+        europe_rt[i] = -eu_exposure.quantity_on((RiskFactor.CHARTER,))
+
+    eu_day = eu_cargo / europe_rt[None, :]
+
+    # asia_cost_exbo isn't a single factor's quantity (it's strip's
+    # bundled ex-boil-off cost: proc + loading + as_ship + asia_port_cost
+    # + other_cost), so the cash-flow layer doesn't expose it directly.
+    # Exact algebraic rearrangement of strip's asia_margin = jkm_L1 *
+    # (1 - asia_bo) - asia_cost_exbo, asia_cargo = asia_margin * cargo
+    # (see legacy_cargo_quantities docstring for the forward derivation)
+    # recovers it from the already-evaluated asia_cargo instead of a
+    # third independent copy of the proc/as_ship formula.
+    asia_cost_exbo = jkm_L1 * (1 - asia_bo) - asia_cargo / cargo
     jkm_star = (eu_day * asia_rt / cargo + asia_cost_exbo) / (1 - asia_bo)
     verdict_asia = jkm_L1 >= jkm_star
 

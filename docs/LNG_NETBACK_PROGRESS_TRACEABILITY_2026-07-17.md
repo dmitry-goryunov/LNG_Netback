@@ -161,7 +161,14 @@ H close-out.
   re-run before commit). Physical-basis decomposition lands in
   increment C.
 - R6.2 Cache physical coefficients.
-- R6.3 Vectorise only the price-dependent tail.
+- R6.3 Vectorise only the price-dependent tail. — **IN PROGRESS
+  (legacy basis DONE):** increment B landed 18-Jul-2026.
+  `risk._vectorized_reprice()` and `risk.analytic_deltas()` now consume
+  `cashflows.legacy_cargo_quantities()` / `quantity_on()`; ~40 lines of
+  duplicated route arithmetic deleted, scenario price preparation kept
+  in risk.py per the plan boundary, `asia_cost_exbo` recovered
+  algebraically (verified ~1e-14 vs bumped `model.strip()` oracles).
+  Frozen 64/64 held throughout. Physical basis lands in increment C.
 - R6.4 Use delivery-contract IDs.
 - R6.5 Add VLSFO and EUA risk factors.
 - R6.6 Add physical basis factors.

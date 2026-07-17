@@ -1,6 +1,6 @@
 """
-cashflows.py -- canonical price-dependent cash-flow layer (R6.1, increment
-A of docs/R6_RISK_REBUILD_PLAN.md).
+cashflows.py -- canonical price-dependent cash-flow layer (R6.1/R6.3,
+increments A-B of docs/R6_RISK_REBUILD_PLAN.md).
 
 Pure module: no Streamlit import, no risk.py import. Importing model.py
 (and pandas/numpy) is fine -- model.py is itself pure, headless code.
@@ -15,14 +15,31 @@ floating-point reassociation error -- see tests/test_cashflows.py group b,
 which pins this against the real workbook for both legacy and
 operating-default Params, worst observed error ~1e-8).
 
-Nothing in strip() or risk.py changes here: this is an additive, parallel
-decomposition only. Increment B is what makes the vectorised repricer
-actually consume this layer instead of model.strip().
+Two-layer split (plan sect 2, increment B): `legacy_cargo_quantities()`
+produces the PRICE-INDEPENDENT quantities -- a pure function of Params
+plus the load month's calendar year (needed only for the ETS phase).
+`legacy_cargo_cashflows()` is a thin D-dependent ASSEMBLY wrapper around
+it: snap prices, resolve the load month's year, attach base_prices. The
+split matters because quantities are Params-hash-cacheable while
+assembly (phase-by-year, JKM tenor shift, snapped bases) is cheap
+D-dependent arithmetic that must be redone every call, never cached --
+this is what lets risk._vectorized_reprice (called ~2,000x by the
+backtest) build a month's quantities ONCE and reuse them across every
+scenario, instead of re-snapping tables per scenario.
+
+As of increment B (R6.3), risk.py consumes this layer:
+risk._vectorized_reprice() evaluates legacy_cargo_quantities()'s output
+against scenario price arrays via CargoExposure.value_matrix(), and
+risk.analytic_deltas() derives its six sensitivities from
+legacy_cargo_cashflows()'s quantity_on() calls -- both replacing what
+used to be independently duplicated day-count/fuel arithmetic in
+risk.py. model.strip() itself is untouched (still the ground truth
+legacy_cargo_cashflows() is pinned against).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional
 
@@ -75,11 +92,20 @@ class CashFlow:
 class CargoExposure:
     """One route's one load month, as a bundle of CashFlow terms plus the
     metadata needed to evaluate or describe them: `route` is a display
-    label ("Europe"/"Asia"), `month_index` is the same 0-based load-month
-    index every one of its cash flows carries, and `base_prices` is the
-    snapped price for every factor referenced by those cash flows --
-    what parity tests (and any caller wanting the deterministic,
-    zero-shock value) evaluate `value()` at."""
+    label ("Europe"/"Asia"), `month_index` is this exposure's own
+    0-based load-month index, and `base_prices` is the snapped price for
+    every factor referenced by those cash flows -- what parity tests
+    (and any caller wanting the deterministic, zero-shock value)
+    evaluate `value()` at.
+
+    Individual CashFlow.month_index fields are NOT guaranteed to match
+    this exposure's month_index: legacy_cargo_quantities() (Params-only,
+    no month_index available -- see its docstring) tags its output with
+    a placeholder, and a caller assembling many exposures per call (e.g.
+    risk._vectorized_reprice, one per load month per call) may reuse
+    that output as-is rather than re-tagging every CashFlow, since
+    evaluation never reads the per-cash-flow field. legacy_cargo_cashflows()
+    re-tags it anyway, for callers that do care."""
 
     route: str
     month_index: int
@@ -161,17 +187,25 @@ def _snap_month_prices(D, tables, params: Params, month_index: int) -> dict:
     return dict(L=L, charter=charter, fx_l=fx_l, hh_l=hh_l, ttf_l=ttf_l, jkm_l1=jkm_l1)
 
 
-def legacy_cargo_cashflows(D, tables, params: Params,
-                           month_index: int) -> tuple[CargoExposure, CargoExposure]:
-    """Decompose model.strip()'s Step 6 arithmetic for ONE load month
-    (model.py's `for i, L in enumerate(months)` body, at i = month_index,
-    roughly lines 424-467) into per-factor CashFlow terms. Returns
-    (europe_exposure, asia_exposure); CargoExposure.value(base_prices)
-    reproduces strip()'s eu_cargo/asia_cargo for this month to
-    floating-point reassociation error (tests/test_cashflows.py group b
-    pins this against the real workbook for both legacy and
-    operating-default Params; worst observed error ~1e-8, target ~1e-9
-    per the plan).
+def legacy_cargo_quantities(params: Params, load_month_year: int) -> tuple[list[CashFlow], list[CashFlow]]:
+    """Price-independent half of the Step 6 decomposition (plan sect 2's
+    Layer 1/2 split): every quantity below is a pure function of `params`
+    plus the load month's calendar YEAR -- the year is needed only for
+    phase_for_year(), which the ETS term folds into its FX-linear
+    quantity (see RiskFactor's docstring for why ETS is FX-linear today
+    rather than an (EUA, FX) bilinear product). No `tables`, no `D`, no
+    snapping, no month_index: this is what lets a caller build a
+    Params-hash-keyable quantity cache and, in risk._vectorized_reprice,
+    build the 12 months' worth of quantities ONCE per call regardless of
+    scenario count, instead of rebuilding them per scenario (plan sect 2).
+
+    `CashFlow.month_index` on every returned term is a placeholder (0):
+    this function has no load-month index to attach (only a calendar
+    year -- multiple load months can share a year). Evaluation
+    (CargoExposure.value/value_matrix/quantity_on) never reads
+    CashFlow.month_index, so the placeholder is inert, not lossy (see
+    CargoExposure's docstring). legacy_cargo_cashflows() below re-tags
+    it to the real month_index for callers that do care.
 
     Derivation (algebraic expansion of eu_margin*cargo / asia_margin*cargo;
     every quantity below is `cargo x` a piece of strip()'s bracketed
@@ -205,8 +239,11 @@ def legacy_cargo_cashflows(D, tables, params: Params,
     constant; asia_port_cost/other_cost are the remaining constant
     pieces. Asia has no FX and no ETS term in strip() -- verified against
     model.py's source, not assumed from memory.
+
+    Returns (europe_cash_flows, asia_cash_flows) -- bare lists, not yet
+    wrapped in a CargoExposure (no route/month_index/base_prices
+    metadata attached; see legacy_cargo_cashflows()).
     """
-    ctx = _snap_month_prices(D, tables, params, month_index)
     cargo = params.cargo_size
     bo = params.boil_off_rate
     load_days = params.loading_days
@@ -231,27 +268,76 @@ def legacy_cargo_cashflows(D, tables, params: Params,
                         + params.ballast_fuel * asia_ballast
                         + params.port_fuel_rate * (asia_port + load_days))
 
-    phase = phase_for_year(ctx["L"].year)
+    phase = phase_for_year(load_month_year)
+    MI = 0  # placeholder month_index -- see docstring above
+
+    europe = [
+        CashFlow((RiskFactor.TTF, RiskFactor.FX), MI,
+                 cargo * (1 - eu_bo_frac) / 3.412,
+                 "TTF revenue net of boil-off, x FX"),
+        CashFlow((RiskFactor.HH,), MI,
+                 -cargo * params.hh_grossup, "HH procurement (grossed up)"),
+        CashFlow((RiskFactor.FX,), MI,
+                 -params.co2_eu_ets_tonnes * params.eua_price * phase,
+                 "ETS (EUA price folded into the quantity -- see docstring)"),
+        CashFlow((RiskFactor.CHARTER,), MI, -europe_rt, "charter hire"),
+        CashFlow((RiskFactor.VLSFO,), MI, -fixed_fuel_eu, "bunker fuel"),
+        CashFlow((), MI,
+                 -cargo * (params.liquefaction_toll + params.pipeline + params.loading
+                           + params.eu_regas_port + params.other_cost),
+                 "fixed fees: liquefaction + pipeline + loading + regas + other"),
+    ]
+
+    asia = [
+        CashFlow((RiskFactor.JKM,), MI,
+                 cargo * (1 - asia_bo_frac), "JKM revenue net of boil-off"),
+        CashFlow((RiskFactor.HH,), MI,
+                 -cargo * params.hh_grossup, "HH procurement (grossed up)"),
+        CashFlow((RiskFactor.CHARTER,), MI, -asia_rt, "charter hire"),
+        CashFlow((RiskFactor.VLSFO,), MI, -fixed_fuel_asia, "bunker fuel"),
+        CashFlow((), MI,
+                 -cargo * (params.liquefaction_toll + params.pipeline + params.loading
+                           + params.asia_port_cost + params.other_cost)
+                 - params.panama_toll_roundtrip,
+                 "fixed fees + Panama toll roundtrip"),
+    ]
+
+    return europe, asia
+
+
+def legacy_cargo_cashflows(D, tables, params: Params,
+                           month_index: int) -> tuple[CargoExposure, CargoExposure]:
+    """D-dependent ASSEMBLY wrapper around legacy_cargo_quantities()
+    (plan sect 2's Layer 1/2 split): snaps prices for ONE load month via
+    _snap_month_prices() (Step 1-3 of model.strip()), calls
+    legacy_cargo_quantities() with that load month's calendar year to
+    get the Params-only quantities, then attaches base_prices -- the
+    snapped bases parity tests (and any caller wanting the
+    deterministic, zero-shock value) evaluate `value()` at.
+
+    Returns (europe_exposure, asia_exposure); CargoExposure.value(base_prices)
+    reproduces strip()'s eu_cargo/asia_cargo for this month to
+    floating-point reassociation error (tests/test_cashflows.py group b
+    pins this against the real workbook for both legacy and
+    operating-default Params; worst observed error ~1e-8, target ~1e-9
+    per the plan) -- unaffected by the quantities/assembly split, since
+    the underlying arithmetic did not move, only which function performs
+    it. See legacy_cargo_quantities()'s docstring for the full per-factor
+    derivation.
+
+    Each returned CashFlow has its month_index re-tagged (via
+    dataclasses.replace) from legacy_cargo_quantities()'s placeholder to
+    this call's actual month_index, matching CargoExposure.month_index --
+    legacy_cargo_quantities() itself cannot do this (it is never given a
+    month_index, only a calendar year, which is not the same thing).
+    """
+    ctx = _snap_month_prices(D, tables, params, month_index)
+    europe_flows, asia_flows = legacy_cargo_quantities(params, ctx["L"].year)
 
     europe = CargoExposure(
         route="Europe",
         month_index=month_index,
-        cash_flows=[
-            CashFlow((RiskFactor.TTF, RiskFactor.FX), month_index,
-                     cargo * (1 - eu_bo_frac) / 3.412,
-                     "TTF revenue net of boil-off, x FX"),
-            CashFlow((RiskFactor.HH,), month_index,
-                     -cargo * params.hh_grossup, "HH procurement (grossed up)"),
-            CashFlow((RiskFactor.FX,), month_index,
-                     -params.co2_eu_ets_tonnes * params.eua_price * phase,
-                     "ETS (EUA price folded into the quantity -- see docstring)"),
-            CashFlow((RiskFactor.CHARTER,), month_index, -europe_rt, "charter hire"),
-            CashFlow((RiskFactor.VLSFO,), month_index, -fixed_fuel_eu, "bunker fuel"),
-            CashFlow((), month_index,
-                     -cargo * (params.liquefaction_toll + params.pipeline + params.loading
-                               + params.eu_regas_port + params.other_cost),
-                     "fixed fees: liquefaction + pipeline + loading + regas + other"),
-        ],
+        cash_flows=[replace(cf, month_index=month_index) for cf in europe_flows],
         base_prices={
             RiskFactor.TTF: ctx["ttf_l"],
             RiskFactor.HH: ctx["hh_l"],
@@ -264,19 +350,7 @@ def legacy_cargo_cashflows(D, tables, params: Params,
     asia = CargoExposure(
         route="Asia",
         month_index=month_index,
-        cash_flows=[
-            CashFlow((RiskFactor.JKM,), month_index,
-                     cargo * (1 - asia_bo_frac), "JKM revenue net of boil-off"),
-            CashFlow((RiskFactor.HH,), month_index,
-                     -cargo * params.hh_grossup, "HH procurement (grossed up)"),
-            CashFlow((RiskFactor.CHARTER,), month_index, -asia_rt, "charter hire"),
-            CashFlow((RiskFactor.VLSFO,), month_index, -fixed_fuel_asia, "bunker fuel"),
-            CashFlow((), month_index,
-                     -cargo * (params.liquefaction_toll + params.pipeline + params.loading
-                               + params.asia_port_cost + params.other_cost)
-                     - params.panama_toll_roundtrip,
-                     "fixed fees + Panama toll roundtrip"),
-        ],
+        cash_flows=[replace(cf, month_index=month_index) for cf in asia_flows],
         base_prices={
             RiskFactor.JKM: ctx["jkm_l1"],
             RiskFactor.HH: ctx["hh_l"],
