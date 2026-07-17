@@ -84,7 +84,7 @@ python3 tests/test_model.py
 ```
 
 Full pytest suite (decision modes, physical engine, emissions, spread
-option, operating assumptions, risk containment -- 144 tests; ~55 of them
+option, operating assumptions, risk containment -- 145 tests; ~56 of them
 need the workbook and self-skip without it):
 
 ```bash

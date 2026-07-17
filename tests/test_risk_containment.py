@@ -117,3 +117,31 @@ def test_operating_default_analytic_sensitivities_match_finite_difference(tables
     finite = {d.name: d for d in risk.finite_difference_deltas("2026-07-08", tables, params)}[shock_name]
     assert analytic.eu_cargo_delta == pytest.approx(finite.eu_cargo_delta, rel=1e-10, abs=0.01)
     assert analytic.asia_cargo_delta == pytest.approx(finite.asia_cargo_delta, rel=1e-10, abs=0.01)
+
+
+def test_operating_default_hedge_leg_vlsfo_tonnage_matches_strip_fuel(tables):
+    """The VLSFO-swap hedge leg must size against the same fuel tonnage
+    model.strip() actually prices. europe/asia_hedge_legs() carried a third
+    copy of the route-fuel formula that the v2.4.1 fix missed (found in
+    post-release review): no loading-port fuel, and Asia ballast days not
+    net of loading time -- invisible to the zero-shock tests because the
+    swap volume never enters a priced, cross-checked quantity. Legacy
+    defaults (loading_days = 0) can't distinguish the formulas, so this
+    pins the operating case."""
+    params = model.operating_default_params()
+
+    eu = risk.europe_hedge_legs("2026-07-08", tables, params)
+    eu_swap = float(eu.loc[eu["leg"].str.startswith("VLSFO swap"), "volume"].iloc[0])
+    eu_expected = (params.residual_laden_vlsfo * params.europe_laden_days
+                   + params.ballast_fuel * params.europe_ballast_days
+                   + params.port_fuel_rate * (params.europe_port_days + params.loading_days))
+    assert eu_swap == pytest.approx(eu_expected, rel=1e-12)
+
+    asia = risk.asia_hedge_legs("2026-07-08", tables, params)
+    asia_swap = float(asia.loc[asia["leg"].str.startswith("VLSFO swap"), "volume"].iloc[0])
+    asia_ballast = (params.asia_rt_days - params.asia_laden_days
+                    - params.asia_port_days - params.loading_days)
+    asia_expected = (params.residual_laden_vlsfo * params.asia_laden_days
+                     + params.ballast_fuel * asia_ballast
+                     + params.port_fuel_rate * (params.asia_port_days + params.loading_days))
+    assert asia_swap == pytest.approx(asia_expected, rel=1e-12)

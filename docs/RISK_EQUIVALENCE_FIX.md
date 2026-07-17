@@ -12,6 +12,20 @@ This is a correctness patch. It does not convert the risk module to the segment-
 
 ## Traceability
 
+> **Editor's note (17-Jul-2026):** the four commit hashes below refer to a
+> discarded staging clone built by the Drive-side review agent, not to this
+> repository -- none of them exist here. The change was actually applied to
+> this repository's `main` as commit
+> `103231006c43a37643b816481ab229535d7c6ca0`, tagged
+> `v2.4.1-risk-equivalence`, after independent re-verification. The workbook
+> hash, size and curve date below were independently confirmed against
+> `H:\My Drive\LNG\LNG history.xlsx`. A post-release review also found a
+> third copy of the same route-fuel formula this note's fix missed --
+> the VLSFO-swap sizing in `risk.europe_hedge_legs()` /
+> `risk.asia_hedge_legs()` (hedge-leg tonnage display only; no valuation,
+> VaR or sensitivity impact) -- fixed separately with its own regression
+> test.
+
 - Imported Drive snapshot commit: `fd303715611e8d6afa4ba7b0fbbcf2c96c6b4837`
 - R1.1 pre-fix evidence commit: `3c09b4714b981126c2d0b2596098bc0db79e0e6b`
 - R1.2 tests and expected failures commit: `c305fd8df842b2e84579c1a16c60828dd5ccaa97`

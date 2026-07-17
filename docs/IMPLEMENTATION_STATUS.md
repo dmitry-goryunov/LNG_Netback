@@ -373,3 +373,25 @@ engine work specifically.
   SHA-256 `4e51a1e6b9...` matching the v2.4.1 evidence exactly): frozen
   64/64, pytest 144/144, and all six smoke checks including the new one
   green.
+
+- **Hedge-leg VLSFO sizing: third formula copy fixed (17-Jul-2026):** an
+  independent logic review of the v2.4.1 release found that
+  `risk.europe_hedge_legs()` / `risk.asia_hedge_legs()` carried a *third*
+  copy of the route-fuel formula that R1.3/R1.4 didn't reach: the Hedging
+  page's VLSFO-swap leg omitted loading-port fuel (Europe and Asia) and
+  didn't subtract loading time from Asia ballast days. No valuation, VaR,
+  zero-shock or sensitivity impact -- the swap volume is a tonnage sizing
+  suggestion that never enters a priced quantity, which is exactly why the
+  R1 test battery couldn't see it. Under operating defaults the Europe swap
+  was understated by 1.5 d of port fuel and the Asia swap overstated by
+  1.5 d of (ballast - port) fuel; at legacy defaults (loading_days = 0) the
+  formulas were arithmetically identical, so the frozen suite was blind to
+  it too. Fixed to mirror `model.strip()` exactly, with a new
+  operating-default regression test pinning both basins' swap tonnage to
+  strip's fuel definitions (`test_operating_default_hedge_leg_vlsfo_tonnage_matches_strip_fuel`).
+  Validation: pytest 145/145, frozen 64/64, six smoke checks all green
+  with the real workbook. The review also re-derived all six analytic
+  deltas from strip's formulas by hand and confirmed
+  `historical_var()` takes its base from `model.strip()` while scenarios
+  go through `_vectorized_reprice()` -- i.e. the zero-shock tests compare
+  two independent implementations and are not circular.

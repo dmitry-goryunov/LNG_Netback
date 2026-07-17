@@ -297,7 +297,7 @@ def europe_hedge_legs(D, tables, params: Params, month_index: int = 0) -> pd.Dat
 
     vlsfo_laden = params.residual_laden_vlsfo * eu_laden
     vlsfo_ballast = params.ballast_fuel * params.europe_ballast_days
-    vlsfo_port = params.port_fuel_rate * params.europe_port_days
+    vlsfo_port = params.port_fuel_rate * (params.europe_port_days + params.loading_days)
     eua_tonnes = params.co2_eu_ets_tonnes * phase_for_year(L.year)
 
     legs = [
@@ -336,10 +336,10 @@ def asia_hedge_legs(D, tables, params: Params, month_index: int = 0) -> pd.DataF
     ng_mmbtu = cargo * params.hh_grossup
     ng_lots = ng_mmbtu / CONTRACT_SPECS["NYMEX Henry Hub (NG)"]["size"]
 
-    asia_ballast = params.asia_rt_days - asia_laden - params.asia_port_days
+    asia_ballast = params.asia_rt_days - asia_laden - params.asia_port_days - params.loading_days
     vlsfo_laden = params.residual_laden_vlsfo * asia_laden
     vlsfo_ballast = params.ballast_fuel * asia_ballast
-    vlsfo_port = params.port_fuel_rate * params.asia_port_days
+    vlsfo_port = params.port_fuel_rate * (params.asia_port_days + params.loading_days)
 
     legs = [
         dict(leg="Short JKM future (month L+1)", month=row["month_label"], volume=delivered_mmbtu, unit="MMBtu",

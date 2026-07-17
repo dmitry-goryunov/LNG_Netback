@@ -76,7 +76,7 @@ Acceptance: Europe and Asia analytic and finite-difference VLSFO deltas agree un
 
 **R1.7 Run full validation — VERIFIED**
 Required: compileall; frozen 64 suite; complete pytest suite; all zero-shock identities; sensitivity reconciliation; all five Streamlit pages.
-Independently re-run: full pytest suite, 89 passed / 0 failed / 55 skipped (workbook-gated, expected without the proprietary workbook present locally).
+Independently re-run in full once the workbook location was confirmed (`H:\My Drive\LNG\LNG history.xlsx`, SHA-256 matching this register's recorded hash exactly): frozen legacy 64/64 PASS, complete pytest suite 144/144 PASS with zero skips, five-page Streamlit smoke PASS. (An initial re-run before the workbook was located covered only the 89 pure tests, with the 55 workbook-gated tests skipping.)
 
 **R1.8 Record impact and close release — VERIFIED**
 Required file: `docs/RISK_EQUIVALENCE_FIX.md`.
@@ -194,7 +194,9 @@ Code changes alone do not complete a step. The tracker, implementation status, t
 
 **Workbook SHA-256 and curve date:** `4e51a1e6b92d004836c8cfe18f118006686ef19ad2b9813c77c53035591c5497`; curve date 2026-07-08.
 
-**Test evidence:** Frozen legacy 64/64 and five-page Streamlit smoke as recorded in `docs/RISK_EQUIVALENCE_FIX.md` (workbook-gated, not independently re-run in the applying environment, which has no local copy of the proprietary workbook). Full pytest suite independently re-run against the applied commit: 89 passed, 0 failed, 55 skipped (workbook-gated) — 144 total, matching the claimed count with zero failures.
+**Test evidence:** Fully independently re-verified once the workbook was located at `H:\My Drive\LNG\LNG history.xlsx` (SHA-256 `4e51a1e6b9...` matching the recorded hash exactly): frozen legacy 64/64 PASS, complete pytest suite 144/144 PASS with zero skips, five-page Streamlit smoke PASS.
+
+**Post-release finding (17-Jul-2026):** an independent logic review after R1 closed found a third copy of the same route-fuel formula that R1.3/R1.4 did not reach: the VLSFO-swap sizing in `risk.europe_hedge_legs()` / `risk.asia_hedge_legs()` (Hedging page) omitted loading-port fuel and did not net loading time out of Asia ballast days. Display/hedge-sizing only — no valuation, VaR, zero-shock or sensitivity impact, which is precisely why the R1 test battery could not see it. Fixed with a dedicated operating-default regression test pinning the swap tonnage to `model.strip()`'s fuel definitions (pytest suite now 145).
 
 **Numerical impact:** Zero-shock P&L corrected from Europe +$151,125, Asia -$48,603, spread -$199,728 and 12-cargo +$1,813,500 to less than $0.01 absolute for every portfolio. Analytic charter and VLSFO sensitivities reconcile to finite difference within numerical noise.
 
