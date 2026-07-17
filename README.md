@@ -1,28 +1,48 @@
 # LNG Forward Netback
 
-Streamlit implementation of `LNG_Netback_Streamlit_Spec.md`: a per-load-month
-netback / diversion model (Europe vs Asia) built on `LNG history.xlsx`, plus
-sensitivities, hedging and historical-simulation VaR modules.
+Streamlit implementation of a per-load-month netback / diversion model
+(Europe vs Asia) built on `LNG history.xlsx`: a 36-month forward strip,
+explicit decision modes (post-lift diversion, pre-lift cargo, discrete
+one-vessel programme) valued by a segment-level physical voyage engine
+(fuel/BOG/heel/emissions/EU-ETS), a Margrabe JKM-vs-TTF diversion option,
+plus sensitivities, hedging and historical-simulation VaR modules.
 
-**Current build: v2.3-phase1.** This build preserves the frozen v2.2
-renewal-rate model (tagged `v2.2-renewal-rate`, see `docs/BASELINE_RECORD.md`)
-and adds explicit decision modes plus a provisional discrete one-vessel
-programme optimiser, per `docs/IMPROVEMENT_PLAN.md` Phase 0 / Increment A+B.
-See `docs/IMPLEMENTATION_STATUS.md` for exactly what is and is not
-implemented, and `docs/MODEL_ASSUMPTIONS.md` for the assumptions behind it.
+**Where to look:**
+- `docs/IMPLEMENTATION_STATUS.md` -- the live project tracker (what is
+  built, with measured impacts, entry per increment). Git history carries
+  the same record at commit granularity.
+- `docs/MODEL_ASSUMPTIONS.md` -- current operating assumptions (17 kn,
+  1.5 d loading/unloading, 2% heel, cube-law fuel) vs the frozen legacy
+  spec case (19.5 kn / 0 / 5) that the 64-check regression suite pins.
+- `docs/IMPROVEMENT_PLAN.md` -- the master roadmap;
+  `docs/PHASE2_PLAN.md` -- the (complete) physical-engine phase, whose
+  Section 10 holds the open parameter decisions.
+- `docs/LNG_Netback_Streamlit_Spec.md` -- the frozen baseline definition
+  (not a manual for current behavior; see its scope banner).
+- Frozen v2.2 baseline: tag `v2.2-renewal-rate`, `docs/BASELINE_RECORD.md`.
 
 ## Layout
 
 ```
-app.py                page routing, sidebar (date picker + Step 5 parameter editor)
-data.py                Section 1 loader + validation (Streamlit only in the cached wrapper)
-model.py                Sections 2-3 as pure functions: strip(D, tables, params) -> DataFrame
-decision.py             decision modes, cost-inclusion policy, discrete vessel-programme optimiser
-risk.py                Sections 6-8: sensitivities, hedging, VaR, stress, backtest
-tests/test_model.py           frozen legacy Section 5/6/7/8 fixtures (pass/fail summary, no pytest)
-tests/test_decision_programme.py   decision-mode and programme-optimiser tests (pytest)
-tests/test_risk_containment.py     roll-aligned scenario / backtest containment tests (pytest)
-tests/app_smoke_check.py           headless Streamlit smoke check
+app.py                 page routing, sidebar (date picker + parameter editor incl. vessel schedule)
+data.py                loader + validation (HH/TTF/JKM/FX incl. 2Y-10Y tenors/charter/volatilities)
+model.py               legacy strip(D, tables, params) as pure functions; speed/fuel/geometry helpers
+decision.py            decision modes, cost-inclusion policy, physical route valuation, programme optimiser
+physical.py            segment-level voyage engine (BOG/reliquefaction/heel/queue mass balance)
+emissions.py           CO2/CH4/CO2e per segment, EU-ETS scope and cost, legacy-ETS derivation
+spread_option.py       Margrabe JKM-vs-TTF exchange option (intrinsic/extrinsic per strip month)
+risk.py                sensitivities, hedging, VaR, stress, backtest (legacy 12-month basis)
+tests/test_model.py                     frozen legacy 64-check suite (no pytest; needs the workbook)
+tests/test_decision_programme.py        decision modes, programme optimiser, physical wiring (pytest)
+tests/test_physical_engine.py           segment mass-balance unit tests
+tests/test_physical_legacy_equivalence.py  proof the engine reproduces the legacy constants
+tests/test_emissions.py                 combustion/ETS factor tests
+tests/test_extended_strip.py            36-month strip + multi-tenor FX tests
+tests/test_spread_option.py             Margrabe formula + tenor-alignment tests
+tests/test_operating_assumptions.py     17-kn operating case, loading/heel/speed-helper guards
+tests/test_risk_containment.py          roll-aligned scenario / backtest containment tests
+tests/app_smoke_check.py                headless five-page Streamlit smoke check
+.github/workflows/tests.yml             CI: pure-test subset on every push (workbook tests self-skip)
 requirements.txt
 ```
 
@@ -63,19 +83,25 @@ export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
 python3 tests/test_model.py
 ```
 
-New decision-mode, programme-optimiser and risk-containment suites
-(pytest, added in v2.3-phase1):
+Full pytest suite (decision modes, physical engine, emissions, spread
+option, operating assumptions, risk containment -- 138 tests; ~49 of them
+need the workbook and self-skip without it):
 
 ```bash
 export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
-python -m pytest tests/test_decision_programme.py tests/test_risk_containment.py
+python -m pytest tests/ --ignore=tests/test_model.py
 ```
 
-Headless Streamlit smoke check:
+Headless Streamlit smoke check (all five pages):
 
 ```bash
 python tests/app_smoke_check.py
 ```
+
+CI (`.github/workflows/tests.yml`) runs the pure-test subset (89 tests)
+plus byte-compilation on every push; the workbook-backed tests and the
+frozen 64/64 suite run locally only, since the workbook is proprietary
+and not committed.
 
 `tests/test_model.py` runs head-less against the real workbook (no synthetic
 data, no pytest dependency) and prints a PASS/FAIL line per check plus a
@@ -121,11 +147,14 @@ provisional decision-state thin slice"):
 - Added a UI warning that the legacy 12-cargo VaR/stress/backtest portfolio
   is not a physically feasible one-vessel programme.
 
-This build's programme optimiser still runs on the legacy monthly-strip
-voyage physics -- it is a scheduling-and-decision-state layer on top of the
-existing model, not the segment-level physical rebuild (`IMPROVEMENT_PLAN.md`
-Phase 2). Its absolute programme values are provisional and will be
-re-derived after that rebuild; see `docs/IMPLEMENTATION_STATUS.md`.
+This build's programme optimiser still ran on the legacy monthly-strip
+voyage physics at release. **Since superseded:** `IMPROVEMENT_PLAN.md`
+Phase 2 (the segment-level physical rebuild) is complete, and the three
+non-screen decision modes -- including every programme value -- are now
+valued by the physical engine (`physical.py`/`emissions.py` via
+`decision.py`); the renewal-rate screen alone stays on the legacy formula
+by design. Turnaround days, heel and a first-class speed knob followed.
+See `docs/IMPLEMENTATION_STATUS.md` for the increment-by-increment record.
 
 ## v2.2 re-baseline (13-Jul-2026, after the notes.md external review)
 
@@ -220,9 +249,13 @@ month-boundaries for NG/TTF, consistent with the model's own front-month
 convention; real NG/TTF expiries fall 2-3 business days before month-end, so
 +-2-3 day artefacts around expiry remain even in this mode.
 
-## Out of scope (v1, per spec Section 9)
+## Out of scope (v1, per spec Section 9) -- updated
 
-Margrabe option valuation for the diversion optionality, forward-curve-
-consistent multi-voyage optimisation, Suez/Cape routing, FuelEU, live data
-feeds (the xlsx is the only source; refresh by re-saving it and letting the
-mtime-keyed cache pick it up).
+Originally: Margrabe option valuation, forward-curve-consistent
+multi-voyage optimisation, Suez/Cape routing, FuelEU, live data feeds.
+**Since built:** Margrabe valuation of the JKM-vs-TTF diversion
+optionality (`spread_option.py`, Forward-strip page). Still out of
+scope: multi-vessel/multi-voyage curve-consistent optimisation,
+Suez/Cape routing, FuelEU pricing (explicitly marked `NOT_PRICED` in
+`emissions.py`), and live data feeds (the xlsx is the only source;
+refresh by re-saving it and letting the mtime-keyed cache pick it up).
