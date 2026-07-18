@@ -117,7 +117,7 @@ import json
 
 import pandas as pd
 
-from data import CurveTables
+import data
 
 CURVE_DATE = "__CURVE_DATE__"
 
@@ -157,10 +157,17 @@ def build_hardcoded_tables() -> CurveTables:
         vol = pd.DataFrame(snapshot["vol"]).set_index("months_forward").sort_index()
 
     curve_date = pd.Timestamp(snapshot["curve_date"])
-    tables = CurveTables(
+    # Look up data.CurveTables at CALL time (not a module-level
+    # `from data import CurveTables`) and pass ONLY the required + non-default
+    # fields. On Streamlit Cloud a stale cached `data` module can lag a
+    # deploy; app.py's module-freshness guard reloads `data` in place, and a
+    # call-time lookup then picks up the reloaded class. Leaving
+    # us_netbacks/us_transport/vlsfo/eua at their None defaults means this
+    # never passes a keyword a slightly-older CurveTables lacks (the crash
+    # that motivated this: a pre-vlsfo/eua CurveTables rejecting vlsfo=None).
+    tables = data.CurveTables(
         hh=hh, ttf=ttf, jkm=jkm, fx=fx, charter=charter,
-        us_netbacks=None, us_transport=None, vol=vol,
-        vlsfo=None, eua=None,
+        vol=vol,
         master_dates=pd.DatetimeIndex([curve_date]),
         source=f"built-in hardcoded curve ({snapshot['curve_date']})",
     )

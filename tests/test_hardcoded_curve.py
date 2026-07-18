@@ -82,6 +82,35 @@ def test_strip_runs_on_hardcoded_curve(params_factory):
         assert np.isfinite(df[col].to_numpy(dtype=float)).all()
 
 
+def test_build_is_robust_to_stale_curvetables_without_vlsfo_eua(monkeypatch):
+    """Regression for the deployed crash: Streamlit Cloud held a stale `data`
+    module whose CurveTables predated the vlsfo/eua fields, and the old code
+    passed vlsfo=None/eua=None -> TypeError constructing it. The fix looks up
+    data.CurveTables at CALL time and passes only required/non-default fields,
+    so an older CurveTables shape still builds. Simulate that shape."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class OldCurveTables:  # pre-increment-E: no vlsfo / eua fields
+        hh: object
+        ttf: object
+        jkm: object
+        fx: object
+        charter: object
+        us_netbacks: object = None
+        us_transport: object = None
+        vol: object = None
+        master_dates: object = None
+        warnings: list = dataclasses.field(default_factory=list)
+        source: str = ""
+
+    monkeypatch.setattr(data, "CurveTables", OldCurveTables)
+    tables = hardcoded_curve.build_hardcoded_tables()  # must not raise
+    assert isinstance(tables, OldCurveTables)
+    assert len(tables.master_dates) == 1
+    assert not hasattr(tables, "vlsfo")
+
+
 def test_decision_route_value_runs_on_hardcoded_curve():
     tables = hardcoded_curve.build_hardcoded_tables()
     params = model.operating_default_params()

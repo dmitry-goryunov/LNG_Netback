@@ -49,7 +49,13 @@ st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 # in place, so cross-module references pick up the new code too). Add a
 # sentinel entry whenever app.py starts using a newly added symbol.
 _FRESHNESS_SENTINELS = [
-    (data, "load_volatilities"),
+    # load_vlsfo is data.py's newest export (R6 increment E). Using it --
+    # not the older load_volatilities -- means a Streamlit Cloud process
+    # still holding a pre-increment-E `data` module is detected as stale
+    # and reloaded, so CurveTables regains its vlsfo/eua fields. (A stale
+    # `data` lacking those fields is what crashed hardcoded_curve's
+    # CurveTables construction after the built-in-curve deploy.)
+    (data, "load_vlsfo"),
     (model, "derived_residual_laden_vlsfo"),
     (physical, "vessel_performance_from_params"),
     (emissions, "voyage_emissions"),
