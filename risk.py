@@ -4,6 +4,14 @@ backtest.
 
 No Streamlit import anywhere in this module (mirrors model.py): everything
 here is importable and runnable head-less.
+
+R6 increment C (plan sect 6.C.5/C.6) adds the PHYSICAL-basis VaR/stress
+entry points (historical_var_physical(), _vectorized_reprice_physical(),
+run_stress_tests()'s basis= parameter) alongside the untouched legacy
+ones -- see each function's own docstring for the split. `decision` is
+imported directly (previously reached only transitively through
+cashflows.py) for FirstCargoState typing/defaults; decision.py does not
+import risk.py, so this introduces no cycle.
 """
 
 from __future__ import annotations
@@ -16,9 +24,14 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import decision
 import model
 from model import Params, contract_calendar, fx_curve, snap, phase_for_year, _month_add
-from cashflows import CargoExposure, CashFlow, RiskFactor, legacy_cargo_cashflows, legacy_cargo_quantities
+from cashflows import (
+    CargoExposure, CashFlow, RiskFactor,
+    legacy_cargo_cashflows, legacy_cargo_quantities,
+    physical_cargo_cashflows, physical_cargo_quantities,
+)
 
 # ===========================================================================
 # Section 6 -- Sensitivities
@@ -529,26 +542,25 @@ def _assert_finite_prices(prices: dict, label: str) -> None:
             raise ValueError(f"non-finite {factor.value} price(s) in {label}")
 
 
-def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
-                         charter, params: Params) -> dict:
-    """Numpy-vectorised re-implementation of model.strip's Step 6 maths,
-    batched over all scenarios x all 12 load months at once. Kept
-    numerically identical to model.strip for both frozen legacy and current
-    operating defaults (cross-checked by zero-shock tests) -- exists purely for VaR/backtest
-    performance, since a pure-Python model.strip call per scenario would
-    be ~500x (or, for the backtest tab, ~50,000x) slower.
+def _prepare_scenario_price_arrays(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm,
+                                    base_spot, base_o6, base_o1) -> dict:
+    """Scenario PRICE PREPARATION shared by _vectorized_reprice() (legacy
+    basis) and _vectorized_reprice_physical() (physical basis, R6
+    increment C.5): exp-of-log-returns, the FX curve interpolation
+    producing fx_l, the months/years/phases arrays, and the JKM column
+    mapping producing jkm_L1. Plan sect 2's boundary keeps ALL of this
+    here, never in the cash-flow layer, which only ever consumes
+    already-prepared price matrices.
 
-    R6 increment B: route valuation (eu_cargo/asia_cargo) is delegated to
-    cashflows.legacy_cargo_quantities()/CargoExposure.value_matrix() --
-    the same per-factor decomposition legacy_cargo_cashflows() is pinned
-    against model.strip() in tests/test_cashflows.py -- instead of a
-    third independent copy of the eu_ship/as_ship/margin arithmetic.
-    Scenario PRICE PREPARATION (below: exp-of-log-returns, the FX curve
-    interpolation producing fx_l, the months/phases arrays, the JKM
-    column mapping producing jkm_L1) is UNCHANGED -- plan sect 2's
-    boundary keeps that here, not in the cash-flow layer, which only
-    consumes already-prepared price matrices.
-    """
+    Extracted verbatim out of _vectorized_reprice() (unchanged from
+    increment B) so the physical variant reuses the SAME price
+    preparation instead of a second, independently-drifting copy --
+    increment C.5's explicit instruction: "reuse _vectorized_reprice's
+    price-preparation output against physical quantities". Byte-identical
+    arithmetic to before the extraction; covered by the same tests that
+    already pinned _vectorized_reprice() (frozen 64/64, Gate 4 VaR
+    fixtures, the batched-vs-scalar cross-check in
+    tests/test_risk_containment.py)."""
     D = pd.Timestamp(D)
     F, s = contract_calendar(D)
     n = scen.hh_ret.shape[0]
@@ -575,15 +587,47 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     fx_far = o6_col + (o1_col - o6_col) * ((t_col - 6.0) / 6.0)
     fx_l = np.where(t_col <= 6.0, fx_near, fx_far)   # (n,12)
 
-    cargo = params.cargo_size
-    asia_rt = params.asia_rt_days
-    asia_bo = params.boil_off_rate * params.asia_laden_days
-
     # HH(L), TTF(L) for month i use column i; JKM(L+1) uses column i+2-s-1 (0-based)
     hh_L = hh_scen[:, 0:12] if hh_scen.shape[1] >= 12 else np.pad(hh_scen, ((0, 0), (0, 12 - hh_scen.shape[1])))
     ttf_L = ttf_scen[:, 0:12] if ttf_scen.shape[1] >= 12 else np.pad(ttf_scen, ((0, 0), (0, 12 - ttf_scen.shape[1])))
     jkm_cols_idx = np.array([i + 1 - s for i in range(12)])  # 0-based
     jkm_L1 = jkm_scen[:, jkm_cols_idx]
+
+    return dict(n=n, years=years, phases=phases, hh_L=hh_L, ttf_L=ttf_L, jkm_L1=jkm_L1, fx_l=fx_l)
+
+
+def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
+                         charter, params: Params) -> dict:
+    """Numpy-vectorised re-implementation of model.strip's Step 6 maths,
+    batched over all scenarios x all 12 load months at once. Kept
+    numerically identical to model.strip for both frozen legacy and current
+    operating defaults (cross-checked by zero-shock tests) -- exists purely for VaR/backtest
+    performance, since a pure-Python model.strip call per scenario would
+    be ~500x (or, for the backtest tab, ~50,000x) slower.
+
+    R6 increment B: route valuation (eu_cargo/asia_cargo) is delegated to
+    cashflows.legacy_cargo_quantities()/CargoExposure.value_matrix() --
+    the same per-factor decomposition legacy_cargo_cashflows() is pinned
+    against model.strip() in tests/test_cashflows.py -- instead of a
+    third independent copy of the eu_ship/as_ship/margin arithmetic.
+    Scenario PRICE PREPARATION is UNCHANGED -- plan sect 2's boundary
+    keeps that here, not in the cash-flow layer, which only consumes
+    already-prepared price matrices.
+
+    R6 increment C.5: the price-preparation block now lives in the shared
+    _prepare_scenario_price_arrays() helper (also used by
+    _vectorized_reprice_physical()) -- this function's OWN signature,
+    behaviour and every returned number are unchanged by that extraction
+    (verified: frozen 64/64, Gate 4 VaR fixtures, and the batched-vs-
+    scalar cross-check all stayed green with no tolerance change).
+    """
+    prep = _prepare_scenario_price_arrays(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1)
+    n, years = prep["n"], prep["years"]
+    hh_L, ttf_L, jkm_L1, fx_l = prep["hh_L"], prep["ttf_L"], prep["jkm_L1"], prep["fx_l"]
+
+    cargo = params.cargo_size
+    asia_rt = params.asia_rt_days
+    asia_bo = params.boil_off_rate * params.asia_laden_days
 
     # --- Route valuation (R6 increment B): the proc/ttf_usd/eu_ship/
     # as_ship/ets/eu_margin/asia_margin arithmetic that used to live here
@@ -656,6 +700,67 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
 
     return dict(eu_cargo=eu_cargo, asia_cargo=asia_cargo, jkm_star=jkm_star, jkm_L1=jkm_L1,
                 verdict_asia=verdict_asia, hh_L=hh_L, ttf_L=ttf_L, fx_l=fx_l)
+
+
+def _vectorized_reprice_physical(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
+                                  charter, params: Params,
+                                  first_cargo_state: Optional[decision.FirstCargoState] = None) -> dict:
+    """Physical-basis counterpart of _vectorized_reprice() (R6 increment
+    C.5, plan sect 6.C.5): identical scenario PRICE PREPARATION
+    (delegated to the SAME _prepare_scenario_price_arrays() helper --
+    "reuse _vectorized_reprice's price-preparation output against
+    physical quantities" is the plan's own wording), but each month's
+    exposure comes from cashflows.physical_cargo_quantities() instead of
+    legacy_cargo_quantities(), so first_cargo_state's sunk-cost zeroing
+    (C.2) is live and fuel/delivered/EUA quantities are the physical
+    engine's real per-segment mass balance rather than the flat legacy
+    formula. _vectorized_reprice() itself is untouched by this function's
+    existence -- same signature, same behaviour (frozen 64/64 green).
+
+    Returns only eu_cargo/asia_cargo/hh_L/ttf_L/jkm_L1/fx_l -- no
+    jkm_star/verdict_asia: 12-cargo verdict-switching is a LEGACY-basis-
+    only concept (plan sect 8.3, "12cargo stays legacy-basis-only");
+    physical basis supports single/spread only for now, neither of which
+    needs a verdict."""
+    prep = _prepare_scenario_price_arrays(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1)
+    n, years = prep["n"], prep["years"]
+    hh_L, ttf_L, jkm_L1, fx_l = prep["hh_L"], prep["ttf_L"], prep["jkm_L1"], prep["fx_l"]
+
+    charter_arr = np.full(n, charter, dtype=float)
+    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
+
+    eu_cargo = np.empty((n, 12), dtype=float)
+    asia_cargo = np.empty((n, 12), dtype=float)
+
+    for i in range(12):
+        eu_flows = physical_cargo_quantities(params, "Europe", int(years[i]), first_cargo_state=first_cargo_state)
+        asia_flows = physical_cargo_quantities(params, "Asia", int(years[i]), first_cargo_state=first_cargo_state)
+        _assert_finite_quantities(eu_flows, f"Europe month {i} physical cash-flow quantities")
+        _assert_finite_quantities(asia_flows, f"Asia month {i} physical cash-flow quantities")
+
+        eu_exposure = CargoExposure(route="Europe", month_index=i, cash_flows=eu_flows)
+        asia_exposure = CargoExposure(route="Asia", month_index=i, cash_flows=asia_flows)
+
+        eu_prices = {
+            RiskFactor.TTF: ttf_L[:, i],
+            RiskFactor.FX: fx_l[:, i],
+            RiskFactor.HH: hh_L[:, i],
+            RiskFactor.CHARTER: charter_arr,
+            RiskFactor.VLSFO: vlsfo_arr,
+        }
+        asia_prices = {
+            RiskFactor.JKM: jkm_L1[:, i],
+            RiskFactor.HH: hh_L[:, i],
+            RiskFactor.CHARTER: charter_arr,
+            RiskFactor.VLSFO: vlsfo_arr,
+        }
+        _assert_finite_prices(eu_prices, f"Europe month {i} physical scenario prices")
+        _assert_finite_prices(asia_prices, f"Asia month {i} physical scenario prices")
+
+        eu_cargo[:, i] = eu_exposure.value_matrix(eu_prices)
+        asia_cargo[:, i] = asia_exposure.value_matrix(asia_prices)
+
+    return dict(eu_cargo=eu_cargo, asia_cargo=asia_cargo, hh_L=hh_L, ttf_L=ttf_L, jkm_L1=jkm_L1, fx_l=fx_l)
 
 
 @dataclass
@@ -784,6 +889,82 @@ def historical_var(D, tables, params: Params, portfolio: str = "12cargo", month_
                       portfolio=portfolio, scen=scen)
 
 
+def historical_var_physical(D, tables, params: Params, portfolio: str = "single", month_index: int = 0,
+                             basin: str = "Europe", lookback: int = 500, method: str = "naive",
+                             scen: Optional[ScenarioSet] = None,
+                             first_cargo_state: Optional[decision.FirstCargoState] = None) -> VarResult:
+    """Physical-basis variant of historical_var() (R6 increment C.5, plan
+    sect 6.C.5): same historical-simulation machinery (build/reuse a
+    ScenarioSet, reprice every scenario, VaR/ES/sd off the resulting P&L
+    vector), but exposures come from
+    cashflows.physical_cargo_quantities()/physical_cargo_cashflows()
+    instead of the legacy formula, so first_cargo_state's sunk-cost
+    zeroing (C.2) is live and the BASE value matches
+    decision.route_value(..., first_cargo_state=first_cargo_state)
+    .incremental_value -- NOT model.strip()'s eu_cargo/asia_cargo -- to
+    <= $0.01 (tests/test_physical_cashflows.py's zero-shock test, same
+    R1-style construction: a zero-return ScenarioSet must reprice to
+    ~$0 P&L against this function's own base).
+
+    portfolio: "single" or "spread" ONLY (plan sect 8.3: 12cargo has no
+    physical-basis equivalent -- it is both an infeasible one-vessel
+    portfolio and fixture-bound to the legacy basis; programme arrives in
+    increment D). "hedged" is not supported either -- the Section 7
+    mechanical hedge legs are themselves legacy-formula-derived
+    (hedge_legs_from_exposure() is increment F).
+
+    A NEW function rather than a `basis=` parameter bolted onto
+    historical_var() itself, per the plan's explicit instruction to
+    extend risk.py "without changing the legacy path's behaviour or
+    signatures" -- historical_var() is untouched by this increment,
+    byte-for-byte (same source, same tests, same frozen 64/64).
+    """
+    if portfolio not in ("single", "spread"):
+        raise ValueError(
+            f"physical-basis VaR supports portfolio 'single' or 'spread' only (got {portfolio!r}); "
+            "12cargo is legacy-basis-only (infeasible one-vessel portfolio, fixture-bound -- plan "
+            "sect 8.3) and hedged/programme are not yet wired to the physical basis"
+        )
+    D = pd.Timestamp(D)
+    if scen is None:
+        scen = build_scenarios(tables, D, lookback=lookback, method=method)
+
+    hh_row = snap(tables.hh, D)
+    ttf_row = snap(tables.ttf, D)
+    jkm_row = snap(tables.jkm, D)
+    fx_row = snap(tables.fx, D)
+    ch_row = snap(tables.charter, D)
+    charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
+
+    base_hh = hh_row[[f"c{i}" for i in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+    base_ttf = ttf_row[[f"c{i}" for i in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+    base_jkm = jkm_row[[f"c{i}" for i in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+    base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
+
+    base_eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state)
+    base_asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state)
+    base_eu_val = base_eu.value(base_eu.base_prices)
+    base_asia_val = base_asia.value(base_asia.base_prices)
+
+    scen_vals = _vectorized_reprice_physical(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
+                                              charter, params, first_cargo_state=first_cargo_state)
+
+    if portfolio == "single":
+        base_val = base_eu_val if basin == "Europe" else base_asia_val
+        col = "eu_cargo" if basin == "Europe" else "asia_cargo"
+        scen_val = scen_vals[col][:, month_index]
+        pnl = scen_val - base_val
+
+    else:  # spread
+        base_val = base_asia_val - base_eu_val
+        scen_val = scen_vals["asia_cargo"][:, month_index] - scen_vals["eu_cargo"][:, month_index]
+        pnl = scen_val - base_val
+
+    var95, var99, es95, es99, sd = _var_es(pnl)
+    return VarResult(pnl=pnl, var95=var95, var99=var99, es95=es95, es99=es99, sd=sd, n=len(pnl),
+                      portfolio=portfolio, scen=scen)
+
+
 def scale_to_horizon(var_1d: float, days: int = 10, method: str = "sqrt", scen: Optional[ScenarioSet] = None,
                       tables=None, D=None, params=None, portfolio="12cargo", month_index=0, basin="Europe",
                       scenario_method: str = "naive") -> float:
@@ -857,44 +1038,125 @@ def stress_historical_replay(D, tables, params: Params, replay_date: str) -> dic
     return dict(name=f"Replay {replay_date.date()} move", pnl_12cargo=r12.pnl[0], pnl_m1_spread=rspread.pnl[0])
 
 
-def run_stress_tests(D, tables, params: Params) -> pd.DataFrame:
+def run_stress_tests(D, tables, params: Params, basis: str = "legacy",
+                      first_cargo_state: Optional[decision.FirstCargoState] = None) -> pd.DataFrame:
     """Section 8 'Stress tests': deterministic scenarios, reported as
-    12-cargo strip and M1 diversion-spread P&L versus base."""
+    12-cargo strip and M1 diversion-spread P&L versus base.
+
+    R6 increment C.6 (plan sect 6.C.6): basis-aware.
+
+    basis="legacy" (the default -- every call site that predates this
+    increment keeps it implicitly) reproduces every number BYTE-FOR-BYTE
+    from before this increment: the three deterministic-shock branches
+    below are the exact code that was here previously, untouched, just
+    reached via an if/else instead of unconditionally. Regression-pinned
+    in tests/test_physical_cashflows.py (stress is not part of the frozen
+    64, so this increment pins it itself, per the plan's instruction).
+
+    basis="physical" re-evaluates the THREE DETERMINISTIC shocks (Panama
+    congestion, JKM +2.6, EUA bump) against
+    cashflows.physical_cargo_cashflows() instead of model.strip(), with
+    first_cargo_state's sunk-cost zeroing (C.2) applied to month 0's
+    cargo. pnl_m1_spread reflects the physical Asia-minus-Europe spread
+    under each shock; pnl_12cargo is NaN ("n/a" -- 12cargo has no
+    physical-basis equivalent, plan sect 8.3: it is both an infeasible
+    one-vessel portfolio and fixture-bound to the legacy basis).
+
+    The THREE historical-REPLAY rows stay legacy/strip-based on EITHER
+    basis -- both pnl columns come back NaN with a "n/a" note under
+    basis="physical" rather than silently showing a legacy number under
+    a "Physical" toggle. Judged disproportionate to port for this
+    increment (decision recorded in the implementation report): each
+    replay row's pnl_12cargo has no physical analogue either (same
+    reason as the deterministic shocks), and porting just the spread half
+    would mean duplicating stress_historical_replay()'s one-scenario
+    ScenarioSet construction into a second, physical-basis code path for
+    a single extra column across three rows out of six -- a
+    disproportionate amount of new repricing machinery for this
+    increment's marginal value; historical_var_physical() (C.5) already
+    gives a caller who wants a physical-basis historical-replay number
+    the building blocks to construct one directly.
+    """
+    if basis not in ("legacy", "physical"):
+        raise ValueError(f"unknown basis {basis!r} (expected 'legacy' or 'physical')")
+
     base = model.strip(D, tables, params)
     base_12 = np.where(base["verdict"] == "Asia", base["asia_cargo"], base["eu_cargo"]).sum()
     base_spread_m1 = base.iloc[0]["asia_cargo"] - base.iloc[0]["eu_cargo"]
 
+    def _physical_spread(shock_params: Params) -> float:
+        eu = physical_cargo_cashflows(D, tables, shock_params, 0, "Europe", first_cargo_state)
+        asia = physical_cargo_cashflows(D, tables, shock_params, 0, "Asia", first_cargo_state)
+        return asia.value(asia.base_prices) - eu.value(eu.base_prices)
+
+    base_spread_phys = _physical_spread(params) if basis == "physical" else None
+
     rows = []
     for rd in STRESS_REPLAY_DATES:
+        if basis == "physical":
+            rows.append(dict(
+                scenario=f"Replay {rd} move", pnl_12cargo=np.nan, pnl_m1_spread=np.nan,
+                note="n/a under physical basis -- historical-replay rows stay legacy/strip-based (plan sect 6.C.6)",
+            ))
+            continue
         try:
             r = stress_historical_replay(D, tables, params, rd)
             rows.append(dict(scenario=r["name"], pnl_12cargo=r["pnl_12cargo"], pnl_m1_spread=r["pnl_m1_spread"]))
         except Exception as e:
             rows.append(dict(scenario=f"Replay {rd} move", pnl_12cargo=np.nan, pnl_m1_spread=np.nan, note=str(e)))
 
+    # --- Panama congestion (Asia RT 54.7d) ---
     p2 = copy.deepcopy(params)
     p2.asia_rt_days = model.ASIA_RT_CONG
-    s = model.strip(D, tables, p2)
-    val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
-    rows.append(dict(scenario="Panama congestion (Asia RT 54.7d)", pnl_12cargo=val12 - base_12,
-                      pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    if basis == "legacy":
+        s = model.strip(D, tables, p2)
+        val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
+        rows.append(dict(scenario="Panama congestion (Asia RT 54.7d)", pnl_12cargo=val12 - base_12,
+                          pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    else:
+        rows.append(dict(scenario="Panama congestion (Asia RT 54.7d)", pnl_12cargo=np.nan,
+                          pnl_m1_spread=_physical_spread(p2) - base_spread_phys,
+                          note="pnl_12cargo n/a under physical basis (plan sect 8.3)"))
 
-    t2 = copy.deepcopy(tables)
-    t2.jkm = t2.jkm.copy()
-    jkm_cols = [c for c in t2.jkm.columns if c.startswith("c")]
-    row_date = snap(t2.jkm, D)["date"]
-    t2.jkm.loc[t2.jkm["date"] == row_date, jkm_cols] += 2.6
-    s = model.strip(D, t2, params)
-    val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
-    rows.append(dict(scenario="JKM +2.6 $/MMBtu (13-Jul-2026 Hormuz repricing)", pnl_12cargo=val12 - base_12,
-                      pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    # --- JKM +2.6 $/MMBtu ---
+    if basis == "legacy":
+        t2 = copy.deepcopy(tables)
+        t2.jkm = t2.jkm.copy()
+        jkm_cols = [c for c in t2.jkm.columns if c.startswith("c")]
+        row_date = snap(t2.jkm, D)["date"]
+        t2.jkm.loc[t2.jkm["date"] == row_date, jkm_cols] += 2.6
+        s = model.strip(D, t2, params)
+        val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
+        rows.append(dict(scenario="JKM +2.6 $/MMBtu (13-Jul-2026 Hormuz repricing)", pnl_12cargo=val12 - base_12,
+                          pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    else:
+        # A genuine factor-PRICE bump (unlike the other two shocks, which
+        # are QUANTITY-level Params changes): the same base exposures,
+        # evaluated at JKM+2.6 instead of base JKM. Europe never
+        # references JKM, so it is algebraically unaffected -- matching
+        # the legacy shock's own Europe-invariance (eu_cargo is untouched
+        # by a JKM-only table bump there too).
+        base_eu = physical_cargo_cashflows(D, tables, params, 0, "Europe", first_cargo_state)
+        base_asia = physical_cargo_cashflows(D, tables, params, 0, "Asia", first_cargo_state)
+        bumped_asia_prices = dict(base_asia.base_prices)
+        bumped_asia_prices[RiskFactor.JKM] = bumped_asia_prices[RiskFactor.JKM] + 2.6
+        new_spread = base_asia.value(bumped_asia_prices) - base_eu.value(base_eu.base_prices)
+        rows.append(dict(scenario="JKM +2.6 $/MMBtu (13-Jul-2026 Hormuz repricing)", pnl_12cargo=np.nan,
+                          pnl_m1_spread=new_spread - base_spread_phys,
+                          note="pnl_12cargo n/a under physical basis (plan sect 8.3)"))
 
+    # --- EUA EUR70 -> EUR120/t ---
     p2 = copy.deepcopy(params)
     p2.eua_price = 120.0
-    s = model.strip(D, tables, p2)
-    val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
-    rows.append(dict(scenario="EUA EUR70 -> EUR120/t", pnl_12cargo=val12 - base_12,
-                      pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    if basis == "legacy":
+        s = model.strip(D, tables, p2)
+        val12 = np.where(s["verdict"] == "Asia", s["asia_cargo"], s["eu_cargo"]).sum()
+        rows.append(dict(scenario="EUA EUR70 -> EUR120/t", pnl_12cargo=val12 - base_12,
+                          pnl_m1_spread=(s.iloc[0]["asia_cargo"] - s.iloc[0]["eu_cargo"]) - base_spread_m1))
+    else:
+        rows.append(dict(scenario="EUA EUR70 -> EUR120/t", pnl_12cargo=np.nan,
+                          pnl_m1_spread=_physical_spread(p2) - base_spread_phys,
+                          note="pnl_12cargo n/a under physical basis (plan sect 8.3)"))
 
     return pd.DataFrame(rows)
 

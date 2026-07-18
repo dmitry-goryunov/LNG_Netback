@@ -442,3 +442,44 @@ engine work specifically.
   order of magnitude (isolated repricer ~2.5x slower pending the
   increment-C quantities cache; dominated in practice by untouched
   scenario-building/pandas costs).
+
+- **R6 increment C: physical basis for VaR/stress (18-Jul-2026):** same
+  Sonnet-implements / independent-review workflow (this increment
+  survived a mid-run session-limit interruption and was resumed from
+  transcript). `cashflows.py` gains the physical counterpart:
+  `physical_cargo_quantities(params, route, year, first_cargo_state)`
+  decomposes `decision.py`'s physical route valuation onto the factor
+  set from the engine's own ledger (charter = `total_days`, bunkers =
+  net purchased `total_liquid_fuel_tonnes` post-reliquefaction/heel
+  substitution, ETS = per-segment-scope CO2e, heel as its own
+  negative cash flow at destination price), pinned against
+  `decision.route_value().incremental_value` across a 144-case sweep
+  (2 params x 12 months x 2 routes x 3 states) at worst ~2.2e-8.
+  Headline: **exposure follows first-cargo state** -- sunk procurement
+  zeroes the HH quantity (plus liquefaction/pipeline constant; sunk
+  loading zeroes the loading fee), with a semantic test proving sunk
+  procurement genuinely narrows VaR. Both quantity producers now sit
+  behind a bounded, field-value-keyed (never identity) LRU cache with
+  hit/miss/in-place-mutation/year-boundary-poison tests. `risk.py`
+  extracts `_prepare_scenario_price_arrays()` (shared price prep, no
+  second drifting copy -- extraction pinned by a dedicated test), adds
+  `_vectorized_reprice_physical()` and `historical_var_physical()`
+  (single/spread only; 12cargo stays legacy-basis-only per plan
+  sect 8.3), and `run_stress_tests()` gains an additive `basis=` param
+  whose legacy default is bit-compatible (pinned to captured
+  pre-increment constants). VaR page gets the "Value basis" radio
+  (legacy default), a first-cargo-state selector, basis captions, and
+  honest disabling of backtest/overlapping-10d under the physical
+  basis. Legacy-vs-physical base gaps characterised, not reconciled:
+  legacy params Europe -0.075% (per-segment ETS scope), operating
+  Europe -1.70% / Asia -1.08% (heel + ETS), legacy Asia ~$1.
+  **Correction to the increment-B note above:** C's measurements show
+  the quantity cache is performance-neutral at backtest level (~0.99s
+  vs ~0.98s uncached; B's 3.47s baseline was not reproducible, ~1.5s
+  measured pre-cache) -- the isolated repricer cost lives in
+  `value_matrix`'s per-CashFlow Python evaluation, not in quantity
+  building, so the cache (still structurally required by the plan and
+  fully tested) does not recover it. Validation: pytest 274/274 with
+  workbook (163 + 111 new), frozen 64/64, CI simulation 162/112-skip,
+  seven smoke checks (new basis-toggle check added) -- all
+  independently re-run at review.

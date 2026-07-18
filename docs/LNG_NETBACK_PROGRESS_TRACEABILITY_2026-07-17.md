@@ -154,21 +154,32 @@ F exposure-derived hedges → G contract-ID backtest + uncertainty →
 H close-out.
 
 - R6.1 Generate canonical cash flows from deterministic valuation. —
-  **IN PROGRESS:** increment A landed 17-Jul-2026 (`cashflows.py` +
-  16 pinning tests; legacy-basis decomposition parity vs `model.strip()`
-  ~1e-8 worst error, all six deltas derived from quantities; built by a
-  Sonnet implementation agent, independently reviewed and full battery
-  re-run before commit). Physical-basis decomposition lands in
-  increment C.
-- R6.2 Cache physical coefficients.
-- R6.3 Vectorise only the price-dependent tail. — **IN PROGRESS
-  (legacy basis DONE):** increment B landed 18-Jul-2026.
-  `risk._vectorized_reprice()` and `risk.analytic_deltas()` now consume
-  `cashflows.legacy_cargo_quantities()` / `quantity_on()`; ~40 lines of
-  duplicated route arithmetic deleted, scenario price preparation kept
-  in risk.py per the plan boundary, `asia_cost_exbo` recovered
-  algebraically (verified ~1e-14 vs bumped `model.strip()` oracles).
-  Frozen 64/64 held throughout. Physical basis lands in increment C.
+  **VERIFIED:** increment A landed 17-Jul-2026 (legacy decomposition,
+  parity vs `model.strip()` ~1e-8, all six deltas derived from
+  quantities); increment C landed 18-Jul-2026 (physical decomposition
+  from the voyage ledger, parity vs `decision.route_value()` ~2.2e-8
+  across 144 cases incl. congested Asia + heel, exposure follows
+  first-cargo state). Both built by Sonnet implementation agents,
+  independently reviewed with full battery re-runs before commit.
+- R6.2 Cache physical coefficients. — **VERIFIED** (increment C,
+  18-Jul-2026): bounded LRU keyed on Params FIELD VALUES (never object
+  identity -- app.py mutates one instance in place) + route/state/year,
+  covering both legacy and physical quantity producers; hit/miss/
+  mutation/year-boundary-poison all tested. Measured performance-neutral
+  at backtest level -- the repricer's residual cost lives in per-CashFlow
+  evaluation, not quantity building (recorded honestly; earlier
+  increment-B prediction corrected).
+- R6.3 Vectorise only the price-dependent tail. — **VERIFIED:**
+  increment B (legacy, 18-Jul-2026): `_vectorized_reprice()` and
+  `analytic_deltas()` consume the cash-flow layer, ~40 lines of
+  duplicated route arithmetic deleted, `asia_cost_exbo` recovered
+  algebraically (~1e-14 vs bumped `model.strip()` oracles). Increment C
+  (physical, 18-Jul-2026): shared `_prepare_scenario_price_arrays()`
+  extraction (pinned by a dedicated regression test),
+  `_vectorized_reprice_physical()` + `historical_var_physical()`
+  (single/spread; zero-shock <= $0.01 per state), basis-aware
+  `run_stress_tests()` with bit-compatible legacy default, VaR-page
+  basis toggle. Frozen 64/64 held throughout both increments.
 - R6.4 Use delivery-contract IDs.
 - R6.5 Add VLSFO and EUA risk factors.
 - R6.6 Add physical basis factors.

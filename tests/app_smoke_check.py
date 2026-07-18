@@ -99,3 +99,31 @@ assert hasattr(stale_app.session_state["params"], "heel_fraction"), \
 assert any("predated" in i.value for i in stale_app.info), \
     "resetting a stale session should tell the user why their inputs changed"
 print("PASS stale-session guard: old-shaped params reset cleanly, no crash")
+
+# R6 increment C.5: the VaR page's "Value basis" toggle. Navigate the main
+# AppTest instance back to the VaR page, flip the basis radio to Physical
+# engine, and assert the physical-basis surface renders: no exception, the
+# basis-disclosure caption appears, the portfolio list narrows to
+# single/spread only (plan sect 8.3 -- no 12cargo, no hedged), and the
+# first-cargo-state selector shows up. (The stress table's replay-row n/a
+# marking is pinned by tests/test_physical_cashflows.py's stress group,
+# not here.)
+page = next(widget for widget in app.sidebar.radio if widget.label == "Page")
+page.set_value("4 VaR & stress")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+basis = next(w for w in app.radio if w.label == "Value basis")
+assert basis.value == "Legacy strip (frozen)", "legacy must stay the default basis"
+basis.set_value("Physical engine")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+assert any("physical engine" in c.value for c in app.caption), \
+    "physical basis must render its basis-disclosure caption"
+portfolio_box = next(s for s in app.selectbox if s.label == "Portfolio")
+assert len(portfolio_box.options) == 3, \
+    f"physical basis portfolio list must be single Europe/Asia + spread only, got {portfolio_box.options}"
+assert not any("12-cargo" in o for o in portfolio_box.options), \
+    "12cargo must not be selectable under the physical basis (plan sect 8.3)"
+assert any(w.label == "Current cargo state" for w in app.radio), \
+    "physical basis must surface the Decision page's first-cargo-state selector"
+print("PASS var page: physical basis toggle renders, portfolio list narrowed, state selector present")

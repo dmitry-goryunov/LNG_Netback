@@ -35,10 +35,29 @@ legacy_cargo_cashflows()'s quantity_on() calls -- both replacing what
 used to be independently duplicated day-count/fuel arithmetic in
 risk.py. model.strip() itself is untouched (still the ground truth
 legacy_cargo_cashflows() is pinned against).
+
+Increment C (R6.1/R6.2/R6.4, plan sect 6.C) adds the PHYSICAL-engine
+counterpart: `physical_cargo_quantities()`/`physical_cargo_cashflows()`
+decompose decision.py's physical route valuation (decision._physical_
+route_breakdown(), the same function that already drives the Decision
+page) onto this module's factor set, one route at a time (unlike the
+legacy pair-returning functions -- decision.py's own physical machinery
+is one-route-at-a-time, e.g. _physical_route_value(row, params, route),
+and this mirrors that shape). Importing decision.py (and, transitively,
+physical.py/emissions.py) is fine here for the same reason importing
+model.py always was: all four are pure, headless modules with no
+Streamlit import -- decision.py does not import risk.py or this module,
+so there is no import cycle. Both quantity producers now share a
+Params-hash-keyed cache (see _BoundedParamsCache) -- this module stays
+free of Streamlit, but is no longer free of module-level mutable state:
+the cache is a pure performance optimisation (same inputs always produce
+equal outputs, cached or not), not a source of nondeterminism.
 """
 
 from __future__ import annotations
 
+import dataclasses
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional
@@ -46,6 +65,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import decision
+import emissions
+import physical
 from model import Params, contract_calendar, fx_curve, phase_for_year, snap, _month_add
 
 
@@ -159,6 +181,99 @@ def _normalized(factors: tuple[RiskFactor, ...]) -> tuple[RiskFactor, ...]:
     return tuple(sorted(factors, key=lambda f: f.name))
 
 
+# ===========================================================================
+# Increment C (plan sect 2, C.4): Params-hash-keyed QUANTITY-layer cache,
+# shared by legacy_cargo_quantities() and physical_cargo_quantities(). Not
+# used by the D-dependent ASSEMBLY wrappers (legacy_cargo_cashflows(),
+# physical_cargo_cashflows()) -- assembly (snap, phase-by-year selection,
+# base_prices, tenor) is cheap arithmetic that must be redone every call,
+# never cached (plan sect 2's "backtest-poison" warning: a single
+# Params-only cache of ASSEMBLED cash flows would serve a stale ETS phase
+# as a backtest walks D across a year boundary).
+# ===========================================================================
+
+_QUANTITY_CACHE_MAXSIZE = 256
+
+
+class _BoundedParamsCache:
+    """LRU-eviction cache keyed by hashable tuples built from Params FIELD
+    VALUES (see _params_field_key()), never object identity -- app.py
+    mutates one Params instance in place across Streamlit reruns, so an
+    identity-/id()-keyed cache would keep serving quantities computed
+    before the mutation. `functools.lru_cache` can't decorate
+    legacy_cargo_quantities()/physical_cargo_quantities() directly because
+    Params is a plain (unfrozen) dataclass with no __hash__; the caller
+    builds the hashable key explicitly instead and looks it up here.
+
+    Bounded (not a plain unbounded dict) so a long-lived session that
+    sweeps through many sidebar edits -- each producing a new field-value
+    key -- doesn't grow this without limit; old entries are evicted
+    least-recently-used. hits/misses mirror functools.lru_cache's own
+    cache_info() convention, for test/debug introspection only (see
+    quantity_cache_info() below) -- production code never reads them."""
+
+    def __init__(self, maxsize: int = _QUANTITY_CACHE_MAXSIZE):
+        self._maxsize = maxsize
+        self._store: "OrderedDict[tuple, object]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: tuple):
+        try:
+            value = self._store[key]
+        except KeyError:
+            self.misses += 1
+            return None
+        self._store.move_to_end(key)
+        self.hits += 1
+        return value
+
+    def set(self, key: tuple, value) -> None:
+        self._store[key] = value
+        self._store.move_to_end(key)
+        if len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        self._store.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def info(self) -> dict:
+        return dict(hits=self.hits, misses=self.misses, maxsize=self._maxsize, currsize=len(self._store))
+
+
+_legacy_quantity_cache = _BoundedParamsCache()
+_physical_quantity_cache = _BoundedParamsCache()
+
+
+def _params_field_key(params: Params) -> tuple:
+    """Hashable cache key built from Params FIELD VALUES, in
+    dataclasses.fields() order -- never object identity (see
+    _BoundedParamsCache's docstring: app.py mutates a single Params
+    instance in place, so identity would serve stale quantities the
+    instant any field changed without the object itself being replaced).
+    Every Params field is a plain float/str/None scalar (verified against
+    model.Params' current definition -- no list/dict fields), so the
+    tuple is directly hashable with no further normalisation."""
+    return tuple(getattr(params, f.name) for f in dataclasses.fields(params))
+
+
+def quantity_cache_info() -> dict:
+    """cache_info()-style introspection (mirrors functools.lru_cache's own
+    convention) for both Params-hash-keyed quantity caches. Test/debug
+    visibility only -- no production code path reads this."""
+    return dict(legacy=_legacy_quantity_cache.info(), physical=_physical_quantity_cache.info())
+
+
+def clear_quantity_caches() -> None:
+    """Empties both quantity caches and resets their hit/miss counters.
+    Not needed in production (bounded LRU eviction keeps memory in check
+    on its own); exists so a test can start from a guaranteed-cold cache."""
+    _legacy_quantity_cache.clear()
+    _physical_quantity_cache.clear()
+
+
 def _snap_month_prices(D, tables, params: Params, month_index: int) -> dict:
     """Step 1-3 snap/contract-calendar/fx setup for ONE load month, built
     from model.py's own public snap()/contract_calendar()/fx_curve()/
@@ -243,7 +358,38 @@ def legacy_cargo_quantities(params: Params, load_month_year: int) -> tuple[list[
     Returns (europe_cash_flows, asia_cash_flows) -- bare lists, not yet
     wrapped in a CargoExposure (no route/month_index/base_prices
     metadata attached; see legacy_cargo_cashflows()).
+
+    Increment C (plan sect 2/C.4): Params-hash-keyed cache (recovers
+    increment B's isolated ~2.5x repricer regression -- this function used
+    to be rebuilt from scratch on every call regardless of whether the
+    same (params, year) pair had already been seen; a backtest calls
+    risk.historical_var() -- and hence, via _vectorized_reprice(), this --
+    up to ~2,000 times per run against an UNCHANGED params, most of them
+    revisiting one of at most 12 distinct years). The key includes
+    load_month_year alongside the Params field values (_params_field_key())
+    so a backtest walking D across a year boundary still recomputes on the
+    NEW year's ETS phase instead of serving a stale phase from a warm
+    cache keyed on params alone (the "backtest-poison" scenario the plan
+    flags -- tests/test_physical_cashflows.py proves this holds for both
+    this function and physical_cargo_quantities()). Returns fresh list
+    objects on every call (a shallow copy of the cached lists) so a
+    caller mutating its own returned list in place can never corrupt a
+    cache entry; the CashFlow objects themselves are frozen, so sharing
+    references to THEM across calls is safe.
     """
+    key = (_params_field_key(params), load_month_year)
+    cached = _legacy_quantity_cache.get(key)
+    if cached is not None:
+        return list(cached[0]), list(cached[1])
+    result = _legacy_cargo_quantities_impl(params, load_month_year)
+    _legacy_quantity_cache.set(key, result)
+    return list(result[0]), list(result[1])
+
+
+def _legacy_cargo_quantities_impl(params: Params, load_month_year: int) -> tuple[list[CashFlow], list[CashFlow]]:
+    """Uncached body of legacy_cargo_quantities() -- see that function's
+    docstring for the full per-factor derivation and the caching
+    contract; this is the arithmetic increment B moved here verbatim."""
     cargo = params.cargo_size
     bo = params.boil_off_rate
     load_days = params.loading_days
@@ -360,3 +506,286 @@ def legacy_cargo_cashflows(D, tables, params: Params,
     )
 
     return europe, asia
+
+
+# ===========================================================================
+# Increment C (R6.1/R6.2, plan sect 6.C): the PHYSICAL-engine counterpart.
+# decision.py's own physical machinery is one-route-at-a-time
+# (route_value(), _physical_route_value(), _physical_route_breakdown()
+# all take a single `route` string), so physical_cargo_quantities()/
+# physical_cargo_cashflows() mirror THAT shape rather than the legacy
+# pair-returning functions above.
+# ===========================================================================
+
+
+def physical_cargo_quantities(
+    params: Params, route: str, load_month_year: int,
+    first_cargo_state: Optional["decision.FirstCargoState"] = None,
+) -> list[CashFlow]:
+    """Price-independent half of the PHYSICAL decomposition (plan sect
+    6.C.1/C.2/C.4): a pure function of `params`, `route` ("Europe"/"Asia",
+    aliases accepted via decision._normalise_route()) and the load
+    month's calendar YEAR (ETS phase, same reason as
+    legacy_cargo_quantities()) and `first_cargo_state` (C.2, sunk-cost
+    zeroing) only. No `tables`, no `D`, no month_index -- same
+    Params-hash-cacheable shape as legacy_cargo_quantities(), so
+    risk.py's physical repricer gets the identical "build once per call,
+    reuse across every scenario" performance property (plan sect 2).
+
+    SOURCE: reconstructs the SAME physical.py/emissions.py call sequence
+    decision._physical_route_breakdown() makes internally
+    (vessel_performance_from_params() -> europe_route_segments()/
+    asia_route_segments() -> run_voyage() -> voyage_emissions()) --
+    verbatim, not an independent re-derivation -- because
+    _physical_route_breakdown() itself is ROW-coupled (it takes a priced
+    strip_df row) and therefore cannot be Params-only cacheable; this
+    function exists to give the physical valuation the SAME two-layer
+    split legacy already has. Numerically verified (not just derived on
+    paper) against decision.route_value(...).incremental_value across
+    both parameter sets, both routes, congested Asia (queue/
+    reliquefaction) and all three first_cargo_state values --
+    tests/test_physical_cashflows.py group b.
+
+    Decomposition (cargo = params.cargo_size; ledger =
+    physical.run_voyage() on the route's segments, heel_target_mmbtu =
+    params.heel_fraction * cargo):
+
+      - Revenue: physical.VoyageLedger.delivered_mmbtu already nets out
+        BOTH the heel retained at discharge AND whatever boiled off/
+        vented/was force-vaporised in transit (run_voyage()'s own
+        definition: delivered = available - other_loss - heel_at_discharge,
+        where `available` is the cargo mass that survives transit to
+        reach the discharge segment). This decomposition instead uses
+        `available` itself (= delivered_mmbtu + heel_at_discharge_mmbtu +
+        other_loss_mmbtu -- reconstructed here since VoyageLedger has no
+        field for it directly; decision.py's own call to run_voyage()
+        never passes other_loss_mmbtu, so it is always 0.0 for every
+        route this module supports, but the term is included so this
+        stays correct if that ever changes) as the "delivered MMBtu"
+        revenue quantity, and heel_at_discharge_mmbtu as its OWN,
+        separately-labelled, negative-quantity cash flow on the same
+        factor -- both economically real and independently inspectable
+        (e.g. quantity_on() can report how much value is at stake from
+        heel policy alone), rather than silently pre-netting them into
+        one number. Transit boil-off/venting gets NO cash flow at all: it
+        is neither delivered nor retained, so it is priced at zero by
+        omission, the same way it is for the legacy formula. Numerically
+        the two cash flows' sum is IDENTICAL to using delivered_mmbtu
+        alone (available - heel == delivered by definition) -- this is a
+        presentation/inspectability choice, not a different valuation.
+        Europe: (TTF, FX)-bilinear, quantity/3.412 (MWh<->MMBtu, matching
+        strip()'s ttf_usd conversion). Asia: JKM-linear, no conversion
+        (JKM is already $/MMBtu).
+      - HH procurement: quantity -cargo * hh_grossup (HH-linear) plus a
+        constant -cargo * (liquefaction_toll + pipeline) -- IDENTICAL
+        formula to legacy_cargo_quantities()'s procurement term (both
+        ultimately read the same model.strip() `proc` field / Params
+        fields; this is a 2-line shared-field formula, not a duplicated
+        ROUTE-economics risk, so re-expressing it here rather than
+        importing legacy's cash flows is deliberate -- it keeps this
+        function's quantities independently traceable to
+        _physical_route_breakdown()'s own `proc` line without a
+        cross-decomposition dependency).
+      - Charter: CHARTER-linear, quantity -ledger.total_days -- the
+        engine's own summed segment duration (loading + laden [+ queue]
+        + discharge + ballast [+ queue]), which equals europe_rt/
+        asia_rt_days by construction of the route builders (verified:
+        congested Asia's ledger.total_days == params.asia_rt_days
+        exactly, queue segments included).
+      - Bunkers: VLSFO-linear, quantity -ledger.total_liquid_fuel_tonnes
+        -- the engine's REAL net purchased fuel (post-reliquefaction,
+        post-heel-substitution on ballast legs), not the legacy flat
+        formula's estimate. This is the headline physical-engine
+        difference from legacy on the fuel side.
+      - ETS (Europe only; Asia is entirely outside EU ETS scope in both
+        models): FX-linear, quantity -voyage_em.ets_covered_co2e_tonnes *
+        eua_price * phase -- EUA price and phase folded into the
+        quantity, mirroring legacy's FX-linear ETS convention exactly
+        (see RiskFactor's docstring: R6.5b re-splits ETS into an
+        (EUA, FX) bilinear product for BOTH bases together, once EUA has
+        its own price history). ets_covered_co2e_tonnes uses the route
+        builder's real PER-SEGMENT scope (0.5 sea / 1.0 at-berth /
+        0.0 loading-berth for Europe), not legacy's uniform-0.5 constant
+        -- the ~4.45% base-value gap test_physical_legacy_equivalence.py
+        documents.
+      - Fees/tolls: constants, matching _physical_route_breakdown()'s own
+        remaining lines (Loading, Discharge/regas [Europe] or Canal/Port
+        [Asia], Other).
+
+    first_cargo_state (C.2, "a sunk leg is a constant, not an exposure"):
+    mapped through decision.cost_policy() exactly, anchored on
+    DecisionMode.PRE_LIFT_CARGO -- cost_policy() only consults the mode
+    argument when first_cargo_state is None (a state argument always
+    short-circuits the mode dispatch), so PRE_LIFT_CARGO here is read
+    ONLY as the None-fallback: cost_policy()'s own "nothing sunk yet"
+    anchor, i.e. first_cargo_state=None means FULLY EXPOSED here -- the
+    conservative choice for a risk engine (never silently understating
+    risk), which is DIFFERENT from decision.py's own POST_LIFT_DIVERSION-
+    mode default (sinks both procurement and loading). A caller that
+    wants that post-lift default must pass
+    FirstCargoState.ALREADY_LOADED explicitly. SUNK ZEROES the affected
+    quantity (equivalent to decision.route_value()'s "add back the sunk
+    cost", since the cash flow's un-zeroed quantity is exactly what would
+    need to be added back) rather than dropping the CashFlow object, so
+    the returned list has the IDENTICAL shape (same factor tuples, same
+    length) in every state -- only quantities differ -- which is what
+    tests/test_physical_cashflows.py's per-state zero-quantity assertions
+    rely on. Exactly two quantities are state-sensitive: the HH-linear
+    procurement term and its constant (liquefaction+pipeline) remainder
+    both zero when procurement is SUNK; the loading constant zeroes when
+    loading is SUNK. Every other quantity (revenue, heel, charter,
+    bunkers, ETS, other fees) is state-invariant -- cost_policy() only
+    ever treats "procurement"/"loading" as state-sensitive cost types,
+    matching the economic reality that a not-yet-burned fuel/charter/ETS
+    cost is not "sunk" merely because the gas itself was already bought.
+
+    NOT part of the factor set (reported, not forced): dynamic
+    reliquefaction/queue physics change the QUANTITIES (fuel tonnes,
+    EUA tonnes, delivered MMBtu) but never the PRICE-linearity of the
+    valuation -- verified against congested Asia (queue segments,
+    non-zero reliquefaction) reproducing decision.route_value() exactly,
+    so no special-casing was needed. Vented gas never arises on any path
+    decision.py itself exercises (it always builds vessels via
+    vessel_performance_from_params(), whose default reliquefaction
+    capacity absorbs every surplus this module's tests hit), so it is
+    not a live edge case here even though physical.py supports it in
+    principle.
+    """
+    route = decision._normalise_route(route)
+    key = (_params_field_key(params), route, load_month_year, first_cargo_state)
+    cached = _physical_quantity_cache.get(key)
+    if cached is not None:
+        return list(cached)
+    result = _physical_cargo_quantities_impl(params, route, load_month_year, first_cargo_state)
+    _physical_quantity_cache.set(key, result)
+    return list(result)
+
+
+def _physical_cargo_quantities_impl(
+    params: Params, route: str, load_month_year: int,
+    first_cargo_state: Optional["decision.FirstCargoState"],
+) -> list[CashFlow]:
+    """Uncached body of physical_cargo_quantities() -- see that function's
+    docstring for the full derivation and the caching/state contract.
+    `route` is assumed already normalised (physical_cargo_quantities()
+    does that before computing the cache key, so it must not re-normalise
+    here -- the key and the computation have to agree on the same
+    string)."""
+    cargo = params.cargo_size
+    vessel = physical.vessel_performance_from_params(params)
+    segments = (physical.europe_route_segments(params) if route == "Europe"
+                else physical.asia_route_segments(params))
+    heel_target = params.heel_fraction * cargo
+    ledger = physical.run_voyage(segments, vessel, loaded_mmbtu=cargo, heel_target_mmbtu=heel_target)
+
+    # `available` = cargo net of transit boil-off/venting, BEFORE heel is
+    # carved out at discharge -- see this function's public docstring.
+    available_mmbtu = ledger.delivered_mmbtu + ledger.heel_at_discharge_mmbtu + ledger.other_loss_mmbtu
+
+    proc_treatment = decision.cost_policy(decision.DecisionMode.PRE_LIFT_CARGO, "procurement",
+                                          first_cargo_state=first_cargo_state)
+    loading_treatment = decision.cost_policy(decision.DecisionMode.PRE_LIFT_CARGO, "loading",
+                                             first_cargo_state=first_cargo_state)
+    proc_sunk = proc_treatment == decision.CostTreatment.SUNK
+    loading_sunk = loading_treatment == decision.CostTreatment.SUNK
+
+    hh_qty = 0.0 if proc_sunk else -cargo * params.hh_grossup
+    proc_const_qty = 0.0 if proc_sunk else -cargo * (params.liquefaction_toll + params.pipeline)
+    loading_qty = 0.0 if loading_sunk else -cargo * params.loading
+
+    MI = 0  # placeholder month_index -- see legacy_cargo_quantities()'s docstring for why
+
+    flows: list[CashFlow] = []
+    if route == "Europe":
+        flows.append(CashFlow((RiskFactor.TTF, RiskFactor.FX), MI, available_mmbtu / 3.412,
+                               "delivered MMBtu (net of transit boil-off, pre-heel) x destination price"))
+        flows.append(CashFlow((RiskFactor.TTF, RiskFactor.FX), MI, -ledger.heel_at_discharge_mmbtu / 3.412,
+                               "heel retained at discharge, foregone at destination price"))
+    else:
+        flows.append(CashFlow((RiskFactor.JKM,), MI, available_mmbtu,
+                               "delivered MMBtu (net of transit boil-off, pre-heel) x destination price"))
+        flows.append(CashFlow((RiskFactor.JKM,), MI, -ledger.heel_at_discharge_mmbtu,
+                               "heel retained at discharge, foregone at destination price"))
+
+    flows.append(CashFlow((RiskFactor.HH,), MI, hh_qty,
+                           "HH procurement (grossed up)" + (" -- SUNK, zeroed" if proc_sunk else "")))
+    flows.append(CashFlow((), MI, proc_const_qty,
+                           "procurement fixed fees: liquefaction + pipeline"
+                           + (" -- SUNK, zeroed" if proc_sunk else "")))
+    flows.append(CashFlow((), MI, loading_qty,
+                           "loading fee" + (" -- SUNK, zeroed" if loading_sunk else "")))
+    flows.append(CashFlow((RiskFactor.CHARTER,), MI, -ledger.total_days,
+                           "charter hire (physical ledger total days)"))
+    flows.append(CashFlow((RiskFactor.VLSFO,), MI, -ledger.total_liquid_fuel_tonnes,
+                           "bunker fuel (physical ledger net purchased tonnes)"))
+
+    if route == "Europe":
+        voyage_em = emissions.voyage_emissions(ledger)
+        phase = phase_for_year(load_month_year)
+        flows.append(CashFlow((RiskFactor.FX,), MI,
+                               -voyage_em.ets_covered_co2e_tonnes * params.eua_price * phase,
+                               "ETS, per-segment scope (EUA price folded into the quantity -- see "
+                               "RiskFactor's docstring; R6.5b re-splits into an (EUA, FX) product)"))
+        flows.append(CashFlow((), MI, -cargo * params.eu_regas_port, "discharge/regas"))
+    else:
+        flows.append(CashFlow((), MI, -params.panama_toll_roundtrip, "Panama toll roundtrip"))
+        flows.append(CashFlow((), MI, -cargo * params.asia_port_cost, "port cost"))
+
+    flows.append(CashFlow((), MI, -cargo * params.other_cost, "other cost"))
+
+    return flows
+
+
+def physical_cargo_cashflows(
+    D, tables, params: Params, month_index: int, route: str,
+    first_cargo_state: Optional["decision.FirstCargoState"] = None,
+) -> CargoExposure:
+    """D-dependent ASSEMBLY wrapper around physical_cargo_quantities()
+    (plan sect 6.C.1), mirroring legacy_cargo_cashflows()'s split: snaps
+    prices for ONE load month via _snap_month_prices() -- the SAME snap/
+    contract-calendar/fx machinery decision.py's own row-based prices
+    ultimately come from too (row["ttf_usd"]/row["JKM"]/row["proc"] etc.
+    are read off a strip_df built by this exact snap logic), so reusing
+    it here rather than re-snapping independently keeps the two bases
+    reading identical prices for the identical D/month_index. Resolves
+    the load month's calendar year for the ETS phase, then attaches
+    base_prices.
+
+    Returns a single CargoExposure (not an (europe, asia) pair like
+    legacy_cargo_cashflows() -- decision.py's own physical machinery is
+    one-route-at-a-time, e.g. _physical_route_value(row, params, route),
+    and this mirrors that shape rather than legacy's).
+
+    CargoExposure.value(base_prices) reproduces
+    decision.route_value(row, params, route, ..., first_cargo_state=
+    first_cargo_state).incremental_value for this route/month to
+    floating-point precision (tests/test_physical_cashflows.py group b
+    pins this against the real workbook, per route, per parameter set,
+    per first_cargo_state -- see physical_cargo_quantities()'s docstring
+    for the derivation). This is the PHYSICAL basis's own base value, NOT
+    model.strip()'s eu_cargo/asia_cargo -- the legacy-vs-physical gap is
+    characterised, not reconciled (plan sect 8.5), same policy the
+    Decision page already discloses.
+    """
+    ctx = _snap_month_prices(D, tables, params, month_index)
+    route_norm = decision._normalise_route(route)
+    flows = physical_cargo_quantities(params, route_norm, ctx["L"].year, first_cargo_state=first_cargo_state)
+    flows = [replace(cf, month_index=month_index) for cf in flows]
+
+    if route_norm == "Europe":
+        base_prices = {
+            RiskFactor.TTF: ctx["ttf_l"],
+            RiskFactor.HH: ctx["hh_l"],
+            RiskFactor.FX: ctx["fx_l"],
+            RiskFactor.CHARTER: ctx["charter"],
+            RiskFactor.VLSFO: params.vlsfo_price,
+        }
+    else:
+        base_prices = {
+            RiskFactor.JKM: ctx["jkm_l1"],
+            RiskFactor.HH: ctx["hh_l"],
+            RiskFactor.CHARTER: ctx["charter"],
+            RiskFactor.VLSFO: params.vlsfo_price,
+        }
+
+    return CargoExposure(route=route_norm, month_index=month_index, cash_flows=flows, base_prices=base_prices)

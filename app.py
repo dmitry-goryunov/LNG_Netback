@@ -1467,6 +1467,24 @@ else:
     strip_df = model.strip(D, tables, params)
     months = list(strip_df["month_label"])
 
+    # R6 increment C.5 (plan sect 6.C.5): "Value basis" toggle. Legacy
+    # (frozen) stays the default so nothing changes for an existing
+    # session; every widget/branch below keyed off `var_basis` falls back
+    # to today's exact behaviour when it is "Legacy strip (frozen)".
+    var_basis = st.radio(
+        "Value basis", ["Legacy strip (frozen)", "Physical engine"],
+        horizontal=True, key="var_value_basis",
+    )
+    physical_basis = var_basis == "Physical engine"
+
+    var_first_cargo_state = None
+    if physical_basis:
+        var_state_label = st.radio(
+            "Current cargo state", list(FIRST_CARGO_STATE_LABELS),
+            horizontal=True, key="var_first_cargo_state",
+        )
+        var_first_cargo_state = FIRST_CARGO_STATE_LABELS[var_state_label]
+
     PORTFOLIO_MAP = {
         "Single cargo - Europe": ("single", "Europe"),
         "Single cargo - Asia": ("single", "Asia"),
@@ -1475,8 +1493,19 @@ else:
         "12-cargo strip (verdict-optimal)": ("12cargo", "Europe"),
         "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
     }
-    portfolio_choice = st.selectbox("Portfolio", list(PORTFOLIO_MAP.keys()))
-    portfolio_kind, basin_kind = PORTFOLIO_MAP[portfolio_choice]
+    # Physical basis: single/spread only (plan sect 8.3) -- 12cargo has no
+    # physical-basis equivalent (infeasible one-vessel portfolio AND
+    # fixture-bound to legacy) and hedged/programme aren't wired to this
+    # basis yet (Section 7's mechanical hedge legs are themselves
+    # legacy-formula-derived; programme arrives in increment D).
+    PORTFOLIO_MAP_PHYSICAL = {
+        "Single cargo - Europe": ("single", "Europe"),
+        "Single cargo - Asia": ("single", "Asia"),
+        "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
+    }
+    active_portfolio_map = PORTFOLIO_MAP_PHYSICAL if physical_basis else PORTFOLIO_MAP
+    portfolio_choice = st.selectbox("Portfolio", list(active_portfolio_map.keys()))
+    portfolio_kind, basin_kind = active_portfolio_map[portfolio_choice]
 
     mi = 0
     if portfolio_kind in ("single", "hedged", "spread"):
@@ -1498,8 +1527,26 @@ else:
     except ValueError as exc:
         st.error(f"Cannot build {method} scenarios: {exc}")
         st.stop()
-    r = risk.historical_var(D, tables, params, portfolio=portfolio_kind, month_index=mi,
-                             basin=basin_kind, scen=scen)
+    if physical_basis:
+        r = risk.historical_var_physical(D, tables, params, portfolio=portfolio_kind, month_index=mi,
+                                          basin=basin_kind, scen=scen, first_cargo_state=var_first_cargo_state)
+    else:
+        r = risk.historical_var(D, tables, params, portfolio=portfolio_kind, month_index=mi,
+                                 basin=basin_kind, scen=scen)
+
+    st.caption(
+        ("Value basis: **physical engine** -- base value and scenario repricing use the segment-level "
+         f"voyage engine (real fuel/delivered-cargo mass balance, per-segment EU ETS scope), state "
+         f"'{var_state_label}' for the current cargo (Section 3a: governs whether procurement/loading "
+         "are still price-exposed). Portfolio is limited to single-cargo/spread; 12-cargo and hedged "
+         "residual stay legacy-basis-only. Backtest and the overlapping 10-day VaR below are not yet "
+         "wired to this basis."
+         if physical_basis else
+         "Value basis: **legacy strip (frozen)** -- the same flat-fuel-rate, uniform-ETS-scope formula "
+         "the frozen regression suite pins (docs/R6_RISK_REBUILD_PLAN.md). Switch to Physical engine "
+         "above to price what the Decision page prices; the two bases' base values differ by design "
+         "(Forward-strip page's own caption quantifies the gap).")
+    )
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("VaR 95% (1d)", f"${r.var95:,.0f}")
@@ -1529,7 +1576,11 @@ else:
         st.caption("Caveat: sqrt(10) scaling assumes iid daily returns; gas/LNG curve moves are "
                    "fat-tailed and cluster around events, so this is approximate.")
     with hc2:
-        if st.checkbox("Compute overlapping 10-day VaR (slower, rebuilds scenario set)"):
+        if physical_basis:
+            st.checkbox("Compute overlapping 10-day VaR (slower, rebuilds scenario set)", disabled=True)
+            st.caption("Not yet available under the physical basis -- scale_to_horizon()'s overlapping "
+                       "method reprices via the legacy formula internally. Switch to Legacy strip to use it.")
+        elif st.checkbox("Compute overlapping 10-day VaR (slower, rebuilds scenario set)"):
             with st.spinner("Rebuilding overlapping 10-day scenarios..."):
                 var10_ov = risk.scale_to_horizon(r.var95, days=10, method="overlapping", tables=tables, D=D,
                                                   params=params, portfolio=portfolio_kind, month_index=mi,
@@ -1539,20 +1590,35 @@ else:
 
     st.subheader("Stress tests (deterministic replays, Section 8)")
     with st.spinner("Running stress tests..."):
-        stress_df = risk.run_stress_tests(D, tables, params)
+        stress_df = risk.run_stress_tests(
+            D, tables, params,
+            basis="physical" if physical_basis else "legacy",
+            first_cargo_state=var_first_cargo_state,
+        )
     st.dataframe(
         stress_df.style.format({"pnl_12cargo": "{:+,.0f}", "pnl_m1_spread": "{:+,.0f}"}),
         width="stretch", hide_index=True,
     )
-    st.caption("Historical replays apply that date's actual single-day curve move onto today's curve. "
-               "The pnl_12cargo column is a legacy regression portfolio and is not a feasible one-vessel programme.")
+    if physical_basis:
+        st.caption(
+            "Physical basis: the three deterministic shocks (Panama congestion, JKM +2.6, EUA bump) "
+            "reprice pnl_m1_spread through the physical engine; pnl_12cargo is n/a (no physical-basis "
+            "equivalent -- plan sect 8.3). The three historical-replay rows stay legacy/strip-based on "
+            "either basis (n/a here) -- see the 'note' column."
+        )
+    else:
+        st.caption("Historical replays apply that date's actual single-day curve move onto today's curve. "
+                   "The pnl_12cargo column is a legacy regression portfolio and is not a feasible one-vessel programme.")
 
     with st.expander("Backtest: rolling 1-day VaR vs realised P&L (Kupiec traffic light)"):
         window_days = st.slider("Backtest window (business days)", 20, 150, 60, 10)
         st.caption("Each day in the window recomputes a full 500-scenario VaR, so this can take a while.")
         if portfolio_kind == "hedged":
             st.info("Interim roll-safe backtesting is not yet available for the hedged residual portfolio.")
-        if st.button("Run backtest", disabled=portfolio_kind == "hedged"):
+        if physical_basis:
+            st.info("Backtest is not yet wired to the physical basis -- it always reprices via the legacy "
+                    "formula internally. Switch to Legacy strip to run it.")
+        if st.button("Run backtest", disabled=(portfolio_kind == "hedged") or physical_basis):
             with st.spinner(f"Running rolling backtest over {window_days} days..."):
                 bt = risk.backtest_var(
                     tables, params, portfolio=portfolio_kind, lookback=lookback,
