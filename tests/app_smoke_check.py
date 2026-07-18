@@ -165,3 +165,74 @@ assert "12-cargo strip (verdict-optimal)" in legacy_portfolio_box.options, \
 assert legacy_portfolio_box.value == "Single cargo - Europe", \
     f"legacy basis default portfolio must stay unchanged, got {legacy_portfolio_box.value!r}"
 print("PASS var page: legacy basis portfolio list and default unchanged by the physical-basis reordering")
+
+# R6 increment E.3 (plan sect 6.E.3): the factor-coverage disclosure line
+# renders on the legacy basis (still current page/basis from the block
+# above) with no silent omissions -- names every RiskFactor plus the
+# excluded locational basis. EUA must read as unconditionally
+# deterministic HERE (legacy is frozen to model.strip(), no live-factor
+# path -- risk.factor_coverage_line()'s own basis-conditional branch).
+coverage_captions = [c.value for c in app.caption if "Factor coverage this run" in c.value]
+assert len(coverage_captions) == 1, f"expected exactly one factor-coverage caption, got {len(coverage_captions)}"
+assert "HH / TTF / JKM / FX -- stochastic" in coverage_captions[0]
+assert "EXCLUDED" in coverage_captions[0] and "locational basis" in coverage_captions[0], \
+    "locational (NWE/JKM) basis must be disclosed as excluded, plan sect 8 decision 4"
+assert "frozen to model.strip()" in coverage_captions[0], \
+    "legacy basis EUA status must read as unconditionally deterministic (no live-factor path on legacy)"
+print("PASS var page: factor-coverage disclosure line renders on the legacy basis, no silent omissions")
+
+# R6 increment E.1(b): the optional independent charter overlay checkbox,
+# default OFF, both bases. Toggling it on must not raise and must render
+# BOTH required assumptions (independence, calibration basis) plus the
+# "model overlay, not historical simulation" label -- plan sect 6.E.1(b)'s
+# explicit requirement.
+overlay_box = next(b for b in app.checkbox if "charter overlay" in b.label.lower())
+assert overlay_box.value is False, "charter overlay must default OFF"
+overlay_box.set_value(True)
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+overlay_captions = [c.value for c in app.caption if "Charter overlay ON" in c.value]
+assert len(overlay_captions) == 1, f"expected exactly one charter-overlay caption when ON, got {len(overlay_captions)}"
+assert "model overlay, not historical simulation" in overlay_captions[0]
+assert "Calibration basis" in overlay_captions[0] and "vol of the" in overlay_captions[0], \
+    "overlay caption must disclose the calibration basis (plan sect 6.E.1(b))"
+assert "Independence assumption" in overlay_captions[0] and "ZERO correlation" in overlay_captions[0], \
+    "overlay caption must disclose the independence assumption (plan sect 6.E.1(b))"
+coverage_with_overlay = next(c.value for c in app.caption if "Factor coverage this run" in c.value)
+assert "optional independent model overlay (ON" in coverage_with_overlay, \
+    "factor-coverage line must reflect the overlay toggle state"
+print("PASS var page: charter overlay defaults off, discloses both required assumptions when switched on")
+
+# Same overlay checkbox under the PHYSICAL basis (plan sect 6.E.1(b):
+# "VaR page checkbox, BOTH bases") -- re-fetch every widget reference
+# after app.run() per this file's own established gotcha (see the
+# "Page"/"basis" re-fetch comments above). The checkbox is `key`-based,
+# so (like the pre-existing "roll-aligned"/"Current cargo state" widgets
+# on this same page) its ON state from the legacy-basis block above
+# PERSISTS across the basis switch -- Streamlit widget state semantics,
+# not a bug -- so this exercises the overlay's PHYSICAL-basis code path
+# (a different historical_var_physical()-based portfolio-quantity branch
+# inside risk._charter_quantity_for_portfolio()) without re-toggling.
+# Also re-checks the factor-coverage line's basis-conditional EUA
+# wording: physical basis must NOT claim the legacy-only "frozen to
+# model.strip()" text.
+basis = next(w for w in app.radio if w.label == "Value basis")
+basis.set_value("Physical engine")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+phys_coverage = next(c.value for c in app.caption if "Factor coverage this run" in c.value)
+assert "frozen to model.strip()" not in phys_coverage, \
+    "physical basis must not claim the legacy-only EUA wording"
+phys_overlay_box = next(b for b in app.checkbox if "charter overlay" in b.label.lower())
+assert phys_overlay_box.value is True, \
+    "charter overlay's keyed widget state should persist across a basis switch (Streamlit semantics)"
+assert any("Charter overlay ON" in c.value for c in app.caption), \
+    "charter overlay must render its disclosure caption under the physical basis too"
+# Toggle it back off, proving the OFF path also still works cleanly
+# under the physical basis (not just the legacy basis exercised above).
+phys_overlay_box.set_value(False)
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+assert not any("Charter overlay ON" in c.value for c in app.caption), \
+    "charter overlay caption must disappear once switched back off"
+print("PASS var page: charter overlay and factor-coverage disclosure both work under the physical basis")

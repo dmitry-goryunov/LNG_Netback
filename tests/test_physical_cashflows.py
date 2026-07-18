@@ -635,6 +635,14 @@ def test_legacy_vectorized_reprice_unaffected_by_shared_helper_extraction(tables
 # D="2026-07-08"; the tolerance below is deliberately tight (this is a
 # deterministic computation -- any drift means the "legacy" branch
 # stopped being byte-identical to before the basis= parameter existed).
+#
+# R6 increment E.1(a) (plan sect 6.E.1): the three "Charter ..." rows
+# below are captured AFTER this increment added them -- extending this
+# SAME pin list additively (not a parallel one) is the plan's own
+# instruction ("extend the pinned regression test additively -- pin the
+# NEW rows too"). The six rows ABOVE the charter rows are byte-for-byte
+# unchanged from increment C -- this file's pre-existing test doesn't
+# need to change to prove that, only to grow to cover the three new ones.
 _STRESS_PIN_LEGACY = [
     ("Replay 2021-12-21 move", 193741417.64618623, 982596.1415178888),
     ("Replay 2022-08-26 move", 40837989.65533432, -205840.40491522476),
@@ -642,6 +650,9 @@ _STRESS_PIN_LEGACY = [
     ("Panama congestion (Asia RT 54.7d)", 0.0, -1349831.9999999963),
     ("JKM +2.6 $/MMBtu (13-Jul-2026 Hormuz repricing)", 8062592.965168893, 8910066.666666668),
     ("EUA EUR70 -> EUR120/t", -3057890.447725475, 253055.00540834293),
+    ("Charter +$25k/day", -7782051.282051235, -520085.4700854607),
+    ("Charter -$25k/day", 7782051.282051355, 520085.4700854756),
+    ("Charter +50%", -13618589.743589759, -910149.5726495571),
 ]
 _STRESS_PIN_OPERATING = [
     ("Replay 2021-12-21 move", 193438466.4333396, 962070.9507334642),
@@ -650,6 +661,9 @@ _STRESS_PIN_OPERATING = [
     ("Panama congestion (Asia RT 54.7d)", 0.0, -597095.1701998226),
     ("JKM +2.6 $/MMBtu (13-Jul-2026 Hormuz repricing)", 8181010.174510777, 8883473.52941177),
     ("EUA EUR70 -> EUR120/t", -3057890.4477255344, 253055.0054083392),
+    ("Charter +$25k/day", -8105882.352941126, -589215.6862745099),
+    ("Charter -$25k/day", 8105882.352941155, 589215.6862745099),
+    ("Charter +50%", -14185294.117647022, -1031127.4509803914),
 ]
 
 
@@ -684,21 +698,23 @@ def test_run_stress_tests_rejects_unknown_basis(tables):
 
 def test_run_stress_tests_physical_basis_shape_and_finiteness(tables):
     """basis="physical": the three historical-replay rows are n/a on
-    EITHER pnl column (NaN, with a note); the three deterministic-shock
-    rows have pnl_12cargo NaN (no physical-basis 12cargo) and a FINITE
-    pnl_m1_spread."""
+    EITHER pnl column (NaN, with a note); the six deterministic-shock
+    rows (three pre-existing -- Panama/JKM/EUA -- plus the three new
+    charter rows, R6 increment E.1(a)) have pnl_12cargo NaN (no
+    physical-basis 12cargo) and a FINITE pnl_m1_spread."""
     params = model.operating_default_params()
     df = risk.run_stress_tests(D, tables, params, basis="physical",
                                 first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT)
-    assert len(df) == 6
+    assert len(df) == 9
     assert df["pnl_12cargo"].isna().all()
 
     replay_rows = df.iloc[0:3]
     assert replay_rows["pnl_m1_spread"].isna().all()
     assert replay_rows["note"].str.contains("n/a").all()
 
-    shock_rows = df.iloc[3:6]
+    shock_rows = df.iloc[3:9]
     assert np.isfinite(shock_rows["pnl_m1_spread"]).all()
+    assert list(df["scenario"].iloc[6:9]) == ["Charter +$25k/day", "Charter -$25k/day", "Charter +50%"]
 
 
 def test_run_stress_tests_physical_jkm_shock_matches_independent_price_bump(tables):
@@ -726,20 +742,25 @@ def test_run_stress_tests_physical_jkm_shock_matches_independent_price_bump(tabl
 
 
 def test_run_stress_tests_physical_spread_pnl_is_first_cargo_state_invariant(tables):
-    """None of the three deterministic shocks (Panama congestion, JKM
-    bump, EUA bump) touches procurement or loading -- the only
-    state-sensitive quantities (C.2) -- so pnl_m1_spread (a P&L DELTA,
-    where any state-invariant constant term cancels between the bumped
-    and base evaluations) must be identical across every first_cargo_state.
-    This is an honest, worth-recording consequence of C.2's design, not a
-    bug: sunk-cost zeroing changes ABSOLUTE exposure values (the base
-    value tests above), never a DELTA between two states-under-the-same-
-    first_cargo_state."""
+    """None of the six deterministic shocks (Panama congestion, JKM bump,
+    EUA bump, and -- R6 increment E.1(a) -- the three charter shocks)
+    touches procurement or loading -- the only state-sensitive quantities
+    (C.2) -- so pnl_m1_spread (a P&L DELTA, where any state-invariant
+    constant term cancels between the bumped and base evaluations) must
+    be identical across every first_cargo_state. This is an honest,
+    worth-recording consequence of C.2's design, not a bug: sunk-cost
+    zeroing changes ABSOLUTE exposure values (the base value tests
+    above), never a DELTA between two states-under-the-same-
+    first_cargo_state. Charter's quantity (CHARTER-linear, ledger.
+    total_days) is likewise never one of C.2's two state-sensitive
+    quantities (HH procurement, loading) -- see
+    cashflows.physical_cargo_quantities()'s own docstring -- so the same
+    invariance is expected to extend to it, and this test proves it does."""
     params = model.operating_default_params()
     spreads = {}
     for state in [None] + FIRST_CARGO_STATES:
         df = risk.run_stress_tests(D, tables, params, basis="physical", first_cargo_state=state)
-        spreads[state] = df.iloc[3:6]["pnl_m1_spread"].to_numpy(dtype=float)
+        spreads[state] = df.iloc[3:9]["pnl_m1_spread"].to_numpy(dtype=float)
     reference = spreads[None]
     for state, values in spreads.items():
         np.testing.assert_allclose(values, reference, rtol=1e-9, atol=1e-6, err_msg=f"state={state}")

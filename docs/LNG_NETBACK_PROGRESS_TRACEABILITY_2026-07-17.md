@@ -181,8 +181,23 @@ H close-out.
   `run_stress_tests()` with bit-compatible legacy default, VaR-page
   basis toggle. Frozen 64/64 held throughout both increments.
 - R6.4 Use delivery-contract IDs.
-- R6.5 Add VLSFO and EUA risk factors.
-- R6.6 Add physical basis factors.
+- R6.5 Add VLSFO and EUA risk factors. — **VERIFIED (data-gated)**
+  (increment E, 18-Jul-2026): `data.load_vlsfo()`/`load_eua()` tolerate
+  absent sheets (`CurveTables.vlsfo`/`.eua` default None); the live-factor
+  scenario path and the physical-basis `(EUA, FX)` ETS re-split
+  (`eua_live=True`, value-preserving at base, physical-basis-only so the
+  legacy `model.strip()` identity is never broken) are written and tested
+  against synthetic in-memory tables. Dormant until the owner adds VLSFO/
+  EUA daily-history sheets to `LNG history.xlsx` (plan sect 5 action
+  item); disclosed as deterministic via `risk.factor_coverage_line()`
+  until then. Charter stays deterministic in HS-VaR (weekly data --
+  plan sect 6.E.1) with three deterministic stress rows plus an optional,
+  clearly-labelled independent overlay.
+- R6.6 Add physical basis factors. — **DEFERRED-with-disclosure**
+  (increment E): NWE/JKM physical basis has no history in the workbook;
+  excluded from the factor set and named as excluded in
+  `factor_coverage_line()` rather than silently proxied (plan sect 8
+  decision 4). Revisit if a basis history source is added.
 - R6.7 Revalue feasible programmes. — **VERIFIED** (increment D,
   18-Jul-2026): "Committed programme" portfolio in
   `historical_var_physical()` — the optimiser's actual plan

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import calendar
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import numpy as np
@@ -426,10 +426,60 @@ class ScenarioSet:
     end_date: pd.Timestamp
     lookback: int
     method: str
+    # R6 increment E.2 (plan sect 6.E.2, R6.5b): OPTIONAL daily log-return
+    # columns for VLSFO/EUA, (n,) like fx_ret (both factors are single
+    # flat prices in this model, not 13-column strips -- Params carries
+    # one vlsfo_price/eua_price, never a curve). Trailing fields with a
+    # None default so EVERY existing ScenarioSet(...) construction across
+    # the repo (all keyword-style -- verified via repo-wide search) keeps
+    # working unchanged. None (the ONLY possibility while the real
+    # workbook has no VLSFO/EUA sheet -- plan sect 5) means "no scenario
+    # shock for this factor" to every consumer (_scenario_factor_array()
+    # below): byte-identical to today's flat params.vlsfo_price/eua_price
+    # pricing, never a hard error. Populated only by build_scenarios()
+    # when `tables.vlsfo`/`tables.eua` are present.
+    vlsfo_ret: Optional[np.ndarray] = None
+    eua_ret: Optional[np.ndarray] = None
 
 
 def _intersection_dates(tables) -> list:
     return sorted(set(tables.hh["date"]) & set(tables.ttf["date"]) & set(tables.jkm["date"]) & set(tables.fx["date"]))
+
+
+def _snap_series_onto_dates(table: Optional["pd.DataFrame"], value_col: str, target_dates: list) -> Optional[np.ndarray]:
+    """R6 increment E.2 (plan sect 6.E.2): as-of ('last known value on or
+    before D') snap of an optional daily-ish price series onto
+    `target_dates` -- the SAME 'last row with date <= D' semantics
+    model.snap() uses everywhere else in this codebase, vectorised via
+    merge_asof rather than one snap() call per date (this runs once per
+    build_scenarios() call, not once per scenario).
+
+    Deliberately does NOT intersect `target_dates` with `table`'s own
+    date range: the existing HH/TTF/JKM/FX scenario window
+    (build_scenarios()'s own `scen_dates`) must stay EXACTLY what it is
+    today regardless of whether an optional VLSFO/EUA sheet exists or how
+    far back it goes (shrinking the shared window the moment an unrelated
+    sheet appeared would silently change every other factor's VaR too --
+    exactly what plan sect 6.E.2's 'every existing path is unchanged'
+    instruction rules out). Returns None (never raises) when `table` is
+    None, or when it has no row on/before the EARLIEST target date (can't
+    snap before the series starts) -- callers treat None as "no scenario
+    shock for this factor", the same optional-factor contract
+    ScenarioSet.vlsfo_ret/eua_ret document."""
+    if table is None:
+        return None
+    # target_dates (build_scenarios()'s scen_dates) is already ascending
+    # (built from sorted(set(...))); merge_asof requires both sides
+    # sorted, and preserves `target`'s row order, so `merged` comes back
+    # in the SAME order as `target_dates` -- no re-sort/reindex needed.
+    target = pd.DataFrame({"date": pd.DatetimeIndex(target_dates)})
+    src = table[["date", value_col]].sort_values("date")
+    if src.empty or src["date"].iloc[0] > target["date"].iloc[0]:
+        return None
+    merged = pd.merge_asof(target, src, on="date", direction="backward")
+    if merged[value_col].isna().any():
+        return None
+    return merged[value_col].to_numpy(dtype=float)
 
 
 def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> ScenarioSet:
@@ -490,8 +540,20 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
 
     fx_ret = np.diff(np.log(fx_px))
 
+    # R6 increment E.2 (plan sect 6.E.2): OPTIONAL VLSFO/EUA log-returns,
+    # snapped onto the SAME scen_dates window computed above (never
+    # shrinking it -- see _snap_series_onto_dates()'s own docstring).
+    # getattr(): tolerates a `tables` stand-in with no vlsfo/eua attribute
+    # at all (e.g. an older-shaped test fixture), degrading to None same
+    # as a present-but-empty attribute.
+    vlsfo_px = _snap_series_onto_dates(getattr(tables, "vlsfo", None), "price", scen_dates)
+    eua_px = _snap_series_onto_dates(getattr(tables, "eua", None), "price", scen_dates)
+    vlsfo_ret = np.diff(np.log(vlsfo_px)) if vlsfo_px is not None else None
+    eua_ret = np.diff(np.log(eua_px)) if eua_px is not None else None
+
     return ScenarioSet(dates=scen_dates[1:], hh_ret=hh_ret, ttf_ret=ttf_ret, jkm_ret=jkm_ret,
-                        fx_ret=fx_ret, end_date=scen_dates[-1], lookback=lookback, method=method)
+                        fx_ret=fx_ret, end_date=scen_dates[-1], lookback=lookback, method=method,
+                        vlsfo_ret=vlsfo_ret, eua_ret=eua_ret)
 
 
 def _is_month_roll(d_prev, d) -> bool:
@@ -540,6 +602,22 @@ def _assert_finite_prices(prices: dict, label: str) -> None:
         a = np.asarray(arr, dtype=float)
         if not np.isfinite(a).all():
             raise ValueError(f"non-finite {factor.value} price(s) in {label}")
+
+
+def _scenario_factor_array(n: int, scen_ret: Optional[np.ndarray], base_price: float) -> np.ndarray:
+    """R6 increment E.2 (plan sect 6.E.2): scenario price array for a
+    SCALAR (non-curve) factor -- VLSFO or EUA, the only two RiskFactors
+    Params represents as one flat price rather than a 13-column strip.
+    `base_price * exp(scen_ret)` when the ScenarioSet carries log-returns
+    for it (only possible when a workbook sheet exists -- plan sect 5),
+    else `base_price` repeated for every scenario, i.e. NO shock -- byte-
+    identical to how VLSFO/EUA are priced today. This is the single
+    'defaulting to zero-shock so every existing path is unchanged'
+    mechanism plan sect 6.E.2 asks for; every repricer below calls this
+    instead of hardcoding np.full(n, params.vlsfo_price) directly."""
+    if scen_ret is None:
+        return np.full(n, base_price, dtype=float)
+    return base_price * np.exp(scen_ret)
 
 
 def _prepare_scenario_price_arrays(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm,
@@ -645,7 +723,16 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
     # per call -- 12 months x 2 routes -- not once per scenario; the
     # n-scenario cost is confined to value_matrix's array arithmetic.
     charter_arr = np.full(n, charter, dtype=float)
-    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
+    # R6 increment E.2: VLSFO goes live automatically whenever `scen`
+    # carries vlsfo_ret (i.e. tables.vlsfo existed when `scen` was built)
+    # -- safe on the LEGACY basis specifically because VLSFO's cash flow
+    # is ALREADY quantity x price[VLSFO] (see cashflows.RiskFactor
+    # docstring: unlike EUA, nothing is folded), so a zero-return
+    # scenario reprices to the SAME value as today's flat
+    # params.vlsfo_price regardless -- model.strip()'s own zero-shock
+    # identity is therefore unaffected (no re-split needed, unlike EUA --
+    # see historical_var_physical()'s EUA wiring for the contrast).
+    vlsfo_arr = _scenario_factor_array(n, scen.vlsfo_ret, params.vlsfo_price)
 
     eu_cargo = np.empty((n, 12), dtype=float)
     asia_cargo = np.empty((n, 12), dtype=float)
@@ -704,7 +791,8 @@ def _vectorized_reprice(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_
 
 def _vectorized_reprice_physical(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
                                   charter, params: Params,
-                                  first_cargo_state: Optional[decision.FirstCargoState] = None) -> dict:
+                                  first_cargo_state: Optional[decision.FirstCargoState] = None,
+                                  base_eua: Optional[float] = None) -> dict:
     """Physical-basis counterpart of _vectorized_reprice() (R6 increment
     C.5, plan sect 6.C.5): identical scenario PRICE PREPARATION
     (delegated to the SAME _prepare_scenario_price_arrays() helper --
@@ -721,20 +809,37 @@ def _vectorized_reprice_physical(scen: ScenarioSet, D, base_hh, base_ttf, base_j
     jkm_star/verdict_asia: 12-cargo verdict-switching is a LEGACY-basis-
     only concept (plan sect 8.3, "12cargo stays legacy-basis-only");
     physical basis supports single/spread only for now, neither of which
-    needs a verdict."""
+    needs a verdict.
+
+    R6 increment E.2 (plan sect 6.E.2): VLSFO goes live automatically off
+    `scen.vlsfo_ret` (see _scenario_factor_array()) -- safe unconditionally,
+    same reasoning as _vectorized_reprice()'s own VLSFO wiring. EUA is
+    DIFFERENT: it requires the cash-flow RE-SPLIT
+    (cashflows.physical_cargo_quantities()'s `eua_live` parameter), which
+    changes the ETS term's factor tuple, so it is gated on BOTH
+    `scen.eua_ret is not None` AND a caller-supplied `base_eua` (the
+    snapped EUA price at D -- this function has no `tables` to snap one
+    from itself, by the same Params-only design as
+    physical_cargo_quantities(); historical_var_physical() is the only
+    caller and supplies both consistently, or neither -- see that
+    function's own docstring for why base and scenario must agree)."""
     prep = _prepare_scenario_price_arrays(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1)
     n, years = prep["n"], prep["years"]
     hh_L, ttf_L, jkm_L1, fx_l = prep["hh_L"], prep["ttf_L"], prep["jkm_L1"], prep["fx_l"]
 
     charter_arr = np.full(n, charter, dtype=float)
-    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
+    vlsfo_arr = _scenario_factor_array(n, scen.vlsfo_ret, params.vlsfo_price)
+    eua_live = base_eua is not None and scen.eua_ret is not None
+    eua_arr = _scenario_factor_array(n, scen.eua_ret, base_eua) if eua_live else None
 
     eu_cargo = np.empty((n, 12), dtype=float)
     asia_cargo = np.empty((n, 12), dtype=float)
 
     for i in range(12):
-        eu_flows = physical_cargo_quantities(params, "Europe", int(years[i]), first_cargo_state=first_cargo_state)
-        asia_flows = physical_cargo_quantities(params, "Asia", int(years[i]), first_cargo_state=first_cargo_state)
+        eu_flows = physical_cargo_quantities(params, "Europe", int(years[i]), first_cargo_state=first_cargo_state,
+                                              eua_live=eua_live)
+        asia_flows = physical_cargo_quantities(params, "Asia", int(years[i]), first_cargo_state=first_cargo_state,
+                                                eua_live=eua_live)
         _assert_finite_quantities(eu_flows, f"Europe month {i} physical cash-flow quantities")
         _assert_finite_quantities(asia_flows, f"Asia month {i} physical cash-flow quantities")
 
@@ -748,6 +853,8 @@ def _vectorized_reprice_physical(scen: ScenarioSet, D, base_hh, base_ttf, base_j
             RiskFactor.CHARTER: charter_arr,
             RiskFactor.VLSFO: vlsfo_arr,
         }
+        if eua_live:
+            eu_prices[RiskFactor.EUA] = eua_arr
         asia_prices = {
             RiskFactor.JKM: jkm_L1[:, i],
             RiskFactor.HH: hh_L[:, i],
@@ -903,6 +1010,7 @@ def programme_leg_is_priceable(leg: "decision.ProgrammeLeg") -> bool:
 
 def _programme_leg_exposures(D, tables, params: Params, plan: "decision.ProgrammePlan",
                               first_cargo_state: Optional[decision.FirstCargoState],
+                              eua_live: bool = False,
                               ) -> tuple:
     """One physical CargoExposure per INCLUDED leg of `plan` (plan sect
     6.D.1: "one CargoExposure per leg") -- D-dependent, built via
@@ -914,13 +1022,22 @@ def _programme_leg_exposures(D, tables, params: Params, plan: "decision.Programm
     was constructed, only what its cash_flows/base_prices already are).
     Legs failing programme_leg_is_priceable() are dropped (see that
     function's docstring); returns (leg, CargoExposure) pairs in leg
-    order."""
+    order.
+
+    `eua_live` (R6 increment E.2, default False, unchanged behaviour):
+    forwarded verbatim to every leg's physical_cargo_cashflows() call, so
+    every Europe leg's ETS term re-splits consistently -- the caller
+    (historical_var_physical()) must pass the SAME value here and to
+    _vectorized_reprice_physical_programme() (base and scenario have to
+    agree on the cash-flow shape, same requirement as the single/spread
+    path -- see that function's own docstring)."""
     out = []
     for leg in plan.legs:
         if not programme_leg_is_priceable(leg):
             continue
         state = _programme_leg_state(leg, first_cargo_state)
-        exposure = physical_cargo_cashflows(D, tables, params, leg.month_index, leg.route, state)
+        exposure = physical_cargo_cashflows(D, tables, params, leg.month_index, leg.route, state,
+                                             eua_live=eua_live)
         _assert_finite_quantities(
             exposure.cash_flows,
             f"committed-programme leg {leg.cargo_number} ({leg.route}, month {leg.month_index}) "
@@ -932,7 +1049,8 @@ def _programme_leg_exposures(D, tables, params: Params, plan: "decision.Programm
 
 def _vectorized_reprice_physical_programme(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm,
                                             base_spot, base_o6, base_o1, charter, params: Params,
-                                            leg_exposures: tuple) -> np.ndarray:
+                                            leg_exposures: tuple,
+                                            base_eua: Optional[float] = None) -> np.ndarray:
     """Scenario P&L of a committed programme: sum, across the
     (leg, CargoExposure) pairs already selected by
     _programme_leg_exposures(), of each leg's OWN CargoExposure at that
@@ -943,12 +1061,25 @@ def _vectorized_reprice_physical_programme(scen: ScenarioSet, D, base_hh, base_t
     _prepare_scenario_price_arrays() -- the shared price-preparation
     helper increment C.5 extracted precisely so a second repricer could
     consume it (see that function's own docstring) -- rather than a third
-    independently-maintained price-prep block."""
+    independently-maintained price-prep block.
+
+    VLSFO/EUA (R6 increment E.2): same `base_eua`-gated live-EUA
+    contract as _vectorized_reprice_physical() -- `eua_live` here MUST
+    match whatever `_programme_leg_exposures()` was called with to build
+    `leg_exposures` (both derived from the SAME `base_eua is not None and
+    scen.eua_ret is not None` test), else a leg's CashFlow factor tuple
+    (built under one eua_live value) would be evaluated against a price
+    dict assembled under the other, which would KeyError (folded-mode
+    Europe legs never reference RiskFactor.EUA) or silently ignore the
+    supplied EUA array (live-mode legs would still get one, just an
+    unused dict entry -- harmless but a sign of caller mismatch)."""
     prep = _prepare_scenario_price_arrays(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1)
     n = prep["n"]
     hh_L, ttf_L, jkm_L1, fx_l = prep["hh_L"], prep["ttf_L"], prep["jkm_L1"], prep["fx_l"]
     charter_arr = np.full(n, charter, dtype=float)
-    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
+    vlsfo_arr = _scenario_factor_array(n, scen.vlsfo_ret, params.vlsfo_price)
+    eua_live = base_eua is not None and scen.eua_ret is not None
+    eua_arr = _scenario_factor_array(n, scen.eua_ret, base_eua) if eua_live else None
 
     total = np.zeros(n, dtype=float)
     for leg, exposure in leg_exposures:
@@ -956,6 +1087,8 @@ def _vectorized_reprice_physical_programme(scen: ScenarioSet, D, base_hh, base_t
         if leg.route == "Europe":
             prices = {RiskFactor.TTF: ttf_L[:, i], RiskFactor.FX: fx_l[:, i], RiskFactor.HH: hh_L[:, i],
                       RiskFactor.CHARTER: charter_arr, RiskFactor.VLSFO: vlsfo_arr}
+            if eua_live:
+                prices[RiskFactor.EUA] = eua_arr
         else:
             prices = {RiskFactor.JKM: jkm_L1[:, i], RiskFactor.HH: hh_L[:, i],
                       RiskFactor.CHARTER: charter_arr, RiskFactor.VLSFO: vlsfo_arr}
@@ -1144,6 +1277,19 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     extend risk.py "without changing the legacy path's behaviour or
     signatures" -- historical_var() is untouched by this increment,
     byte-for-byte (same source, same tests, same frozen 64/64).
+
+    R6 increment E.2 (plan sect 6.E.2): EUA goes LIVE (the (EUA, FX)
+    re-split, cashflows.physical_cargo_quantities()'s `eua_live`) only
+    when BOTH `tables.eua` has a snappable price at D AND the ScenarioSet
+    carries `eua_ret` (only possible when `scen` was built via
+    build_scenarios() against a `tables` that itself had an `eua` table --
+    plan sect 5: the real workbook has neither today). The SAME `eua_live`
+    decision, derived ONCE below, is used for the base value AND the
+    scenario repricing (single/spread/programme alike) so a zero-return
+    scenario always reprices back to this function's own base -- see
+    cashflows.physical_cargo_quantities()'s "EUA factor" docstring
+    paragraph for why this live path exists on the physical basis only
+    (never legacy).
     """
     if portfolio not in ("single", "spread", "programme"):
         raise ValueError(
@@ -1167,23 +1313,31 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     base_jkm = jkm_row[[f"c{i}" for i in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
     base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
 
+    eua_table = getattr(tables, "eua", None)
+    base_eua = float(snap(eua_table, D)["price"]) if eua_table is not None else None
+    eua_live = base_eua is not None and scen.eua_ret is not None
+
     if portfolio == "programme":
         plan = build_committed_programme(D, tables, params, month_index, first_cargo_state)
-        leg_exposures = _programme_leg_exposures(D, tables, params, plan, first_cargo_state)
+        leg_exposures = _programme_leg_exposures(D, tables, params, plan, first_cargo_state, eua_live=eua_live)
         base_val = sum(exposure.value(exposure.base_prices) for _, exposure in leg_exposures)
         scen_val = _vectorized_reprice_physical_programme(
             scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1, charter, params, leg_exposures,
+            base_eua=base_eua,
         )
         pnl = scen_val - base_val
 
     else:
-        base_eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state)
-        base_asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state)
+        base_eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state,
+                                            eua_live=eua_live)
+        base_asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state,
+                                              eua_live=eua_live)
         base_eu_val = base_eu.value(base_eu.base_prices)
         base_asia_val = base_asia.value(base_asia.base_prices)
 
         scen_vals = _vectorized_reprice_physical(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
-                                                  charter, params, first_cargo_state=first_cargo_state)
+                                                  charter, params, first_cargo_state=first_cargo_state,
+                                                  base_eua=base_eua)
 
         if portfolio == "single":
             base_val = base_eu_val if basin == "Europe" else base_asia_val
@@ -1199,6 +1353,273 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     var95, var99, es95, es99, sd = _var_es(pnl)
     return VarResult(pnl=pnl, var95=var95, var99=var99, es95=es95, es99=es99, sd=sd, n=len(pnl),
                       portfolio=portfolio, scen=scen, basis="physical")
+
+
+# ===========================================================================
+# R6 increment E.1(b) (plan sect 6.E.1): OPTIONAL independent charter
+# overlay for HS-VaR. Charter cannot join the joint-historical scenario
+# set honestly (weekly data, ~459 rows -- plan sect 5, E.1(a) above), so
+# this is NOT historical simulation: a separate, clearly-labelled
+# PARAMETRIC add-on that stacks onto an already-computed VarResult,
+# default OFF, never touching ScenarioSet (plan sect 6.E.1's explicit
+# "ScenarioSet must NOT grow charter return columns").
+# ===========================================================================
+
+# Fixed, never wall-clock-derived (plan's explicit "no wall-clock/
+# Date.now-style nondeterminism" requirement) -- chosen as this
+# increment's implementation date so it is traceable, not because the
+# value is otherwise meaningful. Every test exercising the overlay must
+# see the SAME draws run to run.
+CHARTER_OVERLAY_SEED = 20260718
+
+# The charter series is ~weekly (median 7-calendar-day gap -- verified
+# against the live workbook, R6 increment E.2); this model treats a
+# "week" as 5 BUSINESS days for scaling purposes, consistent with every
+# OTHER factor in this codebase being quoted on a business-day calendar
+# (HH/TTF/JKM/FX/the HS-VaR scenario grid itself). This is a documented
+# MODELLING ASSUMPTION, not an observed fact (no daily charter history
+# exists to observe -- that is the entire reason this overlay exists
+# instead of joining charter to the joint-historical set).
+CHARTER_OVERLAY_BUSINESS_DAYS_PER_WEEK = 5.0
+
+
+def charter_weekly_vol(charter_table: pd.DataFrame) -> float:
+    """Std of consecutive-row log-returns of the charter rate174 series
+    (plan sect 6.E.1(b): "weekly-calibrated vol from the actual charter
+    series (log-returns...)"), sample std (ddof=1, the usual unbiased
+    estimator for a vol calibrated from a finite historical sample). Uses
+    the raw series AS-IS, every consecutive pair, exactly as the plan
+    specifies -- no outlier filtering or resampling to a strict weekly
+    grid (the series already IS approximately weekly; a handful of
+    extreme historical moves, e.g. the 2020 COVID-era charter-market
+    dislocation, legitimately widen this estimate rather than being
+    artifacts to clean -- 'honestly' per this increment's own framing)."""
+    rates = charter_table.sort_values("date")["rate174"].to_numpy(dtype=float)
+    if len(rates) < 3:
+        raise ValueError("charter series too short to calibrate an overlay vol (need >= 3 rows)")
+    log_ret = np.diff(np.log(rates))
+    return float(np.std(log_ret, ddof=1))
+
+
+def charter_daily_vol(charter_table: pd.DataFrame) -> float:
+    """Weekly vol scaled DOWN to a 1-day-equivalent std (plan sect
+    6.E.1(b): "scaled to the 1-day horizon honestly -- document the
+    scaling"): variance is additive under the assumption that a weekly
+    move is the sum of CHARTER_OVERLAY_BUSINESS_DAYS_PER_WEEK iid daily
+    moves, so weekly_var = n * daily_var => daily_vol = weekly_vol /
+    sqrt(n). This is the honest direction to scale (DOWN from the only
+    frequency actually observed) -- the rejected alternative (plan sect
+    6.E.1(a)) was forward-filling to fabricate a daily SERIES, which
+    manufactures ~80% zero returns; scaling the VOL alone, then drawing
+    fresh iid shocks at that scale (charter_overlay_pnl()), never
+    fabricates observations, only a magnitude."""
+    return charter_weekly_vol(charter_table) / np.sqrt(CHARTER_OVERLAY_BUSINESS_DAYS_PER_WEEK)
+
+
+def charter_overlay_calibration(tables) -> dict:
+    """Everything the VaR page prints about the overlay's two required
+    assumptions (plan sect 6.E.1(b): "BOTH assumptions (independence,
+    calibration basis) printed on the page") -- `n_obs`/`weekly_vol`/
+    `daily_vol`/`business_days_per_week` document the CALIBRATION basis;
+    the INDEPENDENCE assumption itself has no number to print (it is
+    apply_charter_overlay()'s own seeded-iid-draw construction), so
+    callers state it in prose alongside these numbers."""
+    weekly_vol = charter_weekly_vol(tables.charter)
+    daily_vol = weekly_vol / np.sqrt(CHARTER_OVERLAY_BUSINESS_DAYS_PER_WEEK)
+    return dict(
+        n_obs=len(tables.charter),
+        weekly_vol=weekly_vol,
+        daily_vol=daily_vol,
+        business_days_per_week=CHARTER_OVERLAY_BUSINESS_DAYS_PER_WEEK,
+        seed=CHARTER_OVERLAY_SEED,
+    )
+
+
+def charter_overlay_pnl(n: int, charter_quantity: float, base_charter: float, daily_vol: float,
+                         seed: int = CHARTER_OVERLAY_SEED) -> np.ndarray:
+    """n iid Normal(0, 1) draws, scaled to a dollar charter-PRICE shock at
+    `base_charter` (`base_charter * daily_vol * z` -- a delta-normal
+    absolute perturbation, not a resampled historical move: NORMAL
+    shocks, per plan sect 6.E.1(b), not log-normal compounding, since
+    this overlay is explicitly a MODEL overlay rather than historical
+    simulation), multiplied by `charter_quantity` (days -- the CHARTER
+    cash-flow quantity already on the priced portfolio's exposure(s),
+    negative for a cost) -- plan sect 6.E.1(b): "applied as an ADDITIVE
+    independent P&L overlay per scenario (charter quantity x
+    charter-price shock)". Seeded (CHARTER_OVERLAY_SEED) so the draw is
+    reproducible run to run -- no wall-clock/nondeterministic draw
+    anywhere in this path."""
+    rng = np.random.default_rng(seed)
+    z = rng.normal(0.0, 1.0, size=n)
+    price_shock = base_charter * daily_vol * z
+    return charter_quantity * price_shock
+
+
+def _charter_quantity_for_portfolio(D, tables, params: Params, basis: str, portfolio: str,
+                                     month_index: int, basin: str,
+                                     first_cargo_state: Optional[decision.FirstCargoState] = None) -> float:
+    """Net CHARTER-factor quantity (days) the given portfolio is exposed
+    to -- what apply_charter_overlay() multiplies its independent price
+    shock by. Mirrors each portfolio's OWN composition (verdict selection
+    for 12cargo, asia-minus-europe for spread, leg sum for programme --
+    the exact same logic historical_var()/historical_var_physical() use
+    to select/sum cargo VALUES) but reads only the CHARTER cash-flow
+    quantity via CargoExposure.quantity_on(), cheap D-dependent cash-flow
+    ASSEMBLY (per cashflows.py's own two-layer split), not a full scenario
+    repricing. "hedged" reuses "single": the Section 7 mechanical hedge
+    has no charter leg (the 'Freight FFA' row is explicitly
+    required=False, 'no liquid contract' -- europe_hedge_legs()/
+    asia_hedge_legs()), so a hedged residual's charter exposure equals
+    the unhedged single cargo's."""
+    if basis == "legacy":
+        if portfolio in ("single", "hedged"):
+            eu, asia = legacy_cargo_cashflows(D, tables, params, month_index)
+            exposure = eu if basin == "Europe" else asia
+            return exposure.quantity_on((RiskFactor.CHARTER,))
+        if portfolio == "spread":
+            eu, asia = legacy_cargo_cashflows(D, tables, params, month_index)
+            return asia.quantity_on((RiskFactor.CHARTER,)) - eu.quantity_on((RiskFactor.CHARTER,))
+        if portfolio == "12cargo":
+            base = model.strip(D, tables, params)
+            base_verdict = base["verdict"].to_numpy()
+            total = 0.0
+            for i in range(12):
+                eu, asia = legacy_cargo_cashflows(D, tables, params, i)
+                exposure = asia if base_verdict[i] == "Asia" else eu
+                total += exposure.quantity_on((RiskFactor.CHARTER,))
+            return total
+        raise ValueError(f"unknown legacy portfolio {portfolio!r} for the charter overlay")
+    elif basis == "physical":
+        if portfolio == "single":
+            exposure = physical_cargo_cashflows(D, tables, params, month_index, basin, first_cargo_state)
+            return exposure.quantity_on((RiskFactor.CHARTER,))
+        if portfolio == "spread":
+            eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state)
+            asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state)
+            return asia.quantity_on((RiskFactor.CHARTER,)) - eu.quantity_on((RiskFactor.CHARTER,))
+        if portfolio == "programme":
+            plan = build_committed_programme(D, tables, params, month_index, first_cargo_state)
+            leg_exposures = _programme_leg_exposures(D, tables, params, plan, first_cargo_state)
+            return sum(exposure.quantity_on((RiskFactor.CHARTER,)) for _, exposure in leg_exposures)
+        raise ValueError(f"unknown physical portfolio {portfolio!r} for the charter overlay")
+    else:
+        raise ValueError(f"unknown basis {basis!r} (expected 'legacy' or 'physical')")
+
+
+def apply_charter_overlay(r: VarResult, D, tables, params: Params, portfolio: str, month_index: int = 0,
+                           basin: str = "Europe",
+                           first_cargo_state: Optional[decision.FirstCargoState] = None,
+                           seed: int = CHARTER_OVERLAY_SEED) -> VarResult:
+    """Stacks the OPTIONAL independent charter overlay (plan sect
+    6.E.1(b)) onto an already-computed VarResult `r`: recomputes
+    VaR/ES/sd on `r.pnl + overlay`, where `overlay` is `len(r.pnl)` iid
+    seeded normal draws (charter_overlay_pnl()) x this portfolio's own
+    CHARTER quantity (_charter_quantity_for_portfolio()). ZERO ASSUMED
+    CORRELATION to the gas complex -- the draws are fresh iid noise,
+    statistically independent of which historical scenario row they land
+    on, never derived from or matched to the HS scenario dates in any way
+    -- the other of the two assumptions plan sect 6.E.1(b) requires
+    printed on the page (charter_overlay_calibration() documents the
+    calibration-basis half). `r.basis` selects the portfolio-composition
+    branch (legacy vs physical) -- read off the VarResult itself, never
+    re-derived independently, so the overlay always matches whatever
+    basis `r` was actually computed under.
+
+    Scope: HS-VaR only (plan sect 6.E.1(b)'s own heading) -- this touches
+    ONLY the returned VarResult's pnl/var95/var99/es95/es99/sd; n,
+    portfolio, scen and basis are carried over unchanged (dataclasses.
+    replace). Stress tests (run_stress_tests()) get their OWN, separate
+    charter treatment (E.1(a)'s three deterministic rows); backtest and
+    the overlapping 10-day VaR are untouched by this function -- callers
+    apply it to the top-line VarResult only, not to every downstream
+    consumer of a ScenarioSet.
+    """
+    D = pd.Timestamp(D)
+    charter_qty = _charter_quantity_for_portfolio(D, tables, params, r.basis, portfolio, month_index, basin,
+                                                   first_cargo_state)
+    ch_row = snap(tables.charter, D)
+    base_charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
+    daily_vol = charter_daily_vol(tables.charter)
+    overlay = charter_overlay_pnl(len(r.pnl), charter_qty, base_charter, daily_vol, seed=seed)
+    new_pnl = r.pnl + overlay
+    var95, var99, es95, es99, sd = _var_es(new_pnl)
+    return replace(r, pnl=new_pnl, var95=var95, var99=var99, es95=es95, es99=es99, sd=sd)
+
+
+# ===========================================================================
+# R6 increment E.3 (plan sect 6.E.3, plan sect 8 decision 4): the
+# factor-coverage disclosure line -- "explicit UI disclosure line listing
+# exactly which factors are stochastic vs deterministic in the current
+# run. No silent omissions."
+# ===========================================================================
+
+
+def factor_coverage_line(tables, basis: str = "legacy", charter_overlay_on: bool = False) -> str:
+    """One line naming every RiskFactor's status in the CURRENT run, plus
+    the one excluded factor the plan calls out by name (plan sect 8
+    decision 4: "basis ships disclosed-or-excluded, not silently
+    proxied"). Pure string builder (no Streamlit) so it is unit-testable
+    and reusable by both VaR-page bases -- app.py just st.caption()s the
+    result.
+
+    HH/TTF/JKM/FX: unconditionally stochastic -- the joint-historical
+    scenario set (build_scenarios()) always covers exactly these four,
+    on either basis, with or without VLSFO/EUA/charter-overlay data.
+
+    CHARTER: deterministic inside historical simulation on EITHER basis
+    (plan sect 6.E.1's revised decision -- the ~459-row weekly series
+    cannot join the daily joint-historical set honestly), stress-tested
+    separately (run_stress_tests()'s three new rows); `charter_overlay_on`
+    additionally names the optional independent model overlay
+    (apply_charter_overlay()) when the caller has switched it on.
+
+    VLSFO: reflects `tables.vlsfo` alone (basis-independent -- R6
+    increment E.2's VLSFO wiring is safe and identical on both bases,
+    since VLSFO's cash flow was never folded -- see
+    _vectorized_reprice()'s own E.2 comment).
+
+    EUA: reflects `tables.eua` on the PHYSICAL basis, but is UNCONDITIONALLY
+    deterministic on the LEGACY basis regardless of `tables.eua` -- the
+    live (EUA, FX) re-split is physical-basis-only by hard constraint
+    (model.strip() is frozen/read-only and can never learn about a live
+    EUA table -- see cashflows.physical_cargo_quantities()'s "EUA
+    factor" docstring paragraph for the full reasoning). Getting this
+    basis distinction right is the entire point of this function existing
+    rather than a single global "VLSFO/EUA: no history" caption.
+
+    Locational/physical basis (NWE DES-TTF vs JKM index vs physical,
+    USGC terminal basis to HH -- plan sect 5's "NWE / JKM physical
+    basis" row): EXCLUDED from every run, no exceptions, no proxy --
+    plan sect 8 decision 4's explicit "excluded-with-disclosure, no
+    silent proxy" (as opposed to a config-based proxy vol, the OTHER
+    option R6.6 left open). Named "locational basis" here, not "basis",
+    to avoid colliding with this page's OWN "Value basis" (legacy/
+    physical) radio button label.
+    """
+    if basis not in ("legacy", "physical"):
+        raise ValueError(f"unknown basis {basis!r} (expected 'legacy' or 'physical')")
+
+    charter_status = (
+        "deterministic in historical simulation + optional independent model overlay (ON -- see caption above)"
+        if charter_overlay_on else
+        "deterministic in historical simulation (overlay OFF); stress-tested separately (Section 8 stress rows)"
+    )
+
+    vlsfo_status = ("stochastic (history in workbook)" if getattr(tables, "vlsfo", None) is not None
+                     else "deterministic (no history in workbook)")
+
+    if basis == "legacy":
+        eua_status = "deterministic (legacy basis is frozen to model.strip(); no live-factor path exists here)"
+    else:
+        eua_status = ("stochastic (history in workbook)" if getattr(tables, "eua", None) is not None
+                       else "deterministic (no history in workbook)")
+
+    return (
+        "Factor coverage this run: HH / TTF / JKM / FX -- stochastic (joint historical simulation). "
+        f"CHARTER -- {charter_status}. VLSFO -- {vlsfo_status}. EUA -- {eua_status}. "
+        "NWE/JKM locational basis -- EXCLUDED (not modelled, no proxy -- plan sect 8 decision 4). "
+        "FuelEU is not modelled in this release either (separate from the factor set above)."
+    )
 
 
 def scale_to_horizon(var_1d: float, days: int = 10, method: str = "sqrt", scen: Optional[ScenarioSet] = None,
@@ -1274,6 +1695,75 @@ def stress_historical_replay(D, tables, params: Params, replay_date: str) -> dic
     return dict(name=f"Replay {replay_date.date()} move", pnl_12cargo=r12.pnl[0], pnl_m1_spread=rspread.pnl[0])
 
 
+def _charter_stress_shocks(base_charter: float) -> list[tuple[str, float]]:
+    """R6 increment E.1(a) (plan sect 6.E.1): the three new charter
+    stress-table rows' (label, bumped charter $/day) pairs, shared by
+    both basis branches of run_stress_tests() so the shock DEFINITIONS
+    (not just their evaluation) cannot drift between the two."""
+    return [
+        ("Charter +$25k/day", base_charter + 25_000.0),
+        ("Charter -$25k/day", base_charter - 25_000.0),
+        ("Charter +50%", base_charter * 1.5),
+    ]
+
+
+def _charter_bumped_legacy_12cargo_and_spread(D, tables, params: Params, base: pd.DataFrame,
+                                               bumped_charter: float) -> tuple:
+    """Legacy-basis charter PRICE bump (R6 increment E.1(a)): rebuild
+    each of the 12 months' cash-flow exposures via
+    cashflows.legacy_cargo_cashflows() -- the SAME per-factor
+    decomposition the rest of this module already prices legacy VaR/
+    deltas from -- bump ONLY the CHARTER entry of `base_prices`, and
+    re-evaluate. This is "evaluated on the ACTIVE basis's exposures"
+    (plan sect 6.E.1) rather than a `model.strip()` re-run (unlike the
+    three PRE-EXISTING shocks above, kept byte-for-byte from before this
+    increment): bumping a CargoExposure's base_prices[CHARTER] is
+    numerically IDENTICAL to bumping params.charter_override and
+    reassembling (CHARTER's quantity never depends on the charter PRICE,
+    only on Params' day-count fields -- see cashflows.RiskFactor's
+    docstring), so this is a genuine, not merely convenient,
+    re-expression -- and, unlike a model.strip() re-run, it is the same
+    code shape the `else` (physical) branch below uses, so the two basis
+    branches of a brand-new stress row read as symmetric rather than one
+    more model.strip()-vs-cash-flow-layer asymmetry to keep in sync by
+    hand.
+
+    Returns (val12, m1_spread) at the bumped charter price -- the
+    caller diffs these against base_12/base_spread_m1, matching every
+    other row's convention."""
+    base_verdict = base["verdict"].to_numpy()
+    val12 = 0.0
+    m1_spread = None
+    for i in range(12):
+        eu, asia = legacy_cargo_cashflows(D, tables, params, i)
+        eu_prices = dict(eu.base_prices)
+        eu_prices[RiskFactor.CHARTER] = bumped_charter
+        asia_prices = dict(asia.base_prices)
+        asia_prices[RiskFactor.CHARTER] = bumped_charter
+        eu_val = eu.value(eu_prices)
+        asia_val = asia.value(asia_prices)
+        val12 += asia_val if base_verdict[i] == "Asia" else eu_val
+        if i == 0:
+            m1_spread = asia_val - eu_val
+    return val12, m1_spread
+
+
+def _charter_bumped_physical_spread(D, tables, params: Params, bumped_charter: float,
+                                     first_cargo_state: Optional[decision.FirstCargoState]) -> float:
+    """Physical-basis counterpart of _charter_bumped_legacy_12cargo_and_
+    spread() (R6 increment E.1(a)): same base_prices[CHARTER] bump, on
+    month 0's physical exposures, mirroring the existing JKM+2.6 physical
+    stress row's own pattern (bump one base_prices entry, re-evaluate --
+    see run_stress_tests()'s "JKM +2.6" branch)."""
+    eu = physical_cargo_cashflows(D, tables, params, 0, "Europe", first_cargo_state)
+    asia = physical_cargo_cashflows(D, tables, params, 0, "Asia", first_cargo_state)
+    eu_prices = dict(eu.base_prices)
+    eu_prices[RiskFactor.CHARTER] = bumped_charter
+    asia_prices = dict(asia.base_prices)
+    asia_prices[RiskFactor.CHARTER] = bumped_charter
+    return asia.value(asia_prices) - eu.value(eu_prices)
+
+
 def run_stress_tests(D, tables, params: Params, basis: str = "legacy",
                       first_cargo_state: Optional[decision.FirstCargoState] = None) -> pd.DataFrame:
     """Section 8 'Stress tests': deterministic scenarios, reported as
@@ -1312,6 +1802,21 @@ def run_stress_tests(D, tables, params: Params, basis: str = "legacy",
     increment's marginal value; historical_var_physical() (C.5) already
     gives a caller who wants a physical-basis historical-replay number
     the building blocks to construct one directly.
+
+    THREE CHARTER rows (R6 increment E.1(a), plan sect 6.E.1) follow the
+    six rows above on EITHER basis: "Charter +$25k/day", "Charter
+    -$25k/day", "Charter +50%" -- a genuine factor-PRICE bump evaluated
+    on the ACTIVE basis's own CargoExposure objects (see
+    _charter_bumped_legacy_12cargo_and_spread()/
+    _charter_bumped_physical_spread()), NOT a model.strip() re-run, so
+    (unlike the pre-existing six rows) these three are symmetric code on
+    either basis. This is charter's stress-table half of the plan's
+    revised E.1 decision -- charter stays deterministic inside HS-VaR
+    (see historical_var()/historical_var_physical(), unchanged) because
+    the ~459-row weekly series cannot join the daily joint-historical
+    scenario set honestly (plan sect 5); these three rows plus the
+    optional independent overlay (apply_charter_overlay()) are how
+    charter risk is surfaced instead.
     """
     if basis not in ("legacy", "physical"):
         raise ValueError(f"unknown basis {basis!r} (expected 'legacy' or 'physical')")
@@ -1319,6 +1824,11 @@ def run_stress_tests(D, tables, params: Params, basis: str = "legacy",
     base = model.strip(D, tables, params)
     base_12 = np.where(base["verdict"] == "Asia", base["asia_cargo"], base["eu_cargo"]).sum()
     base_spread_m1 = base.iloc[0]["asia_cargo"] - base.iloc[0]["eu_cargo"]
+    # Base charter $/day (R6 increment E.1(a)) -- the SAME snap/override
+    # resolution historical_var()/historical_var_physical() use, needed
+    # to anchor the three new charter stress shocks below.
+    ch_row = snap(tables.charter, D)
+    charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
 
     def _physical_spread(shock_params: Params) -> float:
         eu = physical_cargo_cashflows(D, tables, shock_params, 0, "Europe", first_cargo_state)
@@ -1393,6 +1903,16 @@ def run_stress_tests(D, tables, params: Params, basis: str = "legacy",
         rows.append(dict(scenario="EUA EUR70 -> EUR120/t", pnl_12cargo=np.nan,
                           pnl_m1_spread=_physical_spread(p2) - base_spread_phys,
                           note="pnl_12cargo n/a under physical basis (plan sect 8.3)"))
+
+    # --- Charter shocks (R6 increment E.1(a), plan sect 6.E.1) ---
+    for label, bumped_charter in _charter_stress_shocks(charter):
+        if basis == "legacy":
+            val12, m1_spread = _charter_bumped_legacy_12cargo_and_spread(D, tables, params, base, bumped_charter)
+            rows.append(dict(scenario=label, pnl_12cargo=val12 - base_12, pnl_m1_spread=m1_spread - base_spread_m1))
+        else:
+            new_spread = _charter_bumped_physical_spread(D, tables, params, bumped_charter, first_cargo_state)
+            rows.append(dict(scenario=label, pnl_12cargo=np.nan, pnl_m1_spread=new_spread - base_spread_phys,
+                              note="pnl_12cargo n/a under physical basis (plan sect 8.3)"))
 
     return pd.DataFrame(rows)
 

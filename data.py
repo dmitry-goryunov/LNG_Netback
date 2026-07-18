@@ -242,6 +242,49 @@ def load_volatilities(path_or_buffer) -> pd.DataFrame:
     return body.drop(columns=["tenor"]).set_index("months_forward").sort_index()
 
 
+def _load_date_price_sheet(path_or_buffer, sheet: str) -> pd.DataFrame:
+    """Shared body for load_vlsfo()/load_eua() (R6 increment E.2, plan
+    sect 6.E.2): a daily date+price history sheet, laid out like every
+    OTHER strip-style sheet in this workbook (row1=index numbers,
+    row2=headers, row3=blank, row4+=data -- the same skiprows=3
+    convention _load_strip_sheet()/load_charter() use), col A=date,
+    col B=price. Neither VLSFO nor EUA sheet exists in the current
+    workbook (plan sect 5 -- verified 17-Jul-2026 and again for this
+    increment); this is the owner's eventual "date + price columns, same
+    layout as charter" sheet (plan sect 5's action item), best-guessed
+    ahead of time so the code path is ready the day it's added -- update
+    the column mapping here if the real sheet differs. Raises naturally
+    (pandas' own "worksheet not found" ValueError) when the sheet is
+    absent; tolerance of that lives at the CALL SITE (load_all(), mirroring
+    load_volatilities()'s own pattern), not here -- every other bare
+    loader in this module also just lets pandas raise."""
+    raw = pd.read_excel(path_or_buffer, sheet_name=sheet, header=None, skiprows=3)
+    out = raw.rename(columns={raw.columns[0]: "date", raw.columns[1]: "price"})[["date", "price"]].copy()
+    out["date"] = _parse_date_column(out["date"])
+    out = out.dropna(subset=["date"])
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out = out.sort_values("date").drop_duplicates(subset="date", keep="last").reset_index(drop=True)
+    out = out.dropna(subset=["price"])
+    return out
+
+
+def load_vlsfo(path_or_buffer) -> pd.DataFrame:
+    """VLSFO daily price history (R6 increment E.2, plan sect 6.E.2,
+    R6.5b) -- see _load_date_price_sheet() for the layout/tolerance
+    contract. Feeds risk.build_scenarios()'s optional VLSFO log-return
+    column once a real sheet exists; until then load_all() catches this
+    function's exception and CurveTables.vlsfo stays None (factor stays
+    deterministic -- see risk.factor_coverage_line())."""
+    return _load_date_price_sheet(path_or_buffer, "VLSFO")
+
+
+def load_eua(path_or_buffer) -> pd.DataFrame:
+    """EUA daily price history -- identical layout/tolerance contract to
+    load_vlsfo() (R6 increment E.2, plan sect 6.E.2, R6.5b); see that
+    function's docstring."""
+    return _load_date_price_sheet(path_or_buffer, "EUA")
+
+
 # ---------------------------------------------------------------------------
 # Master date list (spec 1.5)
 # ---------------------------------------------------------------------------
@@ -348,6 +391,17 @@ class CurveTables:
     us_netbacks: Optional[pd.DataFrame] = None
     us_transport: Optional[pd.DataFrame] = None
     vol: Optional[pd.DataFrame] = None
+    # R6 increment E.2 (plan sect 6.E.2, R6.5b): optional daily date+price
+    # history, None until the owner adds the sheets (plan sect 5). Added
+    # as trailing Optional fields with defaults, like `vol` above, so
+    # EVERY existing CurveTables(...) construction (the sole call site is
+    # load_all() itself, keyword-only -- verified via repo-wide search)
+    # keeps working unchanged. None => the corresponding RiskFactor stays
+    # deterministic everywhere (risk.build_scenarios() emits no return
+    # column for it, cashflows.py's folded ETS quantity is untouched) --
+    # see risk.factor_coverage_line() for the UI-facing disclosure.
+    vlsfo: Optional[pd.DataFrame] = None
+    eua: Optional[pd.DataFrame] = None
     master_dates: pd.DatetimeIndex = field(default_factory=lambda: pd.DatetimeIndex([]))
     warnings: list[str] = field(default_factory=list)
     source: str = ""
@@ -374,12 +428,21 @@ def load_all(path_or_buffer, source_label: str = "") -> CurveTables:
         vol = load_volatilities(path_or_buffer)
     except Exception:
         vol = None
+    try:
+        vlsfo = load_vlsfo(path_or_buffer)
+    except Exception:
+        vlsfo = None
+    try:
+        eua = load_eua(path_or_buffer)
+    except Exception:
+        eua = None
 
     master_dates = compute_master_dates(hh, ttf, jkm, fx, charter)
 
     tables = CurveTables(
         hh=hh, ttf=ttf, jkm=jkm, fx=fx, charter=charter,
         us_netbacks=us_netbacks, us_transport=us_transport, vol=vol,
+        vlsfo=vlsfo, eua=eua,
         master_dates=master_dates,
         source=str(source_label),
     )

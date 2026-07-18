@@ -283,7 +283,18 @@ def _snap_month_prices(D, tables, params: Params, month_index: int) -> dict:
     without importing risk, per plan sect 6.A. Always uses fx_curve()
     (the 3-point spot/o6/o1 curve), matching strip()'s n_months<=12 path
     exactly -- the 12 legacy load months this module targets never take
-    strip()'s n_months>12 / fx_curve_multi() branch."""
+    strip()'s n_months>12 / fx_curve_multi() branch.
+
+    `eua_l` (R6 increment E.2, plan sect 6.E.2): the snapped EUA price at
+    D, or None when `tables` carries no `eua` table (the attribute is
+    read via getattr() so a caller passing a minimal/synthetic tables
+    stand-in without an `eua` attribute at all degrades to None rather
+    than AttributeError -- same tolerate-absence spirit as
+    data.load_all()'s try/except around load_eua()). This is a snap
+    ONLY -- it does not decide whether any caller should USE the EUA
+    factor (that is physical_cargo_cashflows()'s `eua_live` parameter);
+    every caller gets the snapped price for free, cheaply, whether or not
+    it ends up using it."""
     D = pd.Timestamp(D)
     hh_row = snap(tables.hh, D)
     ttf_row = snap(tables.ttf, D)
@@ -299,7 +310,9 @@ def _snap_month_prices(D, tables, params: Params, month_index: int) -> dict:
     ttf_l = float(ttf_row[f"c{month_index + 1}"])
     jkm_idx = month_index + 2 - s
     jkm_l1 = float(jkm_row[f"c{jkm_idx}"])
-    return dict(L=L, charter=charter, fx_l=fx_l, hh_l=hh_l, ttf_l=ttf_l, jkm_l1=jkm_l1)
+    eua_table = getattr(tables, "eua", None)
+    eua_l = float(snap(eua_table, D)["price"]) if eua_table is not None else None
+    return dict(L=L, charter=charter, fx_l=fx_l, hh_l=hh_l, ttf_l=ttf_l, jkm_l1=jkm_l1, eua_l=eua_l)
 
 
 def legacy_cargo_quantities(params: Params, load_month_year: int) -> tuple[list[CashFlow], list[CashFlow]]:
@@ -521,14 +534,16 @@ def legacy_cargo_cashflows(D, tables, params: Params,
 def physical_cargo_quantities(
     params: Params, route: str, load_month_year: int,
     first_cargo_state: Optional["decision.FirstCargoState"] = None,
+    eua_live: bool = False,
 ) -> list[CashFlow]:
     """Price-independent half of the PHYSICAL decomposition (plan sect
     6.C.1/C.2/C.4): a pure function of `params`, `route` ("Europe"/"Asia",
-    aliases accepted via decision._normalise_route()) and the load
-    month's calendar YEAR (ETS phase, same reason as
-    legacy_cargo_quantities()) and `first_cargo_state` (C.2, sunk-cost
-    zeroing) only. No `tables`, no `D`, no month_index -- same
-    Params-hash-cacheable shape as legacy_cargo_quantities(), so
+    aliases accepted via decision._normalise_route()), the load month's
+    calendar YEAR (ETS phase, same reason as legacy_cargo_quantities()),
+    `first_cargo_state` (C.2, sunk-cost zeroing) and `eua_live` (R6
+    increment E.2, plan sect 6.E.2 -- see this function's own "EUA
+    factor" paragraph below) only. No `tables`, no `D`, no month_index --
+    same Params-hash-cacheable shape as legacy_cargo_quantities(), so
     risk.py's physical repricer gets the identical "build once per call,
     reuse across every scenario" performance property (plan sect 2).
 
@@ -598,19 +613,50 @@ def physical_cargo_quantities(
         formula's estimate. This is the headline physical-engine
         difference from legacy on the fuel side.
       - ETS (Europe only; Asia is entirely outside EU ETS scope in both
-        models): FX-linear, quantity -voyage_em.ets_covered_co2e_tonnes *
-        eua_price * phase -- EUA price and phase folded into the
-        quantity, mirroring legacy's FX-linear ETS convention exactly
-        (see RiskFactor's docstring: R6.5b re-splits ETS into an
-        (EUA, FX) bilinear product for BOTH bases together, once EUA has
-        its own price history). ets_covered_co2e_tonnes uses the route
-        builder's real PER-SEGMENT scope (0.5 sea / 1.0 at-berth /
-        0.0 loading-berth for Europe), not legacy's uniform-0.5 constant
-        -- the ~4.45% base-value gap test_physical_legacy_equivalence.py
-        documents.
+        models): when `eua_live=False` (the default -- see "EUA factor"
+        paragraph below), FX-linear, quantity
+        -voyage_em.ets_covered_co2e_tonnes * eua_price * phase -- EUA
+        price and phase folded into the quantity, mirroring legacy's
+        FX-linear ETS convention exactly. ets_covered_co2e_tonnes uses
+        the route builder's real PER-SEGMENT scope (0.5 sea / 1.0
+        at-berth / 0.0 loading-berth for Europe), not legacy's
+        uniform-0.5 constant -- the ~4.45% base-value gap
+        test_physical_legacy_equivalence.py documents.
       - Fees/tolls: constants, matching _physical_route_breakdown()'s own
         remaining lines (Loading, Discharge/regas [Europe] or Canal/Port
         [Asia], Other).
+
+    EUA factor (R6 increment E.2, plan sect 6.E.2, R6.5b -- PHYSICAL BASIS
+    ONLY, see below for why): `eua_live` gates a re-split of the ETS cash
+    flow from the FX-linear folded form above to an (EUA, FX) BILINEAR
+    product -- quantity -voyage_em.ets_covered_co2e_tonnes * phase (EUA
+    price and phase separated: `eua_price` no longer appears in the
+    quantity at all), matching RiskFactor's own docstring note that this
+    is exactly the transition building factor PRODUCTS in from day one
+    was for. `eua_live=False` (the default) is BYTE-IDENTICAL to
+    pre-increment-E behaviour -- every existing caller (analytic_deltas,
+    hedge legs, run_stress_tests's own "EUA EUR70 -> EUR120/t" row, every
+    pre-increment-E test) omits this argument and is therefore completely
+    unaffected regardless of whether `tables.eua` happens to hold data --
+    the re-split only ever fires when a caller explicitly asks for it,
+    never by auto-detection inside this Params-only function (which has
+    no `tables` to detect anything from in the first place).
+
+    PHYSICAL BASIS ONLY: the legacy basis has no `eua_live` path and
+    never will -- legacy_cargo_quantities()'s zero-shock P&L must match
+    model.strip() (a frozen, read-only module whose `ets` line hardcodes
+    `params.eua_price` and can never learn about a live EUA table)
+    EXACTLY, on every scenario including a live-EUA one; re-splitting the
+    legacy ETS term would silently break that identity the moment a real
+    EUA sheet appeared. The physical basis has no equivalent frozen
+    anchor for a live factor to conflict with (its own zero-shock ground
+    truth, decision.route_value(), is likewise frozen at `params.
+    eua_price` under eua_live=False, which is exactly the path every
+    parity test in this file's test suite exercises -- eua_live=True is
+    an ADDITIONAL, self-consistent mode with its OWN zero-shock ground
+    truth, a CargoExposure built the same way, not a claim of parity
+    against decision.route_value(), which -- like model.strip() -- has no
+    live-EUA concept to be consistent WITH).
 
     first_cargo_state (C.2, "a sunk leg is a constant, not an exposure"):
     mapped through decision.cost_policy() exactly, anchored on
@@ -652,11 +698,11 @@ def physical_cargo_quantities(
     principle.
     """
     route = decision._normalise_route(route)
-    key = (_params_field_key(params), route, load_month_year, first_cargo_state)
+    key = (_params_field_key(params), route, load_month_year, first_cargo_state, eua_live)
     cached = _physical_quantity_cache.get(key)
     if cached is not None:
         return list(cached)
-    result = _physical_cargo_quantities_impl(params, route, load_month_year, first_cargo_state)
+    result = _physical_cargo_quantities_impl(params, route, load_month_year, first_cargo_state, eua_live)
     _physical_quantity_cache.set(key, result)
     return list(result)
 
@@ -664,6 +710,7 @@ def physical_cargo_quantities(
 def _physical_cargo_quantities_impl(
     params: Params, route: str, load_month_year: int,
     first_cargo_state: Optional["decision.FirstCargoState"],
+    eua_live: bool = False,
 ) -> list[CashFlow]:
     """Uncached body of physical_cargo_quantities() -- see that function's
     docstring for the full derivation and the caching/state contract.
@@ -722,10 +769,17 @@ def _physical_cargo_quantities_impl(
     if route == "Europe":
         voyage_em = emissions.voyage_emissions(ledger)
         phase = phase_for_year(load_month_year)
-        flows.append(CashFlow((RiskFactor.FX,), MI,
-                               -voyage_em.ets_covered_co2e_tonnes * params.eua_price * phase,
-                               "ETS, per-segment scope (EUA price folded into the quantity -- see "
-                               "RiskFactor's docstring; R6.5b re-splits into an (EUA, FX) product)"))
+        if eua_live:
+            flows.append(CashFlow((RiskFactor.EUA, RiskFactor.FX), MI,
+                                   -voyage_em.ets_covered_co2e_tonnes * phase,
+                                   "ETS, per-segment scope, (EUA, FX) bilinear -- EUA factor LIVE "
+                                   "(R6 increment E.2, plan sect 6.E.2)"))
+        else:
+            flows.append(CashFlow((RiskFactor.FX,), MI,
+                                   -voyage_em.ets_covered_co2e_tonnes * params.eua_price * phase,
+                                   "ETS, per-segment scope (EUA price folded into the quantity -- see "
+                                   "RiskFactor's docstring; R6 increment E.2 re-splits into an "
+                                   "(EUA, FX) product when eua_live=True)"))
         flows.append(CashFlow((), MI, -cargo * params.eu_regas_port, "discharge/regas"))
     else:
         flows.append(CashFlow((), MI, -params.panama_toll_roundtrip, "Panama toll roundtrip"))
@@ -739,6 +793,7 @@ def _physical_cargo_quantities_impl(
 def physical_cargo_cashflows(
     D, tables, params: Params, month_index: int, route: str,
     first_cargo_state: Optional["decision.FirstCargoState"] = None,
+    eua_live: bool = False,
 ) -> CargoExposure:
     """D-dependent ASSEMBLY wrapper around physical_cargo_quantities()
     (plan sect 6.C.1), mirroring legacy_cargo_cashflows()'s split: snaps
@@ -765,11 +820,28 @@ def physical_cargo_cashflows(
     for the derivation). This is the PHYSICAL basis's own base value, NOT
     model.strip()'s eu_cargo/asia_cargo -- the legacy-vs-physical gap is
     characterised, not reconciled (plan sect 8.5), same policy the
-    Decision page already discloses.
+    Decision page already discloses. That parity guarantee holds under
+    the DEFAULT eua_live=False only -- see physical_cargo_quantities()'s
+    "EUA factor" docstring paragraph for why eua_live=True (R6 increment
+    E.2) is a self-consistent but DIFFERENT base value, not a claim of
+    continued parity against decision.route_value().
+
+    `eua_live=True` additionally requires `tables` to carry a usable
+    `eua` table (raises ValueError otherwise -- fail loud rather than
+    silently fall back to the folded form, which would leave a caller
+    thinking it got a live EUA price when it did not); base_prices then
+    carries the snapped RiskFactor.EUA price _snap_month_prices() already
+    computed (Europe only -- Asia has no ETS term either way, so EUA
+    never appears in Asia's base_prices regardless of eua_live).
     """
     ctx = _snap_month_prices(D, tables, params, month_index)
     route_norm = decision._normalise_route(route)
-    flows = physical_cargo_quantities(params, route_norm, ctx["L"].year, first_cargo_state=first_cargo_state)
+    if eua_live and ctx["eua_l"] is None:
+        raise ValueError(
+            "eua_live=True requires tables.eua (no EUA history available to snap a live price from)"
+        )
+    flows = physical_cargo_quantities(params, route_norm, ctx["L"].year, first_cargo_state=first_cargo_state,
+                                       eua_live=eua_live)
     flows = [replace(cf, month_index=month_index) for cf in flows]
 
     if route_norm == "Europe":
@@ -780,6 +852,8 @@ def physical_cargo_cashflows(
             RiskFactor.CHARTER: ctx["charter"],
             RiskFactor.VLSFO: params.vlsfo_price,
         }
+        if eua_live:
+            base_prices[RiskFactor.EUA] = ctx["eua_l"]
     else:
         base_prices = {
             RiskFactor.JKM: ctx["jkm_l1"],

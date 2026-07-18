@@ -508,3 +508,37 @@ engine work specifically.
   and fixed the now-contradictory 12-cargo warning text. Validation
   (independently re-run at review): pytest 293/293 with workbook, frozen
   64/64, CI simulation 164/129-skip, nine smoke checks.
+
+- **R6 increment E: new risk factors, honestly (18-Jul-2026):** same
+  Sonnet-implements / Opus-reviews workflow (this increment's implementer
+  was interrupted three times by session/model limits mid-run, then
+  completed cleanly on the fourth; its final self-report was lost to the
+  last interruption, so the review worked from the code alone). Three
+  strands: **(E.1) charter** cannot join the 500-day daily
+  joint-historical scenario set (the series is ~459 weekly rows), so it
+  is NOT added to `ScenarioSet` -- instead `run_stress_tests()` gains
+  three deterministic charter rows (+$25k/day, -$25k/day, +50%) on BOTH
+  bases, and an OPTIONAL independent overlay (`apply_charter_overlay()`,
+  off by default) draws seeded delta-normal shocks at a vol calibrated
+  from the weekly series and scaled DOWN to the 1-day horizon
+  (`weekly_vol / sqrt(business_days_per_week)` -- the honest direction:
+  scale the magnitude, never fabricate a daily series by forward-fill),
+  added as an independent (zero-assumed-correlation) P&L overlay with
+  both assumptions printed and the result labelled a model overlay, not
+  historical simulation. **(E.2) VLSFO/EUA** get data-gated loaders
+  (`data.load_vlsfo()`/`load_eua()`, tolerate-absence like
+  `load_volatilities`; `CurveTables.vlsfo`/`.eua` default None) and a
+  live-factor code path wired now and tested against synthetic in-memory
+  tables (no sheet exists yet); the EUA path additionally re-splits the
+  ETS cash flow from FX-linear-folded to `(EUA, FX)` bilinear -- PHYSICAL
+  BASIS ONLY and only when `eua_live=True`, since the legacy basis must
+  stay byte-identical to `model.strip()`'s hardcoded `eua_price`. The
+  default `eua_live=False` path is byte-identical to increment D and the
+  re-split is value-preserving at base prices. **(E.3)** a
+  `factor_coverage_line()` states exactly which factors are stochastic
+  vs deterministic each run (basis risk excluded-with-disclosure, no
+  silent proxy). Validation (independently re-run at review): pytest
+  353/353 with workbook (293 + 60 new), frozen 64/64, CI simulation
+  181/172-skip, twelve smoke checks. Existing stress-row pins extended
+  additively (six pre-existing rows byte-unchanged, three charter rows
+  pinned), no test weakened.

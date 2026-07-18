@@ -1538,6 +1538,18 @@ else:
     roll_on = c2.checkbox("Delivery-month roll-aligned returns (application default on)", value=True)
     method = "roll_aligned" if roll_on else "naive"
 
+    # R6 increment E.1(b) (plan sect 6.E.1): optional independent charter
+    # overlay, both bases, default OFF -- charter itself stays
+    # deterministic inside the historical-simulation scenario set either
+    # way (the ~459-row weekly series cannot join the daily
+    # joint-historical set honestly, plan sect 5); this checkbox stacks a
+    # separate, clearly-labelled PARAMETRIC model overlay on top of the
+    # historical-simulation VaR below, not a historical-simulation factor.
+    charter_overlay_on = st.checkbox(
+        "Add independent charter overlay to VaR (model overlay, NOT historical simulation -- default OFF)",
+        value=False, key="var_charter_overlay",
+    )
+
     if portfolio_kind == "12cargo":
         st.warning(
             "Legacy 12-cargo strip is not a physically time-feasible one-vessel "
@@ -1557,6 +1569,22 @@ else:
     else:
         r = risk.historical_var(D, tables, params, portfolio=portfolio_kind, month_index=mi,
                                  basin=basin_kind, scen=scen)
+
+    if charter_overlay_on:
+        r = risk.apply_charter_overlay(r, D, tables, params, portfolio=portfolio_kind, month_index=mi,
+                                        basin=basin_kind, first_cargo_state=var_first_cargo_state)
+        calib = risk.charter_overlay_calibration(tables)
+        st.caption(
+            "Charter overlay ON -- **model overlay, not historical simulation**: the VaR/ES/sd metrics "
+            "below include an ADDITIVE, independently-drawn charter shock stacked onto the historical "
+            f"gas-complex P&L. Calibration basis: weekly log-return vol of the {calib['n_obs']}-row "
+            f"charter series = {calib['weekly_vol']:.1%}/week, scaled to "
+            f"{calib['daily_vol']:.1%}/day assuming {calib['business_days_per_week']:.0f} iid business "
+            "days per week (a documented modelling assumption -- no daily charter history exists to "
+            f"observe directly). Independence assumption: ZERO correlation to HH/TTF/JKM/FX -- each "
+            f"scenario's charter shock is an independent seeded normal draw (seed={calib['seed']}), "
+            "not tied to that scenario's historical date in any way."
+        )
 
     st.caption(
         ("Value basis: **physical engine** -- base value and scenario repricing use the segment-level "
@@ -1700,7 +1728,12 @@ else:
                 st.dataframe(bt, width="stretch", hide_index=True)
 
     st.caption(CAVEATS)
-    st.caption(
-        "Known exclusions from this VaR: charter (weekly data -- cover via the Section 6 charter delta "
-        "times an assumed weekly move), VLSFO and EUA (static inputs, stress-tested only above), FuelEU."
-    )
+    # R6 increment E.3 (plan sect 6.E.3, plan sect 8 decision 4): "No
+    # silent omissions" -- one line naming exactly which factors are
+    # stochastic vs deterministic in THIS run, both bases, superseding
+    # the old static "known exclusions" caption (charter now has real
+    # stress rows + an optional overlay; VLSFO/EUA are data-gated, not
+    # permanently excluded).
+    st.caption(risk.factor_coverage_line(
+        tables, basis="physical" if physical_basis else "legacy", charter_overlay_on=charter_overlay_on,
+    ))
