@@ -763,6 +763,209 @@ def _vectorized_reprice_physical(scen: ScenarioSet, D, base_hh, base_ttf, base_j
     return dict(eu_cargo=eu_cargo, asia_cargo=asia_cargo, hh_L=hh_L, ttf_L=ttf_L, jkm_L1=jkm_L1, fx_l=fx_l)
 
 
+# ===========================================================================
+# R6 increment D (plan sect 6.D): the committed-PROGRAMME portfolio -- VaR
+# of the optimiser's actual (feasible) one-vessel plan, replacing the
+# infeasible 12-cargo default as the physical basis's flagship portfolio.
+# ===========================================================================
+
+# Knobs mirrored VERBATIM from app.py's Decision-page "Discrete one-vessel
+# programme" branch DEFAULTS (turnaround=0.0, one additional cargo, $0/day
+# residual, current cargo valued POST_LIFT_DIVERSION, no Asia-case override
+# -- "Use sidebar route", i.e. params.asia_rt_days as given). Plan sect
+# 6.D.1's own instruction: "same knobs the Decision page uses...derive the
+# default horizon/turnaround the same way app.py does, do not invent a
+# second convention" -- these are not new user-adjustable knobs, they
+# reproduce the Decision page's OWN out-of-the-box programme (app.py's
+# "Discrete one-vessel programme" section) so "Committed programme" on the
+# VaR page prices what a user who changed nothing on the Decision page
+# would see there. Public (no leading underscore) so app.py's caption can
+# read them back rather than re-hardcoding the same numbers a second time.
+PROGRAMME_TURNAROUND_DAYS = 0.0
+PROGRAMME_MAX_ADDITIONAL_CARGOES = 1
+PROGRAMME_RESIDUAL_VALUE_PER_DAY = 0.0
+# Long enough for optimise_programme() to find a later leg's load month
+# regardless of where the caller's month_index sits in the VaR page's
+# 12-month window -- mirrors app.py's own STRIP_MONTHS constant for the
+# identical reason (decision.optimise_programme()'s recursive search
+# matches a future start day against strip_df rows; a too-short strip
+# would silently truncate the search, not error).
+_PROGRAMME_STRIP_MONTHS = 36
+
+
+def build_committed_programme(D, tables, params: Params, month_index: int = 0,
+                               first_cargo_state: Optional[decision.FirstCargoState] = None,
+                               ) -> decision.ProgrammePlan:
+    """R6 increment D.1 (plan sect 6.D): the CURRENT optimiser output for
+    the committed one-vessel programme -- decision.optimise_programme()'s
+    own best plan, built with EXACTLY the knobs app.py's Decision page
+    uses by default (module constants above), so "Committed programme" on
+    the VaR page prices the same plan a user would see, unedited, on the
+    Decision page (plan sect 6.D.1: "same knobs the Decision page
+    uses...do not invent a second convention"). Public: app.py calls this
+    a second time (cheap -- one ~36-month model.strip() plus a handful of
+    physical.run_voyage() calls the optimiser's own search makes) to
+    describe the plan in a caption, mirroring the Decision page's own
+    "recompute for display" pattern rather than threading a new field
+    through VarResult.
+
+    `month_index` is the CURRENT cargo's load month (0..11, the same
+    convention every other historical_var_physical portfolio uses).
+    `first_cargo_state` governs ONLY the current cargo's (leg 1's)
+    valuation here, mirroring exactly how historical_var_physical()
+    already uses it for EXPOSURE (plan sect 6.C.2) -- both uses read the
+    SAME caller-supplied state, so the plan that gets priced stays
+    consistent with the assumption used to price it. Every later leg is
+    ALWAYS valued future_cargo=True inside optimise_programme()
+    (decision.py's own semantics -- a future cargo is a new pre-lift
+    decision regardless of the current cargo's state), so
+    first_cargo_state never reaches leg 2+ here either, and current_mode
+    is fixed at POST_LIFT_DIVERSION -- irrelevant whenever
+    first_cargo_state is given explicitly (decision.cost_policy() only
+    consults mode when first_cargo_state is None) and, when it IS None,
+    matching the Decision page's own hardcoded choice.
+
+    Raises whatever decision.optimise_programme() raises (ValueError if no
+    route fits the derived horizon, IndexError if month_index is
+    out-of-range) -- unchanged, uncaught: callers (app.py) contain this
+    the same way the Decision page's own programme branch already does.
+    """
+    D = pd.Timestamp(D)
+    europe_rt_now = (params.europe_laden_days + params.europe_ballast_days
+                      + params.europe_port_days + params.loading_days)
+    horizon_days = float(np.ceil((2.0 * europe_rt_now + PROGRAMME_TURNAROUND_DAYS) * 10.0) / 10.0)
+    try:
+        programme_strip = model.strip(D, tables, params, n_months=_PROGRAMME_STRIP_MONTHS)
+    except Exception:  # noqa: BLE001 -- mirrors app.py's _safe_strip fallback verbatim: any failure building
+        # the longer strip must not block VaR page rendering; optimise_programme() itself then fails loud with
+        # its own clear ValueError/IndexError if a 12-month strip isn't enough room for the derived horizon.
+        programme_strip = model.strip(D, tables, params, n_months=12)
+    result = decision.optimise_programme(
+        programme_strip, params,
+        horizon_days=horizon_days,
+        current_month_index=month_index,
+        current_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+        current_first_cargo_state=first_cargo_state,
+        max_additional_cargoes=PROGRAMME_MAX_ADDITIONAL_CARGOES,
+        residual_value_per_day=PROGRAMME_RESIDUAL_VALUE_PER_DAY,
+        turnaround_days=PROGRAMME_TURNAROUND_DAYS,
+    )
+    return result.best
+
+
+def _programme_leg_state(leg: "decision.ProgrammeLeg",
+                          first_cargo_state: Optional[decision.FirstCargoState],
+                          ) -> Optional[decision.FirstCargoState]:
+    """Per-leg first_cargo_state (plan sect 6.D.1, 6.C.2): the FIRST leg
+    (cargo_number == 1, the current cargo) takes the caller's state; every
+    later leg is a future, not-yet-committed cargo and is therefore ALWAYS
+    fully exposed (None -- cashflows.physical_cargo_quantities()'s own
+    "nothing sunk yet" convention), regardless of the selector. Mirrors
+    app.py's identical `programme_first_cargo_state if leg.cargo_number ==
+    1 else None` idiom (Decision page, "How the programme value is
+    calculated" detail table) verbatim -- same rule, same reason."""
+    return first_cargo_state if leg.cargo_number == 1 else None
+
+
+def programme_leg_is_priceable(leg: "decision.ProgrammeLeg") -> bool:
+    """A leg is priceable under the historical-simulation scenario price
+    arrays only if its month falls inside the SAME 0..11 (months forward
+    from contract-calendar F(D)) window _prepare_scenario_price_arrays()
+    builds for every other portfolio. The ScenarioSet's own return arrays
+    are N_STRIP_COLS=13 columns wide, which -- once the JKM L+1 tenor
+    shift `s` in {0, 1} is accounted for -- safely covers offsets 0..11
+    but not reliably 12 (a month-12 JKM lookup can land on column 13,
+    one past the last column built by build_scenarios()). Extending the
+    scenario system itself to more months is out of scope for this
+    increment (it touches N_STRIP_COLS/ScenarioSet/build_scenarios(),
+    shared by the frozen legacy path); a leg landing beyond month 11 is
+    instead excluded from the priced sum, same tail-day treatment as an
+    unscheduled residual day, disclosed by the caller (app.py's caption).
+
+    leg.month_index already uses this EXACT "months forward from F(D)"
+    convention with no re-derivation needed: decision.optimise_programme()
+    looks up rows in a model.strip()-built DataFrame whose row i IS
+    calendar month F(D)+i (model.strip()'s own `months =
+    load_months(F, n_months)` / `for i, L in enumerate(months)`
+    construction) -- the identical indexing cashflows.py's month_index
+    parameter and this module's price-array columns already use.
+
+    In practice this only excludes a leg when the caller's month_index
+    (leg 1's own month, always 0..11) is deep in that window AND the
+    committed plan schedules an additional cargo landing past it --
+    unreachable at month_index<=10 given this module's default
+    one-extra-cargo/two-Europe-RT-horizon knobs, since a single leg's
+    duration is under two months. Leg 1 itself is never excluded: its
+    month_index is the caller's own, already required to be 0..11 by
+    every other historical_var_physical portfolio's own indexing."""
+    return 0 <= leg.month_index < 12
+
+
+def _programme_leg_exposures(D, tables, params: Params, plan: "decision.ProgrammePlan",
+                              first_cargo_state: Optional[decision.FirstCargoState],
+                              ) -> tuple:
+    """One physical CargoExposure per INCLUDED leg of `plan` (plan sect
+    6.D.1: "one CargoExposure per leg") -- D-dependent, built via
+    cashflows.physical_cargo_cashflows() exactly like
+    historical_var_physical()'s single-cargo path, so each exposure
+    carries both `base_prices` (for the deterministic base value) and
+    state-adjusted `cash_flows` (reusable, unchanged, for scenario
+    revaluation via value_matrix() -- CargoExposure doesn't care how it
+    was constructed, only what its cash_flows/base_prices already are).
+    Legs failing programme_leg_is_priceable() are dropped (see that
+    function's docstring); returns (leg, CargoExposure) pairs in leg
+    order."""
+    out = []
+    for leg in plan.legs:
+        if not programme_leg_is_priceable(leg):
+            continue
+        state = _programme_leg_state(leg, first_cargo_state)
+        exposure = physical_cargo_cashflows(D, tables, params, leg.month_index, leg.route, state)
+        _assert_finite_quantities(
+            exposure.cash_flows,
+            f"committed-programme leg {leg.cargo_number} ({leg.route}, month {leg.month_index}) "
+            "cash-flow quantities",
+        )
+        out.append((leg, exposure))
+    return tuple(out)
+
+
+def _vectorized_reprice_physical_programme(scen: ScenarioSet, D, base_hh, base_ttf, base_jkm,
+                                            base_spot, base_o6, base_o1, charter, params: Params,
+                                            leg_exposures: tuple) -> np.ndarray:
+    """Scenario P&L of a committed programme: sum, across the
+    (leg, CargoExposure) pairs already selected by
+    _programme_leg_exposures(), of each leg's OWN CargoExposure at that
+    leg's OWN month's scenario prices (plan sect 6.D.1: "one CargoExposure
+    per leg...sum under scenarios, hold-plan-fixed" -- no per-scenario
+    re-optimisation, plan sect 4/8.1: the SAME leg list and SAME per-leg
+    states are used for every scenario). Reuses
+    _prepare_scenario_price_arrays() -- the shared price-preparation
+    helper increment C.5 extracted precisely so a second repricer could
+    consume it (see that function's own docstring) -- rather than a third
+    independently-maintained price-prep block."""
+    prep = _prepare_scenario_price_arrays(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1)
+    n = prep["n"]
+    hh_L, ttf_L, jkm_L1, fx_l = prep["hh_L"], prep["ttf_L"], prep["jkm_L1"], prep["fx_l"]
+    charter_arr = np.full(n, charter, dtype=float)
+    vlsfo_arr = np.full(n, params.vlsfo_price, dtype=float)
+
+    total = np.zeros(n, dtype=float)
+    for leg, exposure in leg_exposures:
+        i = leg.month_index
+        if leg.route == "Europe":
+            prices = {RiskFactor.TTF: ttf_L[:, i], RiskFactor.FX: fx_l[:, i], RiskFactor.HH: hh_L[:, i],
+                      RiskFactor.CHARTER: charter_arr, RiskFactor.VLSFO: vlsfo_arr}
+        else:
+            prices = {RiskFactor.JKM: jkm_L1[:, i], RiskFactor.HH: hh_L[:, i],
+                      RiskFactor.CHARTER: charter_arr, RiskFactor.VLSFO: vlsfo_arr}
+        _assert_finite_prices(
+            prices, f"committed-programme leg {leg.cargo_number} ({leg.route}, month {i}) scenario prices"
+        )
+        total = total + exposure.value_matrix(prices)
+    return total
+
+
 @dataclass
 class VarResult:
     pnl: np.ndarray
@@ -774,9 +977,18 @@ class VarResult:
     n: int
     portfolio: str
     scen: ScenarioSet
+    # R6 increment D.3 (plan sect 6.D.3, increment C's own open question):
+    # which value basis produced this result. Defaulted so every existing
+    # (keyword-only) VarResult(...) construction -- both call sites in this
+    # module, none found elsewhere in the repo -- keeps working unchanged;
+    # set explicitly to "legacy"/"physical" by historical_var()/
+    # historical_var_physical() respectively below so the UI can label
+    # downstream artifacts (charts, captions, exports) without re-deriving
+    # the basis from which function was called.
+    basis: str = "legacy"
 
     def summary(self) -> dict:
-        return dict(portfolio=self.portfolio, n=self.n, var95=self.var95, var99=self.var99,
+        return dict(portfolio=self.portfolio, basis=self.basis, n=self.n, var95=self.var95, var99=self.var99,
                     es95=self.es95, es99=self.es99, sd=self.sd)
 
 
@@ -886,7 +1098,7 @@ def historical_var(D, tables, params: Params, portfolio: str = "12cargo", month_
 
     var95, var99, es95, es99, sd = _var_es(pnl)
     return VarResult(pnl=pnl, var95=var95, var99=var99, es95=es95, es99=es99, sd=sd, n=len(pnl),
-                      portfolio=portfolio, scen=scen)
+                      portfolio=portfolio, scen=scen, basis="legacy")
 
 
 def historical_var_physical(D, tables, params: Params, portfolio: str = "single", month_index: int = 0,
@@ -906,11 +1118,25 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     R1-style construction: a zero-return ScenarioSet must reprice to
     ~$0 P&L against this function's own base).
 
-    portfolio: "single" or "spread" ONLY (plan sect 8.3: 12cargo has no
-    physical-basis equivalent -- it is both an infeasible one-vessel
-    portfolio and fixture-bound to the legacy basis; programme arrives in
-    increment D). "hedged" is not supported either -- the Section 7
-    mechanical hedge legs are themselves legacy-formula-derived
+    portfolio: "single", "spread" or "programme" (R6 increment D, plan
+    sect 6.D). "programme" prices the CURRENT committed one-vessel
+    programme -- build_committed_programme()'s plan (decision.
+    optimise_programme()'s own best plan under the Decision page's default
+    knobs), one CargoExposure per leg (leg 1 = the current cargo, valued
+    under `first_cargo_state`; every later leg is always fully exposed --
+    plan sect 6.C.2/6.D.1), summed, hold-plan-fixed under every scenario
+    (no per-scenario re-optimisation -- plan sect 4/8.1). `basin` is
+    ignored for "programme" (each leg already carries its own route, like
+    "12cargo" ignores `basin` on the legacy side). A leg landing beyond
+    month 11 of the forward curve (only reachable when `month_index` is
+    deep in the 12-month window and the plan schedules an extra cargo past
+    it) is excluded from the priced sum -- see
+    programme_leg_is_priceable().
+
+    "12cargo" has no physical-basis equivalent (plan sect 8.3: it is both
+    an infeasible one-vessel portfolio and fixture-bound to the legacy
+    basis). "hedged" is not supported either -- the Section 7 mechanical
+    hedge legs are themselves legacy-formula-derived
     (hedge_legs_from_exposure() is increment F).
 
     A NEW function rather than a `basis=` parameter bolted onto
@@ -919,11 +1145,11 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     signatures" -- historical_var() is untouched by this increment,
     byte-for-byte (same source, same tests, same frozen 64/64).
     """
-    if portfolio not in ("single", "spread"):
+    if portfolio not in ("single", "spread", "programme"):
         raise ValueError(
-            f"physical-basis VaR supports portfolio 'single' or 'spread' only (got {portfolio!r}); "
-            "12cargo is legacy-basis-only (infeasible one-vessel portfolio, fixture-bound -- plan "
-            "sect 8.3) and hedged/programme are not yet wired to the physical basis"
+            f"physical-basis VaR supports portfolio 'single', 'spread' or 'programme' only "
+            f"(got {portfolio!r}); 12cargo is legacy-basis-only (infeasible one-vessel portfolio, "
+            "fixture-bound -- plan sect 8.3) and hedged is not yet wired to the physical basis"
         )
     D = pd.Timestamp(D)
     if scen is None:
@@ -941,28 +1167,38 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     base_jkm = jkm_row[[f"c{i}" for i in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
     base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
 
-    base_eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state)
-    base_asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state)
-    base_eu_val = base_eu.value(base_eu.base_prices)
-    base_asia_val = base_asia.value(base_asia.base_prices)
-
-    scen_vals = _vectorized_reprice_physical(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
-                                              charter, params, first_cargo_state=first_cargo_state)
-
-    if portfolio == "single":
-        base_val = base_eu_val if basin == "Europe" else base_asia_val
-        col = "eu_cargo" if basin == "Europe" else "asia_cargo"
-        scen_val = scen_vals[col][:, month_index]
+    if portfolio == "programme":
+        plan = build_committed_programme(D, tables, params, month_index, first_cargo_state)
+        leg_exposures = _programme_leg_exposures(D, tables, params, plan, first_cargo_state)
+        base_val = sum(exposure.value(exposure.base_prices) for _, exposure in leg_exposures)
+        scen_val = _vectorized_reprice_physical_programme(
+            scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1, charter, params, leg_exposures,
+        )
         pnl = scen_val - base_val
 
-    else:  # spread
-        base_val = base_asia_val - base_eu_val
-        scen_val = scen_vals["asia_cargo"][:, month_index] - scen_vals["eu_cargo"][:, month_index]
-        pnl = scen_val - base_val
+    else:
+        base_eu = physical_cargo_cashflows(D, tables, params, month_index, "Europe", first_cargo_state)
+        base_asia = physical_cargo_cashflows(D, tables, params, month_index, "Asia", first_cargo_state)
+        base_eu_val = base_eu.value(base_eu.base_prices)
+        base_asia_val = base_asia.value(base_asia.base_prices)
+
+        scen_vals = _vectorized_reprice_physical(scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1,
+                                                  charter, params, first_cargo_state=first_cargo_state)
+
+        if portfolio == "single":
+            base_val = base_eu_val if basin == "Europe" else base_asia_val
+            col = "eu_cargo" if basin == "Europe" else "asia_cargo"
+            scen_val = scen_vals[col][:, month_index]
+            pnl = scen_val - base_val
+
+        else:  # spread
+            base_val = base_asia_val - base_eu_val
+            scen_val = scen_vals["asia_cargo"][:, month_index] - scen_vals["eu_cargo"][:, month_index]
+            pnl = scen_val - base_val
 
     var95, var99, es95, es99, sd = _var_es(pnl)
     return VarResult(pnl=pnl, var95=var95, var99=var99, es95=es95, es99=es99, sd=sd, n=len(pnl),
-                      portfolio=portfolio, scen=scen)
+                      portfolio=portfolio, scen=scen, basis="physical")
 
 
 def scale_to_horizon(var_1d: float, days: int = 10, method: str = "sqrt", scen: Optional[ScenarioSet] = None,

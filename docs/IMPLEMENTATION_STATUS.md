@@ -483,3 +483,28 @@ engine work specifically.
   workbook (163 + 111 new), frozen 64/64, CI simulation 162/112-skip,
   seven smoke checks (new basis-toggle check added) -- all
   independently re-run at review.
+
+- **R6 increment D: committed-programme VaR (18-Jul-2026):** the
+  feasible optimiser plan replaces the infeasible 12-cargo strip as the
+  physical basis's flagship portfolio. `risk.build_committed_programme()`
+  reproduces the Decision page's programme defaults exactly (shared
+  module constants app.py reads back; horizon 54.1 d = two Europe RTs at
+  operating defaults, pinned against the smoke test's independent
+  Decision-page figure). One physical exposure per leg using
+  `ProgrammeLeg.month_index` verbatim (already the strip's own 0-based
+  convention -- no re-derivation); first leg takes the page's
+  first-cargo-state selector, later legs are always fully exposed;
+  hold-plan-fixed under scenarios (no per-scenario re-optimisation --
+  R4-deferred decision, disclosed). Price-independent residual days are
+  excluded (cancel exactly in scen - base); a tail leg landing beyond
+  the 12-month scenario window (only reachable at month_index=11) is
+  dropped from base AND scenarios together, proven exact, with a
+  disclosure caption. Sum-of-legs identity vs independent single-cargo
+  calls: ~7.45e-9 over 500 real scenarios. Programme VaR95 at operating
+  defaults ~-$5.88M vs single-Europe -$3.01M (SD ratio ~1.94x --
+  coherent near-perfect adjacent-month correlation). `VarResult` gains
+  `basis` metadata. Implementer also caught its own stale-widget-
+  reference bug in the smoke test (the exact gotcha the file documents)
+  and fixed the now-contradictory 12-cargo warning text. Validation
+  (independently re-run at review): pytest 293/293 with workbook, frozen
+  64/64, CI simulation 164/129-skip, nine smoke checks.

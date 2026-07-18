@@ -120,10 +120,48 @@ assert not app.exception, [e.message for e in app.exception]
 assert any("physical engine" in c.value for c in app.caption), \
     "physical basis must render its basis-disclosure caption"
 portfolio_box = next(s for s in app.selectbox if s.label == "Portfolio")
-assert len(portfolio_box.options) == 3, \
-    f"physical basis portfolio list must be single Europe/Asia + spread only, got {portfolio_box.options}"
+assert len(portfolio_box.options) == 4, \
+    (f"physical basis portfolio list must be committed programme + single Europe/Asia + spread, "
+     f"got {portfolio_box.options}")
 assert not any("12-cargo" in o for o in portfolio_box.options), \
     "12cargo must not be selectable under the physical basis (plan sect 8.3)"
 assert any(w.label == "Current cargo state" for w in app.radio), \
     "physical basis must surface the Decision page's first-cargo-state selector"
 print("PASS var page: physical basis toggle renders, portfolio list narrowed, state selector present")
+
+# R6 increment D.2 (plan sect 6.D.2): "Committed programme" replaces the
+# infeasible 12-cargo strip as the physical basis's DEFAULT portfolio (the
+# legacy basis's own PORTFOLIO_MAP is untouched -- verified separately
+# below). Its captions must disclose hold-plan-fixed pricing and which
+# programme is being priced.
+assert portfolio_box.value == "Committed programme", \
+    f"Committed programme must be the default physical-basis portfolio, got {portfolio_box.value!r}"
+assert not app.exception, [e.message for e in app.exception]
+assert any("hold-plan-fixed" in c.value.lower() for c in app.caption), \
+    "committed-programme portfolio must disclose hold-plan-fixed pricing in a caption"
+assert any("committed programme" in c.value.lower() for c in app.caption), \
+    "committed-programme portfolio must disclose which programme (legs/routes/months) is being priced"
+print("PASS var page: committed programme is the default physical-basis portfolio and discloses hold-plan-fixed pricing")
+
+# Legacy basis's own PORTFOLIO_MAP (plan sect 8 decision 3: "12cargo"
+# stays legacy-basis-only, fixture-bound, untouched by this increment) must
+# be completely unperturbed by reordering PORTFOLIO_MAP_PHYSICAL above --
+# same 6 options, same pre-existing default ("Single cargo - Europe" was
+# first before this increment and still is; 12cargo itself was never the
+# UI's default selection, only the still-selectable legacy comparison
+# point the plan says must survive). Re-fetch `basis` first -- AppTest
+# element references go stale after app.run() rebuilds the tree (see the
+# "Page" radio re-fetch above); reusing the line-115 reference here would
+# silently no-op, exactly the gotcha that comment already warns about.
+basis = next(w for w in app.radio if w.label == "Value basis")
+basis.set_value("Legacy strip (frozen)")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+legacy_portfolio_box = next(s for s in app.selectbox if s.label == "Portfolio")
+assert len(legacy_portfolio_box.options) == 6, \
+    f"legacy basis portfolio list must be unchanged (6 options), got {legacy_portfolio_box.options}"
+assert "12-cargo strip (verdict-optimal)" in legacy_portfolio_box.options, \
+    "12cargo must remain selectable under the legacy basis (plan sect 8 decision 3)"
+assert legacy_portfolio_box.value == "Single cargo - Europe", \
+    f"legacy basis default portfolio must stay unchanged, got {legacy_portfolio_box.value!r}"
+print("PASS var page: legacy basis portfolio list and default unchanged by the physical-basis reordering")

@@ -1493,12 +1493,17 @@ else:
         "12-cargo strip (verdict-optimal)": ("12cargo", "Europe"),
         "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
     }
-    # Physical basis: single/spread only (plan sect 8.3) -- 12cargo has no
-    # physical-basis equivalent (infeasible one-vessel portfolio AND
-    # fixture-bound to legacy) and hedged/programme aren't wired to this
-    # basis yet (Section 7's mechanical hedge legs are themselves
-    # legacy-formula-derived; programme arrives in increment D).
+    # Physical basis: programme/single/spread only (plan sect 8.3) --
+    # 12cargo has no physical-basis equivalent (infeasible one-vessel
+    # portfolio AND fixture-bound to legacy) and hedged isn't wired to
+    # this basis yet (Section 7's mechanical hedge legs are themselves
+    # legacy-formula-derived). "Committed programme" is listed FIRST so
+    # it is the default selection (R6 increment D.2, plan sect 6.D.2) --
+    # the feasible optimiser plan replaces the infeasible 12-cargo strip
+    # as the flagship physical-basis number; legacy's own PORTFOLIO_MAP
+    # above is untouched, so "12-cargo strip" stays its default there.
     PORTFOLIO_MAP_PHYSICAL = {
+        "Committed programme": ("programme", "Europe"),
         "Single cargo - Europe": ("single", "Europe"),
         "Single cargo - Asia": ("single", "Asia"),
         "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
@@ -1508,8 +1513,25 @@ else:
     portfolio_kind, basin_kind = active_portfolio_map[portfolio_choice]
 
     mi = 0
-    if portfolio_kind in ("single", "hedged", "spread"):
+    if portfolio_kind in ("single", "hedged", "spread", "programme"):
         mi = st.selectbox("Load month", options=list(range(12)), format_func=lambda i: f"M{i + 1} = {months[i]}")
+
+    # R6 increment D (plan sect 6.D): build the committed programme up
+    # front, the same way the Decision page's own programme branch
+    # contains decision.optimise_programme()'s ValueError/IndexError --
+    # an input combination the physical engine rejects (e.g. no route
+    # fitting the derived horizon) must read as an input problem, not
+    # crash the VaR page. historical_var_physical() below recomputes the
+    # SAME plan internally (build_committed_programme() is a pure,
+    # deterministic function of D/tables/params/mi/var_first_cargo_state);
+    # this call is only for the caption's leg/route/month disclosure.
+    programme_plan = None
+    if portfolio_kind == "programme":
+        try:
+            programme_plan = risk.build_committed_programme(D, tables, params, mi, var_first_cargo_state)
+        except (ValueError, IndexError) as exc:
+            st.error(f"Cannot build the committed programme: {exc}")
+            st.stop()
 
     c1, c2 = st.columns(2)
     lookback = c1.select_slider("Lookback (business days)", options=[250, 500, 750], value=500)
@@ -1519,8 +1541,10 @@ else:
     if portfolio_kind == "12cargo":
         st.warning(
             "Legacy 12-cargo strip is not a physically time-feasible one-vessel "
-            "portfolio. It is retained only for regression comparison until the "
-            "programme-based risk portfolio is implemented."
+            "portfolio. It is retained only for regression comparison (fixture-bound "
+            "to the legacy basis, plan sect 8 decision 3) -- switch Value basis to "
+            "Physical engine and select 'Committed programme' for the feasible "
+            "one-vessel alternative (R6 increment D)."
         )
     try:
         scen = risk.build_scenarios(tables, D, lookback=lookback, method=method)
@@ -1538,15 +1562,49 @@ else:
         ("Value basis: **physical engine** -- base value and scenario repricing use the segment-level "
          f"voyage engine (real fuel/delivered-cargo mass balance, per-segment EU ETS scope), state "
          f"'{var_state_label}' for the current cargo (Section 3a: governs whether procurement/loading "
-         "are still price-exposed). Portfolio is limited to single-cargo/spread; 12-cargo and hedged "
-         "residual stay legacy-basis-only. Backtest and the overlapping 10-day VaR below are not yet "
-         "wired to this basis."
+         "are still price-exposed). Portfolio is limited to committed-programme/single-cargo/spread; "
+         "12-cargo and hedged residual stay legacy-basis-only. Backtest and the overlapping 10-day VaR "
+         "below are not yet wired to this basis."
          if physical_basis else
          "Value basis: **legacy strip (frozen)** -- the same flat-fuel-rate, uniform-ETS-scope formula "
          "the frozen regression suite pins (docs/R6_RISK_REBUILD_PLAN.md). Switch to Physical engine "
          "above to price what the Decision page prices; the two bases' base values differ by design "
          "(Forward-strip page's own caption quantifies the gap).")
     )
+
+    # R6 increment D.2 (plan sect 6.D.2): disclose hold-plan-fixed pricing,
+    # which programme (legs/routes/months) is being priced, and that only
+    # the first leg follows the state selector above -- every later leg is
+    # always fully exposed regardless of it.
+    if portfolio_kind == "programme":
+        excluded_legs = [leg for leg in programme_plan.legs if not risk.programme_leg_is_priceable(leg)]
+        leg_desc = "; ".join(
+            f"Cargo {leg.cargo_number} {leg.route} ({leg.load_month.strftime('%b-%y')})"
+            + ("" if risk.programme_leg_is_priceable(leg) else " [beyond the 12-month pricing window -- not priced]")
+            for leg in programme_plan.legs
+        )
+        st.caption(
+            f"Committed programme: **{programme_plan.sequence}** -- {leg_desc}. Horizon "
+            f"{programme_plan.horizon_days:,.1f} d ({risk.PROGRAMME_MAX_ADDITIONAL_CARGOES} additional "
+            f"cargo(es), {risk.PROGRAMME_TURNAROUND_DAYS:,.1f}-day turnaround between voyages, "
+            f"\\${risk.PROGRAMME_RESIDUAL_VALUE_PER_DAY:,.0f}/day residual -- the SAME defaults the "
+            "Decision page's 'Discrete one-vessel programme' section uses out of the box, derived the "
+            "same way: two Europe round trips at the current speed/port settings plus one turnaround "
+            "gap). **Hold-plan-fixed**: this is the current optimiser's committed plan, priced AS-IS "
+            "under every historical scenario -- no per-scenario re-optimisation (re-optimising the "
+            "plan itself under each scenario would price an outside option this model does not yet "
+            "build -- docs/R6_RISK_REBUILD_PLAN.md sect 4/8.1). Only the first (current) cargo's "
+            f"exposure follows the 'Current cargo state' selector above ('{var_state_label}'); every "
+            "later leg is a future, not-yet-committed cargo and is therefore always fully exposed "
+            "(avoidable procurement and loading), regardless of that selector."
+        )
+        if excluded_legs:
+            st.caption(
+                f"{len(excluded_legs)} leg(s) beyond the risk engine's 12-month scenario-pricing window "
+                f"({', '.join(f'Cargo {leg.cargo_number}' for leg in excluded_legs)}) are excluded from "
+                "this VaR figure -- they appear in the programme above and on the Decision page, but are "
+                "not yet priced under scenarios here (a data-window limit, not a modelling choice)."
+            )
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("VaR 95% (1d)", f"${r.var95:,.0f}")

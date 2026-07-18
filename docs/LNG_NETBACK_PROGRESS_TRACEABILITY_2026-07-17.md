@@ -183,7 +183,18 @@ H close-out.
 - R6.4 Use delivery-contract IDs.
 - R6.5 Add VLSFO and EUA risk factors.
 - R6.6 Add physical basis factors.
-- R6.7 Revalue feasible programmes.
+- R6.7 Revalue feasible programmes. — **VERIFIED** (increment D,
+  18-Jul-2026): "Committed programme" portfolio in
+  `historical_var_physical()` — the optimiser's actual plan
+  (`build_committed_programme()` reproduces the Decision page's
+  programme defaults exactly, as shared module constants), hold-plan-
+  fixed under scenarios, first leg state-sensitive / later legs fully
+  exposed, price-independent residual days excluded (cancel exactly in
+  scen − base), month-12 tail legs dropped from base AND scenarios
+  together with UI disclosure. Sum-of-legs identity vs independent
+  single-cargo calls: ~7e-9 over 500 real scenarios. Default
+  physical-basis portfolio on the VaR page; legacy basis untouched.
+  `VarResult.basis` metadata added.
 - R6.8 Derive hedges from contractual exposures.
 - R6.9 Add execution lots, liquidity and transaction costs.
 - R6.10 Backtest the same cargo through time.

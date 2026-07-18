@@ -743,3 +743,228 @@ def test_run_stress_tests_physical_spread_pnl_is_first_cargo_state_invariant(tab
     reference = spreads[None]
     for state, values in spreads.items():
         np.testing.assert_allclose(values, reference, rtol=1e-9, atol=1e-6, err_msg=f"state={state}")
+
+
+# ===========================================================================
+# (f) Committed-programme portfolio (R6 increment D, plan sect 6.D)
+# ===========================================================================
+
+
+def _leg(cargo_number, route, month_index, load_month="2026-08-01", duration_days=27.0):
+    """A bare decision.ProgrammeLeg, for tests that want to exercise the
+    programme-repricing helpers WITHOUT depending on what
+    decision.optimise_programme() happens to choose for a given D/params
+    (that choice is data-dependent; the code paths tested here are not)."""
+    return decision.ProgrammeLeg(
+        cargo_number=cargo_number, route=route, month_index=month_index,
+        load_month=pd.Timestamp(load_month), start_day=0.0, duration_days=duration_days,
+        value=0.0, decision_mode=decision.DecisionMode.POST_LIFT_DIVERSION,
+    )
+
+
+def _hand_built_plan(*legs: decision.ProgrammeLeg) -> decision.ProgrammePlan:
+    return decision.ProgrammePlan(
+        legs=tuple(legs), horizon_days=200.0, residual_days=0.0, residual_value=0.0, total_value=0.0,
+    )
+
+
+def test_programme_leg_is_priceable_boundary():
+    """Pure unit test (no workbook needed): programme_leg_is_priceable()
+    is exactly the 0..11 range check on month_index -- the same window
+    _prepare_scenario_price_arrays() builds for every other portfolio
+    (offsets 0..11 are safe; a 13th month risks running the JKM L+1 tenor
+    lookup past the 13-column ScenarioSet return arrays)."""
+    assert risk.programme_leg_is_priceable(_leg(1, "Europe", 0))
+    assert risk.programme_leg_is_priceable(_leg(2, "Europe", 11))
+    assert not risk.programme_leg_is_priceable(_leg(2, "Europe", 12))
+    assert not risk.programme_leg_is_priceable(_leg(2, "Asia", 35))
+
+
+def test_programme_leg_state_first_leg_takes_caller_state_later_legs_none():
+    """Pure unit test: leg.cargo_number == 1 takes the caller's state;
+    every later leg is always None (fully exposed) -- plan sect
+    6.D.1/6.C.2, mirroring app.py's own `... if leg.cargo_number == 1
+    else None` idiom (Decision page, "How the programme value is
+    calculated" detail table) verbatim."""
+    state = decision.FirstCargoState.ALREADY_LOADED
+    leg1 = _leg(1, "Europe", 0)
+    leg2 = _leg(2, "Europe", 1)
+    leg3 = _leg(3, "Asia", 2)
+    assert risk._programme_leg_state(leg1, state) == state
+    assert risk._programme_leg_state(leg2, state) is None
+    assert risk._programme_leg_state(leg3, state) is None
+    assert risk._programme_leg_state(leg1, None) is None
+
+
+def test_build_committed_programme_horizon_matches_decision_page_formula(tables):
+    """D.1's explicit instruction: derive the default horizon/turnaround
+    the SAME way app.py's Decision page does (two Europe round trips plus
+    one turnaround gap, rounded up to 0.1 d) -- pinned here independently
+    of app.py so a future edit to either side that breaks the parity is
+    caught by pytest, not just by eyeballing the Streamlit page. The
+    54.1 d figure also cross-checks tests/app_smoke_check.py's pinned
+    Decision-page "Used vessel-days" == "54.0392" (54.1 - 54.0392 =
+    0.0608 d residual, the same geometry)."""
+    params = model.operating_default_params()
+    europe_rt_now = (params.europe_laden_days + params.europe_ballast_days
+                      + params.europe_port_days + params.loading_days)
+    expected_horizon = float(np.ceil((2.0 * europe_rt_now + risk.PROGRAMME_TURNAROUND_DAYS) * 10.0) / 10.0)
+    assert expected_horizon == pytest.approx(54.1, abs=1e-9)
+
+    plan = risk.build_committed_programme(D, tables, params, 0, decision.FirstCargoState.FULLY_PRE_LIFT)
+    assert plan.horizon_days == pytest.approx(expected_horizon)
+    assert plan.legs[0].month_index == 0, "leg 1 must carry the caller's own month_index verbatim"
+    assert plan.legs[0].cargo_number == 1
+
+
+def test_build_committed_programme_propagates_index_error_for_bad_month_index(tables):
+    """month_index outside the strip must raise, not silently clamp --
+    the same IndexError decision.optimise_programme() already raises,
+    uncaught here (app.py contains it the same way the Decision page's
+    own programme branch already does)."""
+    params = model.operating_default_params()
+    with pytest.raises(IndexError):
+        risk.build_committed_programme(D, tables, params, 999, None)
+
+
+@pytest.mark.parametrize("params_factory", PARAMS_FACTORIES, ids=PARAMS_IDS)
+@pytest.mark.parametrize("month_index", [0, 11])
+def test_committed_programme_zero_shock_pnl_is_zero(tables, params_factory, month_index):
+    """D.1's acceptance test, same R1-style construction as every other
+    physical zero-shock test: a zero-return ScenarioSet must reprice to
+    ~$0 P&L against historical_var_physical()'s own committed-programme
+    base -- checked at month_index=0 (safe) AND month_index=11 (the
+    boundary where a second leg, if the optimiser schedules one, lands on
+    month 12 and is dropped by programme_leg_is_priceable() -- the
+    zero-shock identity must still hold over whichever legs ARE priced)."""
+    params = params_factory()
+    result = risk.historical_var_physical(
+        D, tables, params, portfolio="programme", month_index=month_index,
+        scen=_zero_scenario(), first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT,
+    )
+    assert abs(float(result.pnl[0])) <= 0.01
+
+
+def test_committed_programme_accepted_where_12cargo_and_hedged_are_not(tables):
+    """D.1 positive-side complement to test_physical_basis_rejects_
+    unsupported_portfolios: "programme" must NOT raise (it did not exist
+    before this increment; 12cargo/hedged still correctly do -- see that
+    test, unchanged)."""
+    result = risk.historical_var_physical(
+        D, tables, model.operating_default_params(), portfolio="programme",
+        month_index=0, scen=_zero_scenario(), first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT,
+    )
+    assert result.portfolio == "programme"
+    assert result.basis == "physical"
+
+
+@pytest.mark.parametrize("params_factory", PARAMS_FACTORIES, ids=PARAMS_IDS)
+@pytest.mark.parametrize("state", [None] + FIRST_CARGO_STATES, ids=["none"] + [s.value for s in FIRST_CARGO_STATES])
+def test_committed_programme_sum_of_legs_identity_and_shape(tables, params_factory, state):
+    """D.1/D.3's core identity, proven through the PUBLIC API rather than
+    by peeking at risk.py's internals: the committed-programme portfolio's
+    P&L must equal, scenario-by-scenario, the EXACT sum of independent
+    "single"-portfolio P&L vectors for each of the plan's legs (leg 1
+    under the caller's first_cargo_state, every later leg under None --
+    D.1's own per-leg-state rule), using REAL (non-zero, 250-scenario)
+    history -- this also exercises "shape/finiteness under real
+    scenarios" in the same stroke. "single" is the already-tested,
+    independent oracle (increment C); this test does not assume anything
+    about which plan the live optimiser prefers for D/params_factory -- it
+    reads that plan back and re-derives the expectation from it, so it
+    stays meaningful even if workbook data changes which plan is best."""
+    params = params_factory()
+    month_index = 0
+    scen = risk.build_scenarios(tables, D, lookback=250, method="naive")
+
+    plan = risk.build_committed_programme(D, tables, params, month_index, state)
+    assert plan.legs[0].month_index == month_index, "leg 1 must carry the caller's own month_index verbatim"
+
+    expected_pnl = np.zeros(len(scen.dates))
+    included = 0
+    for leg in plan.legs:
+        if not risk.programme_leg_is_priceable(leg):
+            continue
+        included += 1
+        leg_state = state if leg.cargo_number == 1 else None
+        leg_result = risk.historical_var_physical(
+            D, tables, params, portfolio="single", basin=leg.route, month_index=leg.month_index,
+            scen=scen, first_cargo_state=leg_state,
+        )
+        expected_pnl = expected_pnl + leg_result.pnl
+    assert included >= 1, "leg 1 must always be included (its month_index is the caller's own, always 0..11)"
+
+    prog = risk.historical_var_physical(
+        D, tables, params, portfolio="programme", month_index=month_index, scen=scen, first_cargo_state=state,
+    )
+    assert prog.pnl.shape == (len(scen.dates),)
+    assert np.isfinite(prog.pnl).all()
+    np.testing.assert_allclose(prog.pnl, expected_pnl, rtol=1e-9, atol=1e-6)
+
+
+def test_committed_programme_drops_out_of_range_tail_leg_exactly(tables):
+    """Deterministic complement to the identity test above, independent of
+    what the live optimiser happens to choose: a HAND-BUILT plan with leg
+    2 beyond month 11 must reprice IDENTICALLY (exact, not approximate) to
+    a single-leg plan containing only leg 1 -- proving the drop is exact,
+    not merely that the function doesn't crash."""
+    params = model.operating_default_params()
+    state = decision.FirstCargoState.ALREADY_LOADED
+    scen = risk.build_scenarios(tables, D, lookback=250, method="naive")
+
+    leg1 = _leg(1, "Europe", 0)
+    leg2 = _leg(2, "Asia", 12, load_month="2027-08-01", duration_days=47.0)
+    exposures_two = risk._programme_leg_exposures(D, tables, params, _hand_built_plan(leg1, leg2), state)
+    exposures_one = risk._programme_leg_exposures(D, tables, params, _hand_built_plan(leg1), state)
+    assert [leg.cargo_number for leg, _ in exposures_two] == [1], "leg 2 (month 12) must be dropped"
+    assert [leg.cargo_number for leg, _ in exposures_one] == [1]
+
+    hh_row = model.snap(tables.hh, pd.Timestamp(D))
+    ttf_row = model.snap(tables.ttf, pd.Timestamp(D))
+    jkm_row = model.snap(tables.jkm, pd.Timestamp(D))
+    fx_row = model.snap(tables.fx, pd.Timestamp(D))
+    ch_row = model.snap(tables.charter, pd.Timestamp(D))
+    charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
+    cols = [f"c{i}" for i in range(1, risk.N_STRIP_COLS + 1)]
+    base_hh = hh_row[cols].to_numpy(dtype=float)
+    base_ttf = ttf_row[cols].to_numpy(dtype=float)
+    base_jkm = jkm_row[cols].to_numpy(dtype=float)
+    base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
+
+    scen_val_two = risk._vectorized_reprice_physical_programme(
+        scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1, charter, params, exposures_two,
+    )
+    scen_val_one = risk._vectorized_reprice_physical_programme(
+        scen, D, base_hh, base_ttf, base_jkm, base_spot, base_o6, base_o1, charter, params, exposures_one,
+    )
+    np.testing.assert_array_equal(scen_val_two, scen_val_one)
+
+
+def test_var_result_basis_field(tables):
+    """D.3: VarResult gains an optional basis field, default "legacy" --
+    every pre-existing keyword-style VarResult(...) construction (the two
+    inside risk.py itself; none found elsewhere in the repo) keeps working
+    unchanged -- set explicitly by both historical_var() ("legacy") and
+    historical_var_physical() ("physical", including for "programme")."""
+    params = model.operating_default_params()
+    default_result = risk.VarResult(
+        pnl=np.zeros(1), var95=0.0, var99=0.0, es95=0.0, es99=0.0, sd=0.0, n=1,
+        portfolio="single", scen=_zero_scenario(),
+    )
+    assert default_result.basis == "legacy"
+
+    legacy = risk.historical_var(D, tables, params, portfolio="single", basin="Europe",
+                                  month_index=0, scen=_zero_scenario())
+    assert legacy.basis == "legacy"
+    assert legacy.summary()["basis"] == "legacy"
+
+    physical = risk.historical_var_physical(D, tables, params, portfolio="single", basin="Europe",
+                                             month_index=0, scen=_zero_scenario(),
+                                             first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT)
+    assert physical.basis == "physical"
+    assert physical.summary()["basis"] == "physical"
+
+    programme = risk.historical_var_physical(D, tables, params, portfolio="programme", month_index=0,
+                                              scen=_zero_scenario(),
+                                              first_cargo_state=decision.FirstCargoState.FULLY_PRE_LIFT)
+    assert programme.basis == "physical"

@@ -85,8 +85,8 @@ python3 tests/test_model.py
 
 Full pytest suite (decision modes, physical engine, emissions, spread
 option, operating assumptions, risk containment, cash-flow layer,
-physical-basis risk -- 274 tests; ~112 of them need the workbook and
-self-skip without it):
+physical-basis risk, committed-programme portfolio -- 293 tests; ~129 of
+them need the workbook and self-skip without it):
 
 ```bash
 export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
@@ -99,7 +99,7 @@ Headless Streamlit smoke check (all five pages):
 python tests/app_smoke_check.py
 ```
 
-CI (`.github/workflows/tests.yml`) runs the pure-test subset (162 tests)
+CI (`.github/workflows/tests.yml`) runs the pure-test subset (164 tests)
 plus byte-compilation on every push; the workbook-backed tests and the
 frozen 64/64 suite run locally only, since the workbook is proprietary
 and not committed.
