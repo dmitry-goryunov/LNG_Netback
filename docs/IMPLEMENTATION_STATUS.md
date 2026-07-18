@@ -542,3 +542,26 @@ engine work specifically.
   181/172-skip, twelve smoke checks. Existing stress-row pins extended
   additively (six pre-existing rows byte-unchanged, three charter rows
   pinned), no test weakened.
+
+- **Built-in single-day forward curve (18-Jul-2026):** the app now
+  produces numbers for one curve date with NO `LNG history.xlsx` present.
+  `hardcoded_curve.py` embeds a JSON snapshot of the vendor forward curve
+  as `model.snap()` returns it at the workbook's latest master date (one
+  row per HH/TTF/JKM/FX/charter table plus the whole volatility term
+  structure); `build_hardcoded_tables()` rebuilds it into a schema-correct
+  single-row `CurveTables` with `master_dates == [curve_date]`.
+  `app.get_tables()` falls back to it when neither an env/path workbook
+  nor an upload is present -- a mounted/uploaded workbook always
+  **overrides** it, so nothing changes for anyone with the real file. The
+  deterministic pages (Decision, Forward strip, Sensitivities, Hedging)
+  reproduce the workbook's own numbers for that date exactly (verified 0.0
+  across all 36 strip months, both parameter sets); the history-dependent
+  VaR/stress/backtest page detects single-day mode (`SINGLE_DAY_MODE`) and
+  discloses it needs the full workbook rather than crashing in
+  `build_scenarios()`. Regenerate to a newer date with
+  `scripts/regenerate_hardcoded_curve.py`. Eight new tests (six pure, two
+  workbook-gated fidelity) -- the six pure ones are CI's first coverage of
+  the `strip()`/decision pricing path, previously entirely workbook-gated.
+  Only this one day of vendor data is embedded; the multi-year workbook
+  stays out of the repo. Validation: pytest 361/361 with workbook, frozen
+  64/64, CI simulation 187/174-skip, thirteen smoke checks.

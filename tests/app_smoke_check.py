@@ -236,3 +236,39 @@ assert not app.exception, [e.message for e in app.exception]
 assert not any("Charter overlay ON" in c.value for c in app.caption), \
     "charter overlay caption must disappear once switched back off"
 print("PASS var page: charter overlay and factor-coverage disclosure both work under the physical basis")
+
+# Hardcoded-curve fallback: the app must produce numbers for ONE curve date
+# with NO workbook at all (a mounted/uploaded xls overrides it, exercised by
+# every check above, which all ran on the real workbook). Force the
+# no-workbook path by clearing both discovery routes get_tables() consults
+# -- the live LNG_HISTORY_XLSX env var and data.DEFAULT_CANDIDATE_PATHS (the
+# env var is captured into that list at data.py import time, so popping the
+# env var alone is not enough; empty the list too). A fresh AppTest then
+# falls through to hardcoded_curve.build_hardcoded_tables().
+import data  # noqa: E402
+import hardcoded_curve  # noqa: E402
+
+os.environ.pop("LNG_HISTORY_XLSX", None)
+data.DEFAULT_CANDIDATE_PATHS = []
+hc_app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+assert not hc_app.exception, [e.message for e in hc_app.exception]
+assert [t.value for t in hc_app.title] == ["LNG cargo and vessel decision"], \
+    "Decision page must render on the built-in curve with no workbook"
+_disclosure_msgs = ([w.value for w in hc_app.sidebar.warning]
+                    + [w.value for w in hc_app.sidebar.info]
+                    + [w.value for w in hc_app.info])
+assert any("hardcoded forward curve" in m or "built-in" in m.lower() for m in _disclosure_msgs), \
+    "hardcoded mode must disclose it is running on the built-in curve"
+# Decision-page metrics must actually compute (not just render empty).
+hc_metrics = {m.label: m.value for m in hc_app.metric}
+assert "Best programme" in hc_metrics and hc_metrics["Best programme"], \
+    "the built-in curve must produce a real programme decision, not a blank"
+# The history-dependent VaR page must disclose single-day unavailability,
+# not crash in build_scenarios().
+hc_page = next(w for w in hc_app.sidebar.radio if w.label == "Page")
+hc_page.set_value("4 VaR & stress")
+hc_app.run(timeout=60)
+assert not hc_app.exception, [e.message for e in hc_app.exception]
+assert any("single curve date" in i.value for i in hc_app.info), \
+    "VaR page must disclose single-day unavailability on the built-in curve, not crash"
+print("PASS hardcoded curve: app produces one-day numbers with no workbook; VaR page discloses single-day mode")

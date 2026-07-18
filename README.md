@@ -64,15 +64,30 @@ The loader looks for the workbook in this order (`data.py::default_data_path`):
 1. `$LNG_HISTORY_XLSX` environment variable (exact path to `LNG history.xlsx`)
 2. `./LNG history.xlsx` or `./data/LNG history.xlsx` (relative to the working directory)
 
-If none of those resolve, the app falls back to an `st.file_uploader` in the
-sidebar so it still runs without the Drive path mounted (spec Section 1.7).
+If none of those resolve, the sidebar still offers an `st.file_uploader`
+(spec Section 1.7), and if nothing is uploaded either, the app runs on a
+**built-in single-day forward curve** (`hardcoded_curve.py`) so it produces
+numbers with no workbook at all. That built-in curve is a snapshot of the
+latest date in the workbook it was generated from; the deterministic pages
+(Decision, Forward strip, Sensitivities, Hedging) reproduce the workbook's
+own numbers for that one date exactly, while the history-dependent pages
+(VaR / stress / backtest, which need a ~500-day lookback) disclose that they
+need the full workbook. A mounted or uploaded `LNG history.xlsx` always
+**overrides** the built-in curve. Refresh the snapshot to a newer date with:
+
+```bash
+LNG_HISTORY_XLSX="/path/to/LNG history.xlsx" python scripts/regenerate_hardcoded_curve.py
+```
+
 The cache is keyed on `(path, mtime)`, so re-saving the workbook and
 refreshing the page picks up new data automatically when loaded from a path;
 uploads are cached per Streamlit session.
 
-This workbook is not included in this repository (vendor-sourced Henry Hub /
-TTF / JKM / EUR-USD / charter series; see `docs/` for the governing spec).
-Supply your own via the env var, relative path, or the sidebar uploader.
+The full multi-year workbook is not included in this repository
+(vendor-sourced Henry Hub / TTF / JKM / EUR-USD / charter series; see
+`docs/` for the governing spec) -- only the one-day built-in curve above is
+embedded. Supply your own via the env var, relative path, or the sidebar
+uploader.
 
 ## Tests
 
@@ -85,8 +100,9 @@ python3 tests/test_model.py
 
 Full pytest suite (decision modes, physical engine, emissions, spread
 option, operating assumptions, risk containment, cash-flow layer,
-physical-basis risk, committed-programme portfolio, new risk factors --
-353 tests; ~172 of them need the workbook and self-skip without it):
+physical-basis risk, committed-programme portfolio, new risk factors,
+built-in curve -- 361 tests; ~174 of them need the workbook and self-skip
+without it):
 
 ```bash
 export LNG_HISTORY_XLSX="/path/to/LNG history.xlsx"
@@ -99,7 +115,7 @@ Headless Streamlit smoke check (all five pages):
 python tests/app_smoke_check.py
 ```
 
-CI (`.github/workflows/tests.yml`) runs the pure-test subset (181 tests)
+CI (`.github/workflows/tests.yml`) runs the pure-test subset (187 tests)
 plus byte-compilation on every push; the workbook-backed tests and the
 frozen 64/64 suite run locally only, since the workbook is proprietary
 and not committed.

@@ -28,6 +28,7 @@ import streamlit as st
 import data
 import decision
 import emissions
+import hardcoded_curve
 import model
 import physical
 import risk
@@ -285,6 +286,12 @@ def _load_from_path(path: str, mtime: float):
 
 
 def get_tables():
+    """Data source priority (spec 1.7 + built-in fallback): a mounted/env-var
+    workbook OVERRIDES everything; else an uploaded workbook OVERRIDES the
+    built-in curve; else the app runs on hardcoded_curve.build_hardcoded_tables()
+    -- a single-day snapshot so the deterministic pages produce numbers with
+    no xls present at all. The uploaded/mounted workbook always wins when
+    supplied, so nothing changes for anyone who has the real file."""
     path = os.environ.get(data.ENV_VAR_NAME) or data.default_data_path()
     if path:
         try:
@@ -293,21 +300,25 @@ def get_tables():
             st.sidebar.error(f"Failed to load {path}: {e}")
 
     st.sidebar.info(
-        f"LNG history.xlsx not found (checked ${data.ENV_VAR_NAME} and conventional paths). "
-        "Upload it below."
+        f"No LNG history.xlsx found (checked ${data.ENV_VAR_NAME} and conventional paths). "
+        f"Running on the built-in {hardcoded_curve.CURVE_DATE} forward curve -- "
+        "upload the workbook below to override it with full history."
     )
-    uploaded = st.sidebar.file_uploader("LNG history.xlsx", type=["xlsx"])
-    if uploaded is None:
-        st.title("LNG Forward Netback")
-        st.warning(
-            f"Waiting for LNG history.xlsx -- set the {data.ENV_VAR_NAME} environment variable "
-            "to its path, or upload the file in the sidebar."
-        )
-        st.stop()
-    return data.load_all_from_upload(uploaded)
+    uploaded = st.sidebar.file_uploader(
+        "LNG history.xlsx (optional -- overrides the built-in curve)", type=["xlsx"]
+    )
+    if uploaded is not None:
+        return data.load_all_from_upload(uploaded)
+    return hardcoded_curve.build_hardcoded_tables()
 
 
 tables = get_tables()
+# Single-day mode: the built-in hardcoded curve (or any source with one
+# master date) can drive the deterministic pages exactly, but not the
+# history-dependent risk pages (VaR/stress/backtest need a ~500-day
+# lookback). The VaR & stress page checks this and discloses rather than
+# crashing in build_scenarios().
+SINGLE_DAY_MODE = len(tables.master_dates) <= 1
 for w in tables.warnings:
     st.sidebar.warning(w)
 
@@ -1464,6 +1475,17 @@ elif PAGE == "3 Hedging":
 
 else:
     st.title("VaR & stress")
+    if SINGLE_DAY_MODE:
+        st.info(
+            f"VaR, stress and backtesting need a multi-year price history (a ~500-day "
+            f"lookback), but the app is running on a single curve date "
+            f"({tables.master_dates.max().date()}) -- the built-in hardcoded curve, or a "
+            "source with only one master date. The Decision, Forward strip, Sensitivities "
+            "and Hedging pages are fully available and exact for this date. To use this "
+            f"page, set {data.ENV_VAR_NAME} to the full LNG history.xlsx or upload it in "
+            "the sidebar."
+        )
+        st.stop()
     strip_df = model.strip(D, tables, params)
     months = list(strip_df["month_label"])
 
