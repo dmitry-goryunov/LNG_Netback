@@ -459,13 +459,17 @@ def test_physical_basis_zero_shock_pnl_is_zero(tables, portfolio, basin, state):
     assert abs(float(result.pnl[0])) <= 0.01
 
 
-@pytest.mark.parametrize("portfolio", ["12cargo", "hedged"])
+@pytest.mark.parametrize("portfolio", ["12cargo"])
 def test_physical_basis_rejects_unsupported_portfolios(tables, portfolio):
     """Plan sect 8.3: 12cargo is legacy-basis-only (infeasible one-vessel
-    portfolio, fixture-bound); hedged's mechanical legs are themselves
-    legacy-formula-derived. Both must fail loud, not silently fall back
-    to a legacy computation under a physical-basis call."""
-    with pytest.raises(ValueError, match="single.*spread|spread.*single"):
+    portfolio, fixture-bound) and has no physical-basis equivalent -- must
+    fail loud, not silently fall back to a legacy computation under a
+    physical-basis call. "hedged" used to be rejected here too (increment
+    C deliberately excluded it) but R6 increment F.4 wires it to the
+    physical basis via the exposure-derived hedge -- see
+    tests/test_hedge_legs.py's "physical-basis hedged-VaR" group for its
+    own acceptance/zero-shock/risk-reduction tests."""
+    with pytest.raises(ValueError, match="single.*hedged.*spread.*programme"):
         risk.historical_var_physical(D, tables, model.operating_default_params(), portfolio=portfolio, scen=_zero_scenario())
 
 

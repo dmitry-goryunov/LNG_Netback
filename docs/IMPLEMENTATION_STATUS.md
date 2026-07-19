@@ -565,3 +565,37 @@ engine work specifically.
   Only this one day of vendor data is embedded; the multi-year workbook
   stays out of the repo. Validation: pytest 361/361 with workbook, frozen
   64/64, CI simulation 187/174-skip, thirteen smoke checks.
+
+- **R6 increment F: hedges derived from exposures (18/19-Jul-2026):** the
+  rebuild's structural payoff. `risk.hedge_legs_from_exposure()` reads
+  every hedge leg off `CargoExposure.quantity_on()` — the SAME quantities
+  the repricer prices — so hedge sizing can no longer drift from what's
+  priced (the VLSFO-swap tonnage that silently drifted in v2.4.1 lived in
+  a hand-maintained hedge formula; deriving it from the priced exposure
+  makes that drift structurally impossible, pinned by a test asserting the
+  exposure-derived VLSFO tonnage equals `physical.run_voyage()`'s real
+  fuel AND differs from the legacy strip estimate). `(TTF, FX)` bilinear
+  revenue decomposes into a TTF-future leg + a netted EUR-forward leg
+  (the FX leg nets the bilinear co-factor piece with the standalone ETS
+  FX term, matching `analytic_deltas()`'s FX-delta formula); whole-lot
+  rounding with visible residuals; `verified: False` flags surfaced;
+  liquidity-tiered transaction-cost placeholder. Physical hedged-VaR wired
+  into `historical_var_physical()` ("Hedged residual – Europe/Asia" on the
+  VaR page; exposure-derived hedge table on the Hedging page), with the
+  new `eu/asia_hedge_pnl_vector_from_exposure()` reproducing the legacy
+  Section-7 hedge math exactly when fed the legacy exposure — the four
+  legacy Section-7 functions stay byte-unchanged and fixture-pinned.
+  Implemented by a Sonnet subagent (interrupted twice by session limits,
+  resumed); then run through a **6-lens multi-agent adversarial review
+  workflow** (hedge signs, bilinear/FX netting, physical hedged-VaR
+  wiring, frozen/legacy integrity, lots/tx-cost edges, test rigor), each
+  finding independently verified. Two confirmed medium findings fixed
+  before commit: (1) the FX hedge leg was charged the 50-bps OTC tx-cost
+  rate via lot-size-truthiness while EURUSD is deeply liquid and its own
+  docstring said 10 bps — retiered by an explicit liquidity set; (2) a
+  sunk-cost test asserted the hedged residual *narrows* when procurement
+  is sunk, but HH is hedged in both states so the residual is *unchanged*
+  (the strict inequality passed on ~1e-9 float noise) — rewritten to pin
+  the real properties (HH hedge leg vanishes; residual unchanged).
+  Validation (independently re-run at review): pytest 385/385 with
+  workbook, frozen 64/64, CI simulation 200/185-skip, fifteen smoke checks.

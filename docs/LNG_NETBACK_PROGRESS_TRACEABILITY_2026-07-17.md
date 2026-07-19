@@ -210,8 +210,25 @@ H close-out.
   single-cargo calls: ~7e-9 over 500 real scenarios. Default
   physical-basis portfolio on the VaR page; legacy basis untouched.
   `VarResult.basis` metadata added.
-- R6.8 Derive hedges from contractual exposures.
-- R6.9 Add execution lots, liquidity and transaction costs.
+- R6.8 Derive hedges from contractual exposures. — **VERIFIED**
+  (increment F, 18/19-Jul-2026): `risk.hedge_legs_from_exposure()` reads
+  every hedge leg off `CargoExposure.quantity_on()` — the same method the
+  repricer and analytic deltas use — so hedge sizing can no longer drift
+  from the priced exposure (the VLSFO-swap bug class this rebuild
+  targeted). `(TTF, FX)` bilinear revenue decomposes into a TTF-future leg
+  + a netted EUR-forward leg, consistent with the legacy Section-7 split;
+  physical hedged-VaR wired into `historical_var_physical()` (Europe
+  residual ~0.4% of unhedged, Asia ~0%). Legacy Section-7 functions
+  byte-unchanged (fixture-pinned). Went through a 6-lens multi-agent
+  adversarial review; two confirmed medium findings fixed before commit
+  (FX-leg tx-cost tier mis-keyed on lot-size → now liquidity-based; a
+  vacuous sunk-cost test rewritten to pin the true property).
+- R6.9 Add execution lots, liquidity and transaction costs. — **VERIFIED**
+  (increment F): whole-lot rounding via `CONTRACT_SPECS` with the residual
+  shown (not hidden), `verified: False` flags surfaced per leg, and a
+  liquidity-tiered transaction-cost haircut (tight for the liquid
+  futures + EURUSD forward, wide for CHARTER/VLSFO/EUA OTC) — a disclosed
+  placeholder, "verify before sizing real trades".
 - R6.10 Backtest the same cargo through time.
 - R6.11 Add VaR/ES uncertainty and model-risk reporting.
 

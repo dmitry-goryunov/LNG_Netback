@@ -72,6 +72,22 @@ for page_name in ("2 Sensitivities", "3 Hedging"):
     assert not app.exception, [f"{page_name}: {e.message}" for e in app.exception]
     print(f"PASS {page_name.split(' ', 1)[1].lower()} page: loads clean")
 
+# R6 increment F: Page 3's new exposure-derived hedge table (still on "3
+# Hedging" from the loop above). Default hedge value basis is legacy; flip
+# to Physical engine and confirm the first-cargo-state selector for the
+# hedge table appears and the page still renders clean, mirroring the VaR
+# page's own basis-toggle smoke check.
+assert any("Exposure-derived hedge" in h.value for h in app.subheader), \
+    "Hedging page must render the R6 increment F exposure-derived hedge section"
+hedge_basis = next(w for w in app.radio if w.label == "Hedge value basis")
+assert hedge_basis.value == "Legacy strip (frozen)", "hedge table must default to the legacy basis"
+hedge_basis.set_value("Physical engine")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+assert any(w.label == "Current cargo state" for w in app.radio), \
+    "physical-basis hedge table must surface the current-cargo-state selector"
+print("PASS hedging page: exposure-derived hedge table renders on both value bases")
+
 # Regression check for the stale-session-state guard (redacted production
 # AttributeError at p.heel_fraction on Streamlit Cloud, 17-Jul-2026): a
 # browser session that stayed open across a deploy adding a new Params
@@ -104,10 +120,14 @@ print("PASS stale-session guard: old-shaped params reset cleanly, no crash")
 # AppTest instance back to the VaR page, flip the basis radio to Physical
 # engine, and assert the physical-basis surface renders: no exception, the
 # basis-disclosure caption appears, the portfolio list narrows to
-# single/spread only (plan sect 8.3 -- no 12cargo, no hedged), and the
-# first-cargo-state selector shows up. (The stress table's replay-row n/a
-# marking is pinned by tests/test_physical_cashflows.py's stress group,
-# not here.)
+# single/hedged/spread/programme only (plan sect 8.3 -- no 12cargo), and
+# the first-cargo-state selector shows up. (The stress table's replay-row
+# n/a marking is pinned by tests/test_physical_cashflows.py's stress
+# group, not here.) R6 increment F.4 (plan sect 6.F.4) added "Hedged
+# residual - Europe/Asia" to this list -- the portfolio count grew from 4
+# to 6 (committed programme + single Europe/Asia + hedged Europe/Asia +
+# spread); the increment brief explicitly requires this list change, so
+# updating this count is an authorized extension, not a weakened check.
 page = next(widget for widget in app.sidebar.radio if widget.label == "Page")
 page.set_value("4 VaR & stress")
 app.run(timeout=120)
@@ -120,14 +140,16 @@ assert not app.exception, [e.message for e in app.exception]
 assert any("physical engine" in c.value for c in app.caption), \
     "physical basis must render its basis-disclosure caption"
 portfolio_box = next(s for s in app.selectbox if s.label == "Portfolio")
-assert len(portfolio_box.options) == 4, \
-    (f"physical basis portfolio list must be committed programme + single Europe/Asia + spread, "
-     f"got {portfolio_box.options}")
+assert len(portfolio_box.options) == 6, \
+    (f"physical basis portfolio list must be committed programme + single Europe/Asia + "
+     f"hedged Europe/Asia + spread, got {portfolio_box.options}")
 assert not any("12-cargo" in o for o in portfolio_box.options), \
     "12cargo must not be selectable under the physical basis (plan sect 8.3)"
+assert "Hedged residual - Europe" in portfolio_box.options and "Hedged residual - Asia" in portfolio_box.options, \
+    "R6 increment F.4: physical basis must offer the exposure-derived hedged-residual portfolio"
 assert any(w.label == "Current cargo state" for w in app.radio), \
     "physical basis must surface the Decision page's first-cargo-state selector"
-print("PASS var page: physical basis toggle renders, portfolio list narrowed, state selector present")
+print("PASS var page: physical basis toggle renders, portfolio list narrowed (incl. hedged residual), state selector present")
 
 # R6 increment D.2 (plan sect 6.D.2): "Committed programme" replaces the
 # infeasible 12-cargo strip as the physical basis's DEFAULT portfolio (the
@@ -142,6 +164,20 @@ assert any("hold-plan-fixed" in c.value.lower() for c in app.caption), \
 assert any("committed programme" in c.value.lower() for c in app.caption), \
     "committed-programme portfolio must disclose which programme (legs/routes/months) is being priced"
 print("PASS var page: committed programme is the default physical-basis portfolio and discloses hold-plan-fixed pricing")
+
+# R6 increment F.4: select the new physical-basis "Hedged residual -
+# Europe" portfolio and confirm it renders VaR metrics with no exception.
+# Re-fetch portfolio_box first -- the D.2 block above didn't rerun the
+# app, but this file's own convention is to always re-fetch before
+# interacting with a widget rather than rely on staleness not having
+# happened yet (see the repeated re-fetch comments elsewhere in this file).
+portfolio_box = next(s for s in app.selectbox if s.label == "Portfolio")
+portfolio_box.set_value("Hedged residual - Europe")
+app.run(timeout=120)
+assert not app.exception, [e.message for e in app.exception]
+assert any(m.label == "VaR 95% (1d)" for m in app.metric), \
+    "physical-basis hedged-residual portfolio must render VaR metrics without exception"
+print("PASS var page: physical-basis hedged-residual portfolio renders VaR metrics")
 
 # Legacy basis's own PORTFOLIO_MAP (plan sect 8 decision 3: "12cargo"
 # stays legacy-basis-only, fixture-bound, untouched by this increment) must

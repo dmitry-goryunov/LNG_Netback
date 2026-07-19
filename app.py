@@ -25,6 +25,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import cashflows
 import data
 import decision
 import emissions
@@ -1473,6 +1474,58 @@ elif PAGE == "3 Hedging":
         "mismatch, lot rounding and transaction costs are not modelled; real residuals are larger."
     )
 
+    # R6 increment F (plan sect 6.F): exposure-derived hedge, rendered
+    # ALONGSIDE the Section 7 mechanical-hedge table above, not replacing
+    # it (F.3 -- that table and its VaR-effectiveness panel stay
+    # byte-intact). Every leg below is read directly off the SAME
+    # CargoExposure the risk repricer prices (risk.hedge_legs_from_
+    # exposure()), so it structurally cannot drift from what VaR/stress
+    # actually price the way the Section 7 table historically could (the
+    # v2.4.1 VLSFO-swap tonnage bug this whole rebuild targets).
+    st.subheader("Exposure-derived hedge (R6 increment F)")
+    st.caption(
+        "Sized off `CargoExposure.quantity_on()` -- the same quantities the VaR/stress repricers "
+        "evaluate -- not a separately hand-maintained day-count/fuel formula. Available on EITHER "
+        "value basis; the physical basis additionally follows the current cargo's commercial state "
+        "(a sunk procurement leg needs no NG hedge either, not just no HH shock)."
+    )
+    hedge_basis_choice = st.radio(
+        "Hedge value basis", ["Legacy strip (frozen)", "Physical engine"],
+        horizontal=True, key="hedge_value_basis",
+    )
+    if hedge_basis_choice == "Physical engine":
+        hedge_state_label = st.radio(
+            "Current cargo state", list(FIRST_CARGO_STATE_LABELS),
+            horizontal=True, key="hedge_first_cargo_state",
+        )
+        hedge_first_cargo_state = FIRST_CARGO_STATE_LABELS[hedge_state_label]
+        hedge_exposure = cashflows.physical_cargo_cashflows(D, tables, params, mi, basin, hedge_first_cargo_state)
+    else:
+        hedge_eu_exposure, hedge_asia_exposure = cashflows.legacy_cargo_cashflows(D, tables, params, mi)
+        hedge_exposure = hedge_eu_exposure if basin == "Europe" else hedge_asia_exposure
+
+    hedge_load_month = strip_df.iloc[mi]["load_month"]
+    hedge_legs_df = risk.hedge_legs_from_exposure(hedge_exposure, load_month=hedge_load_month)
+    display_hedge_legs = hedge_legs_df.copy()
+    display_hedge_legs.attrs = {}
+    for col in ("net_exposure_quantity", "hedge_quantity", "lot_residual"):
+        display_hedge_legs[col] = display_hedge_legs[col].map(lambda v: f"{v:,.2f}")
+    display_hedge_legs["lots"] = display_hedge_legs["lots"].map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
+    display_hedge_legs["lot_size"] = display_hedge_legs["lot_size"].map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
+    display_hedge_legs["tx_cost_usd"] = display_hedge_legs["tx_cost_usd"].map(lambda v: f"${v:,.0f}")
+    st.dataframe(display_hedge_legs, width="stretch", hide_index=True)
+    st.caption(
+        "`verified=False` (every row today) means the underlying contract lot size/spec has NOT been "
+        "checked against live exchange data -- same caveat as the Section 7 warning box above, "
+        "surfaced per-leg here as the spec demands. Lots are rounded to the NEAREST whole lot; "
+        "`lot_residual` is what that rounding leaves unhedged (shown, not hidden) -- 'no liquid "
+        "contract' legs (CHARTER/VLSFO/EUA) report their ENTIRE notional as residual, since there is "
+        "no lot to round to. `tx_cost_usd` is a conservative, DISCLOSED-but-not-market-calibrated "
+        f"haircut ({risk.HEDGE_TX_COST_BPS_LISTED:.0f} bp on listed contracts, "
+        f"{risk.HEDGE_TX_COST_BPS_OTC:.0f} bp on OTC/no-lot legs) -- verify against live broker quotes "
+        "before sizing real trades."
+    )
+
     st.caption(CAVEATS)
 
 # ===========================================================================
@@ -1521,19 +1574,25 @@ else:
         "12-cargo strip (verdict-optimal)": ("12cargo", "Europe"),
         "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
     }
-    # Physical basis: programme/single/spread only (plan sect 8.3) --
-    # 12cargo has no physical-basis equivalent (infeasible one-vessel
-    # portfolio AND fixture-bound to legacy) and hedged isn't wired to
-    # this basis yet (Section 7's mechanical hedge legs are themselves
-    # legacy-formula-derived). "Committed programme" is listed FIRST so
-    # it is the default selection (R6 increment D.2, plan sect 6.D.2) --
-    # the feasible optimiser plan replaces the infeasible 12-cargo strip
-    # as the flagship physical-basis number; legacy's own PORTFOLIO_MAP
-    # above is untouched, so "12-cargo strip" stays its default there.
+    # Physical basis: programme/single/hedged/spread only (plan sect 8.3)
+    # -- 12cargo has no physical-basis equivalent (infeasible one-vessel
+    # portfolio AND fixture-bound to legacy). "Hedged residual" (R6
+    # increment F.4, plan sect 6.F.4) is NEW here: the exposure-derived
+    # mechanical hedge (risk.eu_hedge_pnl_vector_from_exposure()/
+    # asia_hedge_pnl_vector_from_exposure()) applied to the SAME physical
+    # single-cargo exposure and scenario arrays, NOT the Section 7
+    # legacy-formula-derived legs (those stay legacy-basis-only, F.3).
+    # "Committed programme" is listed FIRST so it is the default selection
+    # (R6 increment D.2, plan sect 6.D.2) -- the feasible optimiser plan
+    # replaces the infeasible 12-cargo strip as the flagship physical-basis
+    # number; legacy's own PORTFOLIO_MAP above is untouched, so "12-cargo
+    # strip" stays its default there.
     PORTFOLIO_MAP_PHYSICAL = {
         "Committed programme": ("programme", "Europe"),
         "Single cargo - Europe": ("single", "Europe"),
         "Single cargo - Asia": ("single", "Asia"),
+        "Hedged residual - Europe": ("hedged", "Europe"),
+        "Hedged residual - Asia": ("hedged", "Asia"),
         "M1 diversion spread (Asia minus Europe)": ("spread", "Europe"),
     }
     active_portfolio_map = PORTFOLIO_MAP_PHYSICAL if physical_basis else PORTFOLIO_MAP
@@ -1618,8 +1677,10 @@ else:
         ("Value basis: **physical engine** -- base value and scenario repricing use the segment-level "
          f"voyage engine (real fuel/delivered-cargo mass balance, per-segment EU ETS scope), state "
          f"'{var_state_label}' for the current cargo (Section 3a: governs whether procurement/loading "
-         "are still price-exposed). Portfolio is limited to committed-programme/single-cargo/spread; "
-         "12-cargo and hedged residual stay legacy-basis-only. Backtest and the overlapping 10-day VaR "
+         "are still price-exposed). Portfolio is limited to committed-programme/single-cargo/hedged/"
+         "spread; 12-cargo has no physical-basis equivalent (plan sect 8.3). 'Hedged residual' here "
+         "uses the R6 increment F exposure-derived hedge (short the netted physical exposure "
+         "quantities), NOT the Section 7 legacy-formula legs. Backtest and the overlapping 10-day VaR "
          "below are not yet wired to this basis."
          if physical_basis else
          "Value basis: **legacy strip (frozen)** -- the same flat-fuel-rate, uniform-ETS-scope formula "

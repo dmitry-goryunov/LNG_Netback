@@ -410,6 +410,336 @@ def asia_hedge_pnl_vector(scen_jkm_L1, scen_hh_L, base_jkm_L1, base_hh_L,
 
 
 # ===========================================================================
+# R6 increment F (plan sect 6.F, [R6.8, R6.9]): hedges DERIVED from
+# exposures. europe_hedge_legs()/asia_hedge_legs()/eu_hedge_pnl_vector()/
+# asia_hedge_pnl_vector() above are the Section 7 mechanical hedge and stay
+# BYTE-INTACT (F.3) -- fixture-pinned by
+# tests/test_risk_containment.py::test_operating_default_hedge_leg_vlsfo_
+# tonnage_matches_strip_fuel and the legacy Gate-4 hedged-VaR fixtures.
+# Everything below is new, additive machinery that reads hedge sizing off
+# a CargoExposure's own quantity_on() instead of a third hand-maintained
+# day-count/fuel formula -- the exact bug class (VLSFO-swap tonnage
+# drifting from what the repricer actually prices) that pin exists to
+# catch. It RENDERS ALONGSIDE the Section 7 legs, it does not replace them
+# (plan sect 8 decision 3: nothing frozen is deleted).
+#
+# Placement (cashflows.py vs risk.py -- plan sect 6.F.1 asks for a
+# justification either way): risk.py. cashflows.py's own module docstring
+# draws the layer boundary at "canonical price-dependent cash flows"
+# (plan sect 2's Layer 2) with an explicit purity contract ("no Streamlit
+# import, no risk.py import"); CONTRACT_SPECS, lot rounding and
+# transaction-cost haircuts are a HEDGING/EXECUTION concept (Section 7's
+# own domain, already living here), not a cash-flow-valuation one, so
+# extending cashflows.py with them would blur that boundary for no
+# benefit -- hedge_legs_from_exposure() needs nothing from CargoExposure
+# that isn't already public (quantity_on(), base_prices, route,
+# month_index), so it can live in the CONSUMER module without any new
+# coupling back into cashflows.py beyond the import risk.py already has.
+# ===========================================================================
+
+# Per-RiskFactor contract mapping for hedge-leg display/lot-rounding, built
+# from the SAME CONTRACT_SPECS entries Section 7's tables and Page 3's
+# "NOT verified against current exchange specs" warning box already read
+# (no second, independently-maintained spec) -- None for CHARTER/VLSFO/EUA,
+# which have no listed lot-sized futures contract in CONTRACT_SPECS either
+# (Section 7's own Freight-FFA/VLSFO-swap/EUA-futures rows are all
+# required=False, lots=None, "OTC only" -- represented the same way here,
+# not silently invented).
+FACTOR_CONTRACT_SPECS: dict[RiskFactor, Optional[dict]] = {
+    RiskFactor.TTF: CONTRACT_SPECS["ICE TTF"],
+    RiskFactor.JKM: CONTRACT_SPECS["ICE JKM"],
+    RiskFactor.HH: CONTRACT_SPECS["NYMEX Henry Hub (NG)"],
+    RiskFactor.FX: CONTRACT_SPECS["EURUSD"],
+    RiskFactor.CHARTER: None,
+    RiskFactor.VLSFO: None,
+    RiskFactor.EUA: None,
+}
+
+_HEDGE_LEG_UNIT: dict[RiskFactor, str] = {
+    RiskFactor.TTF: "MWh", RiskFactor.JKM: "MMBtu", RiskFactor.HH: "MMBtu",
+    RiskFactor.CHARTER: "days", RiskFactor.VLSFO: "t", RiskFactor.EUA: "t CO2",
+    RiskFactor.FX: "EUR notional",
+}
+
+_HEDGE_LEG_CONTRACT_NAME: dict[RiskFactor, str] = {
+    RiskFactor.TTF: "ICE TTF", RiskFactor.JKM: "ICE JKM", RiskFactor.HH: "NYMEX Henry Hub (NG)",
+    RiskFactor.FX: "EURUSD (OTC forward)",
+    RiskFactor.CHARTER: "no liquid contract (Spark/Baltic FFA OTC only)",
+    RiskFactor.VLSFO: "no liquid contract (bunker swap OTC)",
+    RiskFactor.EUA: "OTC/ICE EUA",
+}
+
+# TTF's lot is calendar-dependent (1 MW x hours in the delivery month --
+# CONTRACT_SPECS["ICE TTF"]["size"] is a descriptive string, not a number,
+# for exactly this reason: europe_hedge_legs() resolves it via
+# hours_in_month(L), which needs the actual calendar month). This function
+# takes an OPTIONAL load_month for the same reason; when the caller doesn't
+# have one handy, TTF lots fall back to this average-month approximation
+# (365.25*24/12 -- disclosed via the returned row's own `lot_size` value,
+# not hidden) rather than skipping TTF lot-rounding entirely.
+TTF_LOT_HOURS_FALLBACK = 365.25 * 24.0 / 12.0
+
+# Transaction-cost haircut (F.2, "a config constant, conservative default,
+# documented"): a conservative round-trip bid/ask estimate, NOT calibrated
+# against live broker quotes (no such data source exists in this repo) --
+# a disclosed placeholder, verify before sizing real trades with it.
+# Tiered by LIQUIDITY, not by whether the leg has an exchange lot size:
+# the tight figure covers the deeply-liquid legs -- the listed futures
+# (TTF/JKM/NG) AND the EURUSD forward, which is OTC yet the most liquid FX
+# market there is and trades far inside a bespoke-swap bid/ask. The wide
+# figure covers the illiquid OTC legs (CHARTER FFA / VLSFO swap / EUA),
+# reflecting real bid/ask on a bespoke contract rather than a screen.
+# (EURUSD has no lot size, so an earlier lot_size-keyed selection wrongly
+# charged it the wide OTC rate -- corrected to key off _TIGHT_TX_COST_FACTORS.)
+HEDGE_TX_COST_BPS_LISTED = 10.0
+HEDGE_TX_COST_BPS_OTC = 50.0
+
+# Legs liquid enough for HEDGE_TX_COST_BPS_LISTED: the three liquid futures
+# plus the EURUSD forward. Everything else (CHARTER/VLSFO/EUA) gets the
+# wider OTC rate. Liquidity-based, so it does not depend on a listed lot
+# size (EURUSD has none yet belongs here -- see the note above).
+_TIGHT_TX_COST_FACTORS = frozenset({RiskFactor.TTF, RiskFactor.JKM, RiskFactor.HH, RiskFactor.FX})
+
+
+def _sorted_factor_key(factors: tuple[RiskFactor, ...]) -> tuple[RiskFactor, ...]:
+    """Order-insensitive grouping key, mirroring cashflows.CargoExposure.
+    quantity_on()'s own normalisation (that private helper is
+    cashflows._normalized() -- duplicated here as a one-line tuple sort,
+    not re-imported, because it is a trivial presentation-grouping detail,
+    not economic logic; the actual quantity arithmetic always goes through
+    quantity_on() itself, never re-derived)."""
+    return tuple(sorted(factors, key=lambda f: f.name))
+
+
+def _hedge_leg_dollar_price(exposure: CargoExposure, factor: RiskFactor) -> float:
+    """USD price used to size the transaction-cost haircut in dollar
+    terms. TTF and EUA are EUR-denominated (EUR/MWh, EUR/t) and need the
+    exposure's own base FX to convert; the merged FX leg's `net_quantity`
+    is already a EUR notional, so its own dollar price is just base FX;
+    every other factor (JKM/HH/CHARTER/VLSFO) is already USD-denominated."""
+    if factor == RiskFactor.FX:
+        return exposure.base_prices[RiskFactor.FX]
+    if factor in (RiskFactor.TTF, RiskFactor.EUA):
+        return exposure.base_prices[factor] * exposure.base_prices[RiskFactor.FX]
+    return exposure.base_prices[factor]
+
+
+def _hedge_leg_row(exposure: CargoExposure, factor: RiskFactor, net_quantity: float,
+                    load_month: Optional[pd.Timestamp]) -> dict:
+    """One hedge_legs_from_exposure() row: `net_quantity` is the exposure's
+    OWN signed quantity for `factor` (positive = long, e.g. TTF/JKM
+    revenue; negative = short, e.g. an HH/CHARTER/VLSFO cost) --
+    `hedge_quantity = -net_quantity` is the position that neutralises it
+    (short a long exposure, long a short one -- plan sect 6.F.1's own
+    framing). Verified against the four pre-existing Section 7 legs'
+    signs: long cargo TTF exposure -> "Short TTF future"; short HH
+    exposure -> "Long NG future"; the FX leg (long EUR receivable from
+    Europe's TTF revenue) -> "Short EUR forward"; long JKM exposure ->
+    "Short JKM future" -- all four match this function's sign convention
+    exactly (tests/test_hedge_legs.py pins this)."""
+    hedge_quantity = -net_quantity
+    direction = "Short" if hedge_quantity < 0 else ("Long" if hedge_quantity > 0 else "Flat")
+
+    if factor == RiskFactor.TTF:
+        lot_size = float(hours_in_month(load_month)) if load_month is not None else TTF_LOT_HOURS_FALLBACK
+    else:
+        spec = FACTOR_CONTRACT_SPECS.get(factor)
+        lot_size = float(spec["size"]) if spec is not None and isinstance(spec["size"], (int, float)) else None
+
+    if lot_size:
+        lots = float(np.round(hedge_quantity / lot_size))
+        residual = hedge_quantity - lots * lot_size
+    else:
+        lots = None
+        residual = hedge_quantity  # no lot concept to round to -- the WHOLE notional is "unrounded" (OTC)
+
+    spec = FACTOR_CONTRACT_SPECS.get(factor)
+    verified = bool(spec["verified"]) if spec is not None else False
+    dollar_price = _hedge_leg_dollar_price(exposure, factor)
+    tx_bps = HEDGE_TX_COST_BPS_LISTED if factor in _TIGHT_TX_COST_FACTORS else HEDGE_TX_COST_BPS_OTC
+    tx_cost_usd = abs(hedge_quantity) * dollar_price * tx_bps / 10_000.0
+
+    return dict(
+        leg=f"{direction} {factor.value}" + ("" if lot_size else " (no liquid contract)"),
+        route=exposure.route, month_index=exposure.month_index, load_month=load_month,
+        factor=factor.value, contract=_HEDGE_LEG_CONTRACT_NAME[factor], direction=direction,
+        net_exposure_quantity=net_quantity, hedge_quantity=hedge_quantity, unit=_HEDGE_LEG_UNIT[factor],
+        lot_size=lot_size, lots=lots, lot_residual=residual,
+        verified=verified, tx_cost_bps=tx_bps, tx_cost_usd=tx_cost_usd,
+    )
+
+
+def hedge_legs_from_exposure(exposure: CargoExposure, load_month: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """R6 increment F.1 (plan sect 6.F.1): the net quantity per (factor,
+    month) on `exposure` IS the hedge -- read directly off
+    CargoExposure.quantity_on(), the SAME method analytic_deltas() and
+    apply_charter_overlay()'s quantity helper already use, so hedge sizing
+    can never independently drift from what the repricer prices (the
+    VLSFO-swap bug class this whole rebuild targets -- plan sect 1). No
+    day-count/fuel formula is re-derived anywhere in this function: every
+    number below is `exposure.quantity_on(...)` or `exposure.base_prices[...]`.
+
+    One row per RiskFactor the exposure references, EXCEPT bilinear
+    (X, FX) terms, which are DECOMPOSED into two linear legs -- an X
+    future/swap plus an FX forward -- exactly how europe_hedge_legs()
+    already splits Europe's TTF x FX revenue into "Short TTF future" +
+    "Short EUR forward" today (plan sect 6.F.1's explicit instruction:
+    "consistent with how europe_hedge_legs splits the TTF future + EUR
+    forward today"). Concretely, for a two-factor term (A, B):
+      - if FX is one of the two factors, the OTHER factor X gets a
+        native-unit leg of quantity `exposure.quantity_on((X, FX))`
+        (exactly the volume a TTF/EUA future would be sized at -- the
+        product's own quantity, no co-factor price involved), and FX's
+        own leg quantity gets `quantity_on((X, FX)) * base_prices[X]`
+        (the EUR notional an FX forward would need to lock in -- the
+        SAME "quantity x co-factor base price" rule
+        CargoExposure.quantity_on()'s docstring and analytic_deltas()'s
+        FX delta already use).
+      - a bilinear term that does NOT involve FX has no decomposition
+        rule here and raises NotImplementedError rather than guessing --
+        every bilinear term this codebase currently produces ((TTF, FX)
+        always; (EUA, FX) only under R6.5b's eua_live=True) pairs a
+        commodity factor with FX, so this is a real, not theoretical,
+        completeness boundary.
+
+    FX legs are further NETTED across every source that contributes to
+    them: the bilinear co-factor pieces above PLUS any standalone
+    (RiskFactor.FX,) linear term (Europe's ETS leg, EUA price folded into
+    the quantity when eua_live=False) all fold into ONE combined FX row --
+    the exact same combination analytic_deltas()'s own FX delta computes
+    (`quantity_on((TTF, FX)) * base_ttf + quantity_on((FX,))`,
+    tests/test_cashflows.py::test_deltas_derived_from_quantities_match_
+    analytic_deltas already pins this formula) -- because a single net EUR
+    receivable is naturally hedged with ONE FX forward, not two unrelated
+    ones. A month with no FX-referencing cash flow at all (e.g. Asia,
+    which has no FX term in this model) emits no FX row.
+
+    Constant (empty-tuple) cash flows are skipped entirely -- a
+    price-independent fee has nothing to hedge.
+
+    `load_month` (optional): only used to resolve TTF's calendar-dependent
+    lot size (1 MW x hours in that month) via hours_in_month(); every
+    other factor's lot size is a fixed constant from CONTRACT_SPECS.
+    Omit it and TTF lot-rounds against TTF_LOT_HOURS_FALLBACK's
+    average-month approximation instead (disclosed via the returned
+    `lot_size` value, not hidden).
+
+    Lots (F.2): `hedge_quantity` rounded to the NEAREST whole lot via
+    FACTOR_CONTRACT_SPECS (`lots`, None when the factor has no listed lot
+    size); `lot_residual` is the leftover notional the rounding can't
+    reach (`hedge_quantity` itself, unrounded, when there is no lot
+    concept -- e.g. CHARTER/VLSFO/EUA/the OTC EURUSD/FX leg) -- shown, per
+    the plan's explicit "don't hide it" instruction, never dropped.
+    `verified` surfaces CONTRACT_SPECS' own `verified: False` flag
+    (False, unverified, when the factor has no CONTRACT_SPECS entry at
+    all -- an unverified absence of a lot size is still unverified).
+    `tx_cost_usd` is the conservative haircut (HEDGE_TX_COST_BPS_LISTED /
+    _OTC, see those constants' own docstrings) applied to the leg's
+    (unrounded) dollar notional.
+    """
+    keys = {_sorted_factor_key(cf.factors) for cf in exposure.cash_flows if cf.factors}
+    bilinear_fx = [k for k in keys if len(k) == 2 and RiskFactor.FX in k]
+    unsupported = [k for k in keys if len(k) > 2 or (len(k) == 2 and RiskFactor.FX not in k)]
+    if unsupported:
+        raise NotImplementedError(
+            f"hedge_legs_from_exposure has no decomposition rule for factor tuple(s) {unsupported} on "
+            f"{exposure.route} month {exposure.month_index} -- every bilinear term this codebase currently "
+            "produces pairs a commodity factor with FX (see this function's own docstring); a genuinely new "
+            "product shape needs an explicit decomposition rule added here, not a silent guess."
+        )
+    linear_keys = [k for k in keys if len(k) == 1]
+
+    non_fx_factors = sorted(
+        {k[0] for k in linear_keys if k[0] != RiskFactor.FX} | {f for k in bilinear_fx for f in k if f != RiskFactor.FX},
+        key=lambda f: f.name,
+    )
+
+    rows = []
+    for factor in non_fx_factors:
+        qty = exposure.quantity_on((factor,))
+        for k in bilinear_fx:
+            if factor in k:
+                qty += exposure.quantity_on(k)
+        rows.append(_hedge_leg_row(exposure, factor, qty, load_month))
+
+    fx_referenced = (RiskFactor.FX,) in linear_keys or bool(bilinear_fx)
+    if fx_referenced:
+        fx_notional = exposure.quantity_on((RiskFactor.FX,))
+        for k in bilinear_fx:
+            primary = k[0] if k[1] == RiskFactor.FX else k[1]
+            fx_notional += exposure.quantity_on(k) * exposure.base_prices[primary]
+        rows.append(_hedge_leg_row(exposure, RiskFactor.FX, fx_notional, load_month))
+
+    out = pd.DataFrame(rows)
+    out.attrs["route"] = exposure.route
+    out.attrs["month_index"] = exposure.month_index
+    out.attrs["load_month"] = load_month
+    return out
+
+
+def eu_hedge_pnl_vector_from_exposure(exposure: CargoExposure, scen_ttf_L: np.ndarray, scen_hh_L: np.ndarray,
+                                       scen_fx_L: np.ndarray) -> np.ndarray:
+    """R6 increment F.4 (plan sect 6.F.4): physical-basis hedge P&L for a
+    Europe exposure, generalising eu_hedge_pnl_vector() (Section 7,
+    UNCHANGED, still legacy-fixture-pinned) to read its notionals off
+    `exposure.quantity_on()` instead of a hand-maintained day-count/fuel
+    formula. Same TTF-future + EUR-forward + NG-future decomposition, same
+    base-FX EUR->USD conversion convention as eu_hedge_pnl_vector() (that
+    function's own docstring: converting the TTF leg's EUR P&L at the
+    SCENARIO fx rate instead of the base rate reproduces a residual an
+    order of magnitude too small against the Section 7 fixture -- the
+    same convention applies here since the underlying economics are
+    identical, only the notional's SOURCE changed).
+
+    Feeding this the LEGACY exposure (cashflows.legacy_cargo_cashflows())
+    reproduces eu_hedge_pnl_vector() bit-for-bit (V = quantity_on((TTF,
+    FX)) = cargo*(1-eu_bo_frac)/3.412 exactly; hh_qty = quantity_on((HH,))
+    = -cargo*hh_grossup exactly) -- not exercised by any frozen fixture
+    (F.3 keeps eu_hedge_pnl_vector() itself as the fixture-pinned path),
+    but a useful internal consistency property
+    (tests/test_hedge_legs.py checks it) proving this generalisation
+    doesn't silently change the legacy hedge's own math, only WHERE the
+    notional comes from."""
+    V = exposure.quantity_on((RiskFactor.TTF, RiskFactor.FX))
+    hh_qty = exposure.quantity_on((RiskFactor.HH,))
+    base_ttf = exposure.base_prices[RiskFactor.TTF]
+    base_fx = exposure.base_prices[RiskFactor.FX]
+    base_hh = exposure.base_prices[RiskFactor.HH]
+
+    eur_notional = base_ttf * V
+    d_ttf = scen_ttf_L - base_ttf
+    d_hh = scen_hh_L - base_hh
+    d_fx = scen_fx_L - base_fx
+
+    hedge_ttf = -V * d_ttf * base_fx
+    hedge_fx = -eur_notional * d_fx
+    hedge_hh = -hh_qty * d_hh
+    return hedge_ttf + hedge_fx + hedge_hh
+
+
+def asia_hedge_pnl_vector_from_exposure(exposure: CargoExposure, scen_jkm_L1: np.ndarray,
+                                         scen_hh_L: np.ndarray) -> np.ndarray:
+    """Asia counterpart of eu_hedge_pnl_vector_from_exposure() (R6
+    increment F.4) -- generalises asia_hedge_pnl_vector() (Section 7,
+    UNCHANGED) the same way: short JKM future sized at
+    quantity_on((JKM,)), long NG future sized at -quantity_on((HH,)), no
+    FX leg (Asia has none). Feeding this the LEGACY exposure reproduces
+    asia_hedge_pnl_vector() bit-for-bit for the same reason
+    eu_hedge_pnl_vector_from_exposure() does."""
+    jkm_qty = exposure.quantity_on((RiskFactor.JKM,))
+    hh_qty = exposure.quantity_on((RiskFactor.HH,))
+    base_jkm = exposure.base_prices[RiskFactor.JKM]
+    base_hh = exposure.base_prices[RiskFactor.HH]
+
+    d_jkm = scen_jkm_L1 - base_jkm
+    d_hh = scen_hh_L - base_hh
+
+    hedge_jkm = -jkm_qty * d_jkm
+    hedge_hh = -hh_qty * d_hh
+    return hedge_jkm + hedge_hh
+
+
+# ===========================================================================
 # Section 8 -- Historical simulation VaR
 # ===========================================================================
 
@@ -1268,9 +1598,28 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
 
     "12cargo" has no physical-basis equivalent (plan sect 8.3: it is both
     an infeasible one-vessel portfolio and fixture-bound to the legacy
-    basis). "hedged" is not supported either -- the Section 7 mechanical
-    hedge legs are themselves legacy-formula-derived
-    (hedge_legs_from_exposure() is increment F).
+    basis) and stays legacy-basis-only, unsupported here.
+
+    "hedged" (R6 increment F.4, plan sect 6.F.4): the residual after the
+    exposure-DERIVED mechanical hedge (eu_hedge_pnl_vector_from_exposure()/
+    asia_hedge_pnl_vector_from_exposure(), increment F) is applied to the
+    SAME `single`-cargo exposure and the SAME already-prepared scenario
+    price arrays _vectorized_reprice_physical() built for the cargo P&L
+    itself -- "hedge P&L evaluated on the SAME scenario price arrays,
+    short the netted exposure quantities" (plan sect 6.F.4's own wording).
+    Unlike historical_var()'s "hedged" (which calls the Section 7
+    eu_hedge_pnl_vector()/asia_hedge_pnl_vector() functions, UNCHANGED,
+    fixture-pinned -- F.3), this reads its hedge notionals off the
+    PHYSICAL exposure's own quantity_on(), so first_cargo_state's
+    sunk-cost zeroing (C.2) automatically narrows the hedge too: a sunk
+    HH leg means there is nothing left to hedge with an NG future either,
+    not just nothing left to shock. Scope matches Section 7's own mechanical
+    hedge exactly -- only TTF+FX+HH (Europe) / JKM+HH (Asia) are hedged;
+    CHARTER/VLSFO/EUA are NOT (no liquid contract -- Section 7's own
+    Freight-FFA/VLSFO-swap/EUA-futures rows are all `required=False`), so
+    the hedged residual still carries charter/fuel/ETS risk by design, the
+    same "residual is boil-off / ETS / second-order FX cross-term risk
+    only" caveat Page 3's legacy hedge-effectiveness panel already states.
 
     A NEW function rather than a `basis=` parameter bolted onto
     historical_var() itself, per the plan's explicit instruction to
@@ -1291,11 +1640,11 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     paragraph for why this live path exists on the physical basis only
     (never legacy).
     """
-    if portfolio not in ("single", "spread", "programme"):
+    if portfolio not in ("single", "hedged", "spread", "programme"):
         raise ValueError(
-            f"physical-basis VaR supports portfolio 'single', 'spread' or 'programme' only "
+            f"physical-basis VaR supports portfolio 'single', 'hedged', 'spread' or 'programme' only "
             f"(got {portfolio!r}); 12cargo is legacy-basis-only (infeasible one-vessel portfolio, "
-            "fixture-bound -- plan sect 8.3) and hedged is not yet wired to the physical basis"
+            "fixture-bound -- plan sect 8.3)"
         )
     D = pd.Timestamp(D)
     if scen is None:
@@ -1344,6 +1693,25 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
             col = "eu_cargo" if basin == "Europe" else "asia_cargo"
             scen_val = scen_vals[col][:, month_index]
             pnl = scen_val - base_val
+
+        elif portfolio == "hedged":
+            # R6 increment F.4: cargo P&L + hedge P&L, both evaluated on
+            # the SAME scen_vals price arrays _vectorized_reprice_physical()
+            # already prepared above -- no second scenario repricing pass.
+            exposure = base_eu if basin == "Europe" else base_asia
+            base_val = base_eu_val if basin == "Europe" else base_asia_val
+            col = "eu_cargo" if basin == "Europe" else "asia_cargo"
+            cargo_pnl = scen_vals[col][:, month_index] - base_val
+            if basin == "Europe":
+                hedge_pnl = eu_hedge_pnl_vector_from_exposure(
+                    exposure, scen_vals["ttf_L"][:, month_index], scen_vals["hh_L"][:, month_index],
+                    scen_vals["fx_l"][:, month_index],
+                )
+            else:
+                hedge_pnl = asia_hedge_pnl_vector_from_exposure(
+                    exposure, scen_vals["jkm_L1"][:, month_index], scen_vals["hh_L"][:, month_index],
+                )
+            pnl = cargo_pnl + hedge_pnl
 
         else:  # spread
             base_val = base_asia_val - base_eu_val
@@ -1466,11 +1834,15 @@ def _charter_quantity_for_portfolio(D, tables, params: Params, basis: str, portf
     to select/sum cargo VALUES) but reads only the CHARTER cash-flow
     quantity via CargoExposure.quantity_on(), cheap D-dependent cash-flow
     ASSEMBLY (per cashflows.py's own two-layer split), not a full scenario
-    repricing. "hedged" reuses "single": the Section 7 mechanical hedge
-    has no charter leg (the 'Freight FFA' row is explicitly
-    required=False, 'no liquid contract' -- europe_hedge_legs()/
-    asia_hedge_legs()), so a hedged residual's charter exposure equals
-    the unhedged single cargo's."""
+    repricing. "hedged" reuses "single" on EITHER basis: the mechanical
+    hedge has no charter leg on the legacy side (the 'Freight FFA' row is
+    explicitly required=False, 'no liquid contract' -- europe_hedge_legs()/
+    asia_hedge_legs()) NOR on the physical side (R6 increment F.4's
+    eu_hedge_pnl_vector_from_exposure()/asia_hedge_pnl_vector_from_exposure()
+    hedge only TTF+FX+HH/JKM+HH, matching Section 7's own scope exactly --
+    see historical_var_physical()'s "hedged" docstring paragraph), so a
+    hedged residual's charter exposure equals the unhedged single cargo's
+    on both bases."""
     if basis == "legacy":
         if portfolio in ("single", "hedged"):
             eu, asia = legacy_cargo_cashflows(D, tables, params, month_index)
@@ -1490,7 +1862,7 @@ def _charter_quantity_for_portfolio(D, tables, params: Params, basis: str, portf
             return total
         raise ValueError(f"unknown legacy portfolio {portfolio!r} for the charter overlay")
     elif basis == "physical":
-        if portfolio == "single":
+        if portfolio in ("single", "hedged"):
             exposure = physical_cargo_cashflows(D, tables, params, month_index, basin, first_cargo_state)
             return exposure.quantity_on((RiskFactor.CHARTER,))
         if portfolio == "spread":
