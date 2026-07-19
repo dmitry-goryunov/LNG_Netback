@@ -38,44 +38,36 @@ import spread_option
 st.set_page_config(page_title="LNG Forward Netback", layout="wide")
 
 # --- Module-freshness guard ------------------------------------------------
-# Streamlit hot-reload re-executes THIS script on every deploy/rerun, but
-# modules it imports stay cached in the running process. After a deploy
-# that adds a new function to a first-party module, this (fresh) script can
-# reference a symbol the (stale) cached module lacks -- observed twice as an
-# AttributeError: once locally (decision.physical_waterfall_breakdown) and
-# once in production (model.derived_residual_laden_vlsfo, redacted crash on
-# Streamlit Cloud). Each sentinel below is the newest app.py-referenced
-# symbol of its module; if any is missing, every first-party module is
-# reloaded IN DEPENDENCY ORDER (importlib.reload mutates the module object
-# in place, so cross-module references pick up the new code too). Add a
-# sentinel entry whenever app.py starts using a newly added symbol.
-_FRESHNESS_SENTINELS = [
-    # load_vlsfo is data.py's newest export (R6 increment E). Using it --
-    # not the older load_volatilities -- means a Streamlit Cloud process
-    # still holding a pre-increment-E `data` module is detected as stale
-    # and reloaded, so CurveTables regains its vlsfo/eua fields. (A stale
-    # `data` lacking those fields is what crashed hardcoded_curve's
-    # CurveTables construction after the built-in-curve deploy.)
-    (data, "load_vlsfo"),
-    (model, "derived_residual_laden_vlsfo"),
-    (physical, "vessel_performance_from_params"),
-    (emissions, "voyage_emissions"),
-    (decision, "physical_waterfall_breakdown"),
-    (spread_option, "month_spread_option"),
-    (risk, "run_stress_tests"),
-]
-if any(not hasattr(_mod, _attr) for _mod, _attr in _FRESHNESS_SENTINELS):
-    for _mod, _ in _FRESHNESS_SENTINELS:
+# Streamlit Cloud keeps a process (and every module it imported) alive
+# ACROSS deploys, so after a deploy that adds or changes a first-party
+# symbol, this freshly-exec'd script can call into a STALE cached module
+# and hit a redacted AttributeError/TypeError in production. This has
+# recurred several times (decision.physical_waterfall_breakdown;
+# model.derived_residual_laden_vlsfo; data.CurveTables gaining vlsfo/eua;
+# risk.hedge_legs_from_exposure).
+#
+# The previous scheme -- a hand-maintained "newest sentinel symbol" per
+# module, reload only if a sentinel was missing -- was fragile: it tripped
+# only when the *chosen* sentinel was absent, so forgetting to bump a
+# sentinel when a module gained a NEW symbol let the staleness straight
+# through (exactly how risk.hedge_legs_from_exposure crashed -- risk's
+# sentinel was the older run_stress_tests, which the stale module still
+# had). Replaced with an UNCONDITIONAL once-per-process reload of every
+# first-party module in dependency order: importlib.reload re-reads each
+# from disk (authoritative after a deploy) and mutates the module object
+# in place, so app.py's `import x` references and any cross-module
+# `from x import y` bindings pick up the new code. The guard flag lives on
+# `risk` and is set AFTER the reload loop, so it survives later reruns in
+# the same process but is absent on a fresh or post-deploy-stale process --
+# the reload therefore runs exactly ONCE per process, and there is no
+# sentinel list to keep current. Order is dependency-first (model/data
+# before the modules that import them; cashflows before risk).
+_FIRST_PARTY_MODULES = [model, data, physical, emissions, decision,
+                        cashflows, spread_option, risk, hardcoded_curve]
+if not getattr(risk, "_LNG_MODULES_RELOADED", False):
+    for _mod in _FIRST_PARTY_MODULES:
         importlib.reload(_mod)
-    _still_stale = [f"{_mod.__name__}.{_attr}" for _mod, _attr in _FRESHNESS_SENTINELS
-                    if not hasattr(_mod, _attr)]
-    if _still_stale:
-        st.error(
-            "The running process has stale copies of: " + ", ".join(_still_stale) +
-            ". Reload did not resolve it -- restart the app (Streamlit Cloud: "
-            "Manage app -> Reboot)."
-        )
-        st.stop()
+    risk._LNG_MODULES_RELOADED = True
 
 # Decision and Forward-strip pages show this many forward months. HH/TTF
 # have 64 forward columns and JKM 44 in the real workbook (comfortably

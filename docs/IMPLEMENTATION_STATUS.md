@@ -599,3 +599,22 @@ engine work specifically.
   the real properties (HH hedge leg vanishes; residual unchanged).
   Validation (independently re-run at review): pytest 385/385 with
   workbook, frozen 64/64, CI simulation 200/185-skip, fifteen smoke checks.
+
+- **Module-freshness guard: systemic once-per-process reload
+  (19-Jul-2026):** the recurring Streamlit Cloud stale-module crash
+  (`risk.hedge_legs_from_exposure` AttributeError after the increment-F
+  deploy — the third instance, after `decision.physical_waterfall_breakdown`
+  and `data.CurveTables` gaining vlsfo/eua) had a root cause in the guard
+  itself: the old scheme reloaded first-party modules only if a
+  hand-picked "newest sentinel symbol" was missing, so forgetting to bump
+  a sentinel when a module gained a new symbol let staleness through
+  (risk's sentinel was the older `run_stress_tests`, which the stale
+  module still had). Replaced with an UNCONDITIONAL once-per-process
+  reload of every first-party module in dependency order (`importlib.reload`
+  re-reads each from disk — authoritative after a deploy — and mutates the
+  module object in place; a flag on `risk` set after the loop makes it run
+  exactly once per process). No sentinel list to keep current, so this
+  class of crash cannot recur from a forgotten bump. New smoke regression
+  (16th check) simulates a stale pre-F `risk` module and asserts the guard
+  reloads and restores the missing symbol without crashing. Validation:
+  pytest 385/385, frozen 64/64, sixteen smoke checks.

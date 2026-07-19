@@ -308,3 +308,30 @@ assert not hc_app.exception, [e.message for e in hc_app.exception]
 assert any("single curve date" in i.value for i in hc_app.info), \
     "VaR page must disclose single-day unavailability on the built-in curve, not crash"
 print("PASS hardcoded curve: app produces one-day numbers with no workbook; VaR page discloses single-day mode")
+
+# Regression for the recurring Streamlit Cloud stale-module crash class
+# (three production crashes: decision.physical_waterfall_breakdown;
+# data.CurveTables gaining vlsfo/eua; risk.hedge_legs_from_exposure). A
+# process kept alive across a deploy holds a STALE cached module missing a
+# newly-added symbol; app.py then calls it and AttributeErrors (the last
+# one at app.py:~1508). Simulate a pre-increment-F `risk` module -- missing
+# hedge_legs_from_exposure and without the reload flag -- then run app.py:
+# the UNCONDITIONAL once-per-process module-freshness guard must reload
+# every first-party module from disk and restore the symbol, so the crash
+# cannot happen. (The previous per-module "newest sentinel" guard did NOT
+# catch this, because risk's sentinel was the older run_stress_tests, which
+# the stale module still had.)
+import importlib as _importlib  # noqa: E402
+import risk as _risk_mod  # noqa: E402
+
+_importlib.reload(_risk_mod)                       # a clean real module first
+delattr(_risk_mod, "hedge_legs_from_exposure")     # simulate the stale pre-F shape
+if hasattr(_risk_mod, "_LNG_MODULES_RELOADED"):
+    delattr(_risk_mod, "_LNG_MODULES_RELOADED")    # ... on an un-reloaded process
+assert not hasattr(_risk_mod, "hedge_legs_from_exposure"), "test setup: symbol removed"
+
+healed_app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+assert not healed_app.exception, [e.message for e in healed_app.exception]
+assert hasattr(_risk_mod, "hedge_legs_from_exposure"), \
+    "the module-freshness guard must reload a stale first-party module and restore its new symbols"
+print("PASS module-freshness guard: a stale first-party module is reloaded and healed, no crash")
