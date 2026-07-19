@@ -138,6 +138,24 @@ pre-rebaseline spec). These 64 checks are frozen exactly as-is under the
 described in `docs/IMPROVEMENT_PLAN.md`.
 
 
+## v2.6 risk-and-hedging rebuild (19-Jul-2026)
+
+The risk engine no longer duplicates the route economics: physical
+quantities are price-independent, so they are generated once into canonical
+per-factor cash flows and evaluated generically everywhere (`cashflows.py`).
+The route formula now exists in exactly one place beside the frozen
+`model.strip()`, and hedge legs read their sizing off the same priced
+exposure — closing the formula-drift class that produced the v2.4.1 and
+hedge-leg defects. The VaR page gains a physical-engine value basis, the
+feasible committed-programme portfolio (default), exposure-derived hedged
+residual, a charter overlay, factor-coverage disclosure, and bootstrap
+VaR/ES uncertainty bands; the Hedging page gains an exposure-derived hedge
+table. The legacy basis is unchanged and stays the default; the frozen
+64/64 held at every commit. Seven increments A–G, tag `v2.6-risk-rebuild`.
+See `docs/RISK_REBUILD.md`. Does NOT deliver the deferred R2–R5/R7
+correctness/feature releases (physical-ledger validation, year-aware ETS,
+outside options, dated cash flows, production controls).
+
 ## v2.4.1 risk-equivalence correction (17-Jul-2026)
 
 The vectorised risk repricer and analytic charter/VLSFO sensitivities now include loading time and loading-port fuel consistently with `model.strip()`. Under the 17-kn operating defaults, zero shocks now produce zero P&L for Europe, Asia, the diversion spread and the legacy 12-cargo portfolio. The frozen 64-check suite remains unchanged; the full pytest suite is 144/144. See `docs/RISK_EQUIVALENCE_FIX.md`. This fixes base-value equivalence only; the risk module remains on the legacy 12-month economics and is not yet programme-based.

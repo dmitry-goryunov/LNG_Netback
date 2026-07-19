@@ -141,8 +141,21 @@ Status: NOT STARTED | Dependency: R4 VERIFIED
 
 ## RELEASE R6 — risk and hedging rebuild
 
-Status: NOT STARTED | Dependency: stable deterministic commercial engine
-**Prioritisation (owner decision, 17-Jul-2026):** R6 is pulled ahead of
+**Status: VERIFIED — closed 19-Jul-2026, tag `v2.6-risk-rebuild`.** All
+seven build increments (A–G) landed on `main` (commits `80bd7e0`, `22ca9cc`,
+`b5ed4bc`, `0605525`, `5f22aca`, `f34f2d8`, `482b22f`) with the H close-out
+(this register update + `docs/RISK_REBUILD.md` release note). Every
+increment: Sonnet-implemented, independently reviewed (F/G via a 6-lens
+multi-agent adversarial workflow), full battery re-run before commit. The
+route formula now exists once (`cashflows.py`) beside the frozen
+`model.strip()`; the frozen 64/64 held at every commit. Final validation:
+frozen 64/64, pytest 415/415, CI-pure 207, seventeen smoke checks. Deferred
+items NOT delivered by R6 (per plan §4): full R2 ledger validation, R5
+dated cash flows / discounting, R4 outside-option re-optimisation — the
+mitigations (minimal input-sanity guard, undated cash flows, hold-plan-fixed
+programme VaR) remain in place and those releases stay open below.
+
+**Prioritisation (owner decision, 17-Jul-2026):** R6 was pulled ahead of
 R2–R5. Implementation plan, deferred-dependency mitigations (minimal
 input-sanity guard in lieu of full R2; undated/undiscounted cash flows
 pending R5; hold-plan-fixed programme VaR pending R4) and data gating
@@ -269,14 +282,18 @@ Status: NOT STARTED
 
 ## Current next action
 
-Start R6 increment A (canonical cash-flow layer) per
-`docs/R6_RISK_REBUILD_PLAN.md` — R6 prioritised ahead of R2–R5 by owner
-decision, 17-Jul-2026. R2–R5 remain open and unclaimed. Owner action
-that unblocks R6.5b: add VLSFO and EUA daily-history sheets to
+R6 is closed (VERIFIED, tag `v2.6-risk-rebuild`, 19-Jul-2026). The
+originally-deferred correctness releases are now the front of the queue:
+**R2** (physical `run_voyage()` ledger validation — it still accepts
+impossible ledgers) then **R3** (year-aware EU ETS gas scope — methane
+charged in 2024/25 when only CO2 was in scope; N2O economically zero from
+2026). R4/R5 (commercial outside options, dated cash flows) and R7
+(production controls) follow. Standing owner action that would light up
+R6.5b's already-built code path: add VLSFO and EUA daily-history sheets to
 `LNG history.xlsx` (same layout as `charter`).
 
-(Superseded: the previous next action was R2.1 physical-ledger
-validation. R1 is fully VERIFIED and applied to `main`.)
+(Superseded: earlier next actions were R2.1, then R6 increment A. R1 and
+all of R6 are VERIFIED and applied to `main`.)
 
 ## Mandatory agent completion report
 
