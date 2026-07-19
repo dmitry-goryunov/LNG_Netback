@@ -180,7 +180,14 @@ H close-out.
   (single/spread; zero-shock <= $0.01 per state), basis-aware
   `run_stress_tests()` with bit-compatible legacy default, VaR-page
   basis toggle. Frozen 64/64 held throughout both increments.
-- R6.4 Use delivery-contract IDs.
+- R6.4 Use delivery-contract IDs. — **VERIFIED** (increment G,
+  19-Jul-2026): `build_scenarios(method="contract_id")` labels scenario
+  returns by delivery month (not continuation column), the roll-safe
+  default for the physical basis; `naive` stays byte-frozen (independent
+  re-derivation test) and `roll_aligned` byte-identical. Also formally
+  corrected a `roll_aligned` JKM cancellation approximation (a month-roll
+  and day-15/16 tenor reset that net to zero shift) via the new
+  contract-ID method rather than mutating the frozen path.
 - R6.5 Add VLSFO and EUA risk factors. — **VERIFIED (data-gated)**
   (increment E, 18-Jul-2026): `data.load_vlsfo()`/`load_eua()` tolerate
   absent sheets (`CurveTables.vlsfo`/`.eua` default None); the live-factor
@@ -229,8 +236,21 @@ H close-out.
   liquidity-tiered transaction-cost haircut (tight for the liquid
   futures + EURUSD forward, wide for CHARTER/VLSFO/EUA OTC) — a disclosed
   placeholder, "verify before sizing real trades".
-- R6.10 Backtest the same cargo through time.
-- R6.11 Add VaR/ES uncertainty and model-risk reporting.
+- R6.10 Backtest the same cargo through time. — **VERIFIED** (increment
+  G): `risk.same_cargo_backtest()` walks one fixed load-month cargo across
+  a historical window, repricing on each date's contract-ID prices via the
+  Params-hash-keyed cached quantities — the physical engine runs ONCE for
+  the whole window (misses=1, hits=N), the payoff of the price-independent
+  quantity architecture. Feeds the existing Kupiec traffic light; realised
+  AND modelled (var) legs both value-pinned against independent
+  computations (the var-leg cross-check added at review after the
+  adversarial pass flagged it was only finiteness-checked).
+- R6.11 Add VaR/ES uncertainty and model-risk reporting. — **VERIFIED**
+  (increment G): `bootstrap_var_es()` resamples the P&L vector (1000
+  seeded resamples) and reports a 90% band beside each of VaR95/VaR99/
+  ES95/ES99 on the VaR page, plus the effective tail-sample-size
+  disclosure (n_tail99 ~ 5 of 500 — the ES99 band is ~3.7x wider than
+  VaR95's, making the deep-tail noise visible rather than hidden).
 
 ## RELEASE R7 — production controls
 

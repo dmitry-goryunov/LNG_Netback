@@ -49,6 +49,23 @@ roll = next(box for box in app.checkbox if "roll-aligned" in box.label)
 assert roll.value is True
 print("PASS risk page: roll-aligned scenarios default on")
 
+# R6 increment G.3 (plan sect 6.G.3, R6.11): bootstrap VaR/ES uncertainty
+# bands render beside the point-estimate metrics on first load of the VaR
+# page (legacy basis, default portfolio) -- no exception, and the
+# disclosure caption names the resample count/seed and both ES tail
+# counts (the "make the noise visible" requirement).
+assert any(m.label == "VaR 95% (1d)" for m in app.metric), \
+    "VaR page must render the VaR95 point-estimate metric"
+bootstrap_captions = [c.value for c in app.caption if "Bootstrap uncertainty bands" in c.value]
+assert len(bootstrap_captions) == 1, f"expected exactly one bootstrap disclosure caption, got {len(bootstrap_captions)}"
+assert "resamples" in bootstrap_captions[0] and "seed=" in bootstrap_captions[0], \
+    "bootstrap caption must disclose resample count and seed"
+assert "n_tail99=" in bootstrap_captions[0] and "n_tail95=" in bootstrap_captions[0], \
+    "bootstrap caption must disclose the ES95/ES99 effective tail sample sizes"
+band_captions = [c.value for c in app.caption if c.value.startswith("90% band:")]
+assert len(band_captions) == 4, f"expected 4 per-metric band captions (VaR95/99, ES95/99), got {len(band_captions)}"
+print("PASS var page: bootstrap uncertainty bands render beside VaR/ES point estimates, tail counts disclosed")
+
 # Re-fetch the widget: AppTest element references go stale after app.run()
 # rebuilds its internal tree, so reusing the `page` object from above would
 # silently no-op (and did, the first time this was written -- caught by the

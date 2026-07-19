@@ -55,6 +55,165 @@ def test_roll_aligned_nan_guard_is_explicit_but_naive_path_survives(tables):
     assert np.isfinite(naive.jkm_ret).all()
 
 
+# ===========================================================================
+# R6 increment G.1 (plan sect 6.G.1, R6.4): contract-ID (delivery-month)
+# return labelling. `naive` must stay byte-unchanged (verified below by
+# independent re-derivation, not just "the method tag still says naive");
+# `contract_id` must agree with `roll_aligned` wherever roll_aligned's
+# shift-by-one heuristic is exact (HH/TTF, always), and correct it where
+# it is not (the one JKM transition where a month-roll and the day-15/16
+# tenor reset cancel to a net zero shift).
+# ===========================================================================
+
+
+def test_naive_scenarios_unchanged_by_the_contract_id_addition(tables):
+    """Byte-frozen check, done by independent re-derivation rather than
+    trusting the `method` tag: build naive scenarios through
+    build_scenarios(), then recompute the SAME log-returns directly off
+    the raw tables (the exact pre-increment-G naive arithmetic) and
+    assert exact equality -- not just close -- for every one of the four
+    return arrays."""
+    scen = risk.build_scenarios(tables, "2026-07-07", lookback=250, method="naive")
+    inter = risk._intersection_dates(tables)
+    end_idx = max(i for i, d in enumerate(inter) if d <= pd.Timestamp("2026-07-07"))
+    scen_dates = inter[end_idx - 250:end_idx + 1]
+    cols = [f"c{i}" for i in range(1, risk.N_STRIP_COLS + 1)]
+
+    hh_px = tables.hh.set_index("date").loc[scen_dates, cols].to_numpy(dtype=float)
+    ttf_px = tables.ttf.set_index("date").loc[scen_dates, cols].to_numpy(dtype=float)
+    jkm_px = tables.jkm.set_index("date").loc[scen_dates, cols].to_numpy(dtype=float)
+    fx_px = tables.fx.set_index("date").loc[scen_dates, "spot"].to_numpy(dtype=float)
+
+    assert np.array_equal(scen.hh_ret, np.diff(np.log(hh_px), axis=0))
+    assert np.array_equal(scen.ttf_ret, np.diff(np.log(ttf_px), axis=0))
+    assert np.array_equal(scen.jkm_ret, np.diff(np.log(jkm_px), axis=0))
+    assert np.array_equal(scen.fx_ret, np.diff(np.log(fx_px)))
+
+
+def test_contract_id_scenarios_work_for_current_window(tables):
+    scen = risk.build_scenarios(tables, "2026-07-07", lookback=500, method="contract_id")
+    assert scen.method == "contract_id"
+    assert scen.hh_ret.shape == (500, 13)
+    assert scen.ttf_ret.shape == (500, 13)
+    assert scen.jkm_ret.shape == (500, 13)
+    assert np.isfinite(scen.hh_ret).all()
+    assert np.isfinite(scen.ttf_ret).all()
+    assert np.isfinite(scen.jkm_ret).all()
+
+
+def test_contract_id_nan_guard_is_explicit_but_naive_path_survives(tables):
+    """Mirrors test_roll_aligned_nan_guard_is_explicit_but_naive_path_
+    survives -- contract_id needs the same c1..c14 completeness roll_
+    aligned does (same 14-column buffer), so it must fail loud on the
+    same gap, by the same error family."""
+    broken = copy.deepcopy(tables)
+    broken.jkm = broken.jkm.copy()
+    target = pd.Timestamp("2026-06-15")
+    idx = broken.jkm.index[broken.jkm["date"] == target]
+    if len(idx) == 0:
+        target = broken.jkm.loc[broken.jkm["date"] <= "2026-07-08", "date"].iloc[-20]
+        idx = broken.jkm.index[broken.jkm["date"] == target]
+    broken.jkm.loc[idx, "c14"] = np.nan
+
+    with pytest.raises(ValueError, match="complete c1..c14 history"):
+        risk.build_scenarios(broken, "2026-07-08", lookback=500, method="contract_id")
+
+    naive = risk.build_scenarios(broken, "2026-07-08", lookback=500, method="naive")
+    assert np.isfinite(naive.jkm_ret).all()
+
+
+def test_contract_id_matches_roll_aligned_for_hh_ttf(tables):
+    """HH/TTF have no JKM-style tenor shift -- every delivery-month shift
+    is uniform across all 13 columns, so contract_id's exact lookup and
+    roll_aligned's shift-by-one heuristic must always agree for these two
+    markets (empirically verified against the live workbook: identical to
+    full float precision over a 500-day window)."""
+    cid = risk.build_scenarios(tables, "2026-07-07", lookback=500, method="contract_id")
+    roll = risk.build_scenarios(tables, "2026-07-07", lookback=500, method="roll_aligned")
+    np.testing.assert_array_equal(cid.hh_ret, roll.hh_ret)
+    np.testing.assert_array_equal(cid.ttf_ret, roll.ttf_ret)
+
+
+def test_contract_id_disagrees_with_roll_aligned_on_some_jkm_transitions(tables):
+    """roll_aligned's heuristic is only approximate for JKM (day-15/16
+    tenor resets can coincide with a month roll and cancel) -- over the
+    live workbook's current 500-day window there ARE real transitions
+    where contract_id and roll_aligned disagree, but they remain a small
+    minority (most JKM transitions have no cancellation, so the two
+    methods still mostly agree)."""
+    cid = risk.build_scenarios(tables, "2026-07-07", lookback=500, method="contract_id")
+    roll = risk.build_scenarios(tables, "2026-07-07", lookback=500, method="roll_aligned")
+    diff_mask = ~np.isclose(cid.jkm_ret, roll.jkm_ret)
+    n_diff = int(diff_mask.sum())
+    assert 0 < n_diff < cid.jkm_ret.size * 0.10, \
+        f"expected a small minority of JKM entries to differ, got {n_diff}/{cid.jkm_ret.size}"
+
+
+def test_contract_id_picks_correct_delivery_month_naive_does_not(tables):
+    """Constructed example (real workbook dates): a plain HH month-
+    boundary roll (2026-01-30 Fri -> 2026-02-02 Mon, F: Feb-2026 ->
+    Mar-2026, no weekend gap) where continuation-column (naive)
+    labelling silently compares TWO DIFFERENT delivery months while
+    contract_id compares the SAME one -- the exact defect G.1 formalises
+    away."""
+    d_prev, d = pd.Timestamp("2026-01-30"), pd.Timestamp("2026-02-02")
+    inter = risk._intersection_dates(tables)
+    assert inter.index(d) == inter.index(d_prev) + 1, "test assumes adjacent trading days, no gap"
+
+    F_prev, _ = model.contract_calendar(d_prev)
+    F, _ = model.contract_calendar(d)
+    assert F == model._month_add(F_prev, 1), "test assumes a plain month roll"
+    # s (the JKM-only tenor shift) is irrelevant here -- HH has no L+1
+    # shift, so its delivery-month mapping never reads s at all.
+
+    row_prev = tables.hh.set_index("date").loc[d_prev]
+    row = tables.hh.set_index("date").loc[d]
+    naive_c1 = np.log(row["c1"] / row_prev["c1"])                # WRONG: different delivery months
+    correct_c1 = np.log(row["c1"] / row_prev["c2"])              # RIGHT: today's c1 == yesterday's c2's month
+    assert not np.isclose(naive_c1, correct_c1)
+
+    px = tables.hh.set_index("date").loc[[d_prev, d], [f"c{i}" for i in range(1, 15)]].to_numpy(dtype=float)
+    cid = risk._contract_id_returns(px, [d_prev, d], jkm=False)
+    assert cid[0, 0] == pytest.approx(correct_c1)
+    assert not np.isclose(cid[0, 0], naive_c1)
+
+
+def test_contract_id_fixes_jkm_month_and_tenor_cancellation():
+    """Real transition (verified against the live workbook): 2024-08-30
+    (day>15, s=1) -> 2024-09-02 (day<=15 of the NEXT month, s=0). Both a
+    calendar-month roll AND a JKM tenor reset occur on this SAME
+    day-pair and CANCEL to a net ZERO delivery-month shift -- but
+    _is_jkm_roll() (and hence roll_aligned) fires anyway, since it
+    treats the two triggers as independent. contract_id looks up the
+    actual delivery month instead of assuming a shift size, so it gets
+    this transition right; roll_aligned mis-shifts by one column. Pure
+    synthetic price construction -- no workbook dependency, deterministic."""
+    d_prev, d = pd.Timestamp("2024-08-30"), pd.Timestamp("2024-09-02")
+    F_prev, s_prev = model.contract_calendar(d_prev)
+    F, s = model.contract_calendar(d)
+    assert F_prev != F, "test assumes a genuine calendar-month roll"
+    assert (s_prev, s) == (1, 0), "test assumes a genuine JKM tenor reset"
+    assert risk._is_jkm_roll(d_prev, d) is True, "roll_aligned's heuristic must fire on this pair"
+
+    m = 14
+    for k in range(1, m):
+        assert risk._delivery_month(F, s, k, jkm=True) == risk._delivery_month(F_prev, s_prev, k, jkm=True), \
+            "ground truth: the month-roll and tenor-reset shifts must cancel for every column"
+
+    dates = [d_prev, d]
+    px = np.empty((2, m))
+    px[0, :] = [100.0 + k for k in range(1, m + 1)]
+    px[1, :] = [100.0 + k + 0.01 * k for k in range(1, m + 1)]   # distinct per-column shock
+
+    cid = risk._contract_id_returns(px, dates, jkm=True)
+    roll = risk._roll_aligned_returns(px, dates, risk._is_jkm_roll)
+
+    expected_no_shift = np.log(px[1, :13] / px[0, :13])
+    np.testing.assert_allclose(cid[0], expected_no_shift)
+    assert not np.allclose(cid[0], roll[0]), \
+        "roll_aligned's unconditional shift-by-one must disagree with the correct zero-shift answer here"
+
+
 def test_interim_backtest_skips_roll_pairs(tables):
     bt = risk.backtest_var(
         tables, model.Params(), portfolio="single", basin="Europe", month_index=0,
@@ -72,6 +231,20 @@ def test_interim_backtest_skips_roll_pairs(tables):
 def test_legacy_function_default_remains_naive(tables):
     scen = risk.build_scenarios(tables, "2026-07-08", lookback=10)
     assert scen.method == "naive"
+
+
+def test_historical_var_physical_defaults_to_contract_id(tables):
+    """R6 increment G.1 (plan sect 6.G.1): the roll-safe/contract-ID
+    method is the default for the physical basis's OWN scenario-building
+    (only reachable when a caller omits `scen`) -- historical_var()
+    itself (the frozen legacy path) is untouched, still "naive"."""
+    import inspect
+    assert inspect.signature(risk.historical_var).parameters["method"].default == "naive"
+    assert inspect.signature(risk.historical_var_physical).parameters["method"].default == "contract_id"
+
+    r = risk.historical_var_physical("2026-07-08", tables, model.operating_default_params(),
+                                      portfolio="single", basin="Europe", month_index=0, lookback=250)
+    assert r.scen.method == "contract_id"
 
 
 def _zero_scenario() -> risk.ScenarioSet:

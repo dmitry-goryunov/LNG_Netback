@@ -618,3 +618,32 @@ engine work specifically.
   (16th check) simulates a stale pre-F `risk` module and asserts the guard
   reloads and restores the missing symbol without crashing. Validation:
   pytest 385/385, frozen 64/64, sixteen smoke checks.
+
+- **R6 increment G: contract-ID backtest + bootstrap VaR/ES bands
+  (19-Jul-2026):** the final build increment. **G.1** —
+  `build_scenarios(method="contract_id")` labels scenario returns by
+  delivery month rather than continuation column (the roll-safe default
+  for the physical basis via `historical_var_physical`; `naive` stays
+  byte-frozen, `roll_aligned` byte-identical); building it surfaced and
+  formally corrected a real `roll_aligned` JKM cancellation approximation
+  (a month roll coinciding with a day-15/16 tenor reset nets to zero
+  shift) — corrected via the new method, not by mutating the frozen path.
+  **G.2** — `same_cargo_backtest()` walks one fixed load-month cargo
+  through history, repricing on cached price-independent quantities so the
+  physical engine runs ONCE for the whole window (misses=1, hits=N),
+  feeding the Kupiec traffic light. **G.3** — `bootstrap_var_es()`
+  resamples the P&L vector (1000 seeded resamples) for a 90% band beside
+  each VaR/ES point estimate on the VaR page, with an effective-tail-count
+  disclosure (n_tail99 ~ 5 of 500; the ES99 band is ~3.7x wider than
+  VaR95's, making the deep-tail noise visible). Implemented by a Sonnet
+  subagent, then run through the **6-lens multi-agent adversarial review
+  workflow**; two confirmed findings, both handled: a cosmetic nit (a
+  refactored shared error-guard changed `roll_aligned`'s error-message
+  string but not its numeric output — accepted, the interpolated message
+  is more correct) and a medium test-coverage gap (the same-cargo var leg
+  was only finiteness-checked — closed at review with a value-equality
+  cross-check pinning it against `historical_var`/`historical_var_physical`
+  for both bases and both alphas, so an HH↔TTF swap or inverted-alpha
+  regression can no longer ship green). Validation (independently re-run at
+  review): pytest 415/415 with workbook, frozen 64/64, CI simulation
+  207/208-skip, seventeen smoke checks.

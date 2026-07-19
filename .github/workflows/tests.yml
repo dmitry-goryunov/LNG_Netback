@@ -1,13 +1,14 @@
 # CI: the pure-test subset. LNG history.xlsx is proprietary market data
 # and is NOT in the repo, so the workbook-backed tests (fixtures skip
-# gracefully without it -- ~185 of ~385) and the frozen legacy 64/64 suite
+# gracefully without it -- ~208 of ~415) and the frozen legacy 64/64 suite
 # (tests/test_model.py, which requires the workbook outright) can only
 # run locally. What CI still guards on every push: all pure-math and
 # engine tests (Margrabe closed forms, physical mass balance, emissions
 # factors, cost policy, speed/heel/turnaround mechanics, cash-flow layer
 # evaluation, quantity-cache behaviour, charter overlay calibration,
 # built-in single-day curve (first CI coverage of the strip/decision
-# pricing path), exposure-derived hedge legs -- 200 tests), byte-compilation of
+# pricing path), exposure-derived hedge legs, bootstrap VaR/ES bands --
+# 207 tests), byte-compilation of
 # every module, and dependency installability.
 name: tests
 

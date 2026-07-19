@@ -817,12 +817,31 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
     spot, on the intersection of dates across the four tables.
 
     method="naive": plain same-index-column continuation returns (what
-    the spec's fixture numbers use).
+    the spec's fixture numbers use). FROZEN -- byte-pinned by the Gate 4
+    VaR fixtures and tests/test_risk_containment.py::
+    test_legacy_function_default_remains_naive; never touch this branch.
     method="roll_aligned": on an NG/TTF month-boundary or a JKM 15th/16th
     boundary, compare today's contract k against *yesterday's* contract
     k+1 (same underlying delivery month) instead of yesterday's contract
     k. Toggle-able, default OFF, not used by the gated fixtures (Section
     8's own text: implement this after reproducing the naive numbers).
+    An APPROXIMATION: it always shifts by exactly one column on a
+    detected roll date, which over-corrects the one JKM transition where
+    a month rollover and the day-15/16 tenor reset land on the SAME
+    day-pair and cancel out to a net ZERO-column shift (see
+    method="contract_id"'s docstring for the worked case).
+    method="contract_id": R6 increment G.1 (plan sect 6.G.1, R6.4) --
+    FORMALISES roll_aligned's shift-by-one heuristic into an EXACT
+    calendar delivery-month lookup (_contract_id_returns()): today's
+    contract c_k is compared against WHATEVER column of yesterday's row
+    carries the SAME delivery month (found by direct lookup, not assumed
+    to be c_k or c_{k+1}). This corrects roll_aligned's cancellation gap
+    above and is the method NEW work (the physical basis, the G.2
+    same-cargo backtest, G.3's bootstrap) should default to --
+    `naive` stays the ONLY method the frozen Gate-4 fixtures may use, and
+    `roll_aligned` is kept exactly as-is for backward compatibility
+    (nothing frozen reads `contract_id`, so introducing it changes no
+    existing output).
     """
     D = pd.Timestamp(D)
     inter = _intersection_dates(tables)
@@ -832,19 +851,20 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
         raise ValueError(f"only {end_idx} intersection dates available before {D.date()}, need {lookback}")
     scen_dates = inter[start_idx:end_idx + 1]
 
-    n_cols = N_STRIP_COLS + (1 if method == "roll_aligned" else 0)
+    n_cols = N_STRIP_COLS + (1 if method in ("roll_aligned", "contract_id") else 0)
     hh_cols = [f"c{i}" for i in range(1, n_cols + 1)]
     hh_px = tables.hh.set_index("date").loc[scen_dates, hh_cols].to_numpy(dtype=float)
     ttf_px = tables.ttf.set_index("date").loc[scen_dates, hh_cols].to_numpy(dtype=float)
     jkm_px = tables.jkm.set_index("date").loc[scen_dates, hh_cols].to_numpy(dtype=float)
     fx_px = tables.fx.set_index("date").loc[scen_dates, "spot"].to_numpy(dtype=float)
 
-    # Roll alignment requires one additional continuation (c14) so that
-    # today's c13 can be compared with yesterday's c14 on a roll date.
-    # The source workbook has known historical gaps in JKM c14.  Failing
-    # explicitly is safer than propagating NaNs into VaR or silently dropping
-    # scenarios. Legacy naive fixtures are unaffected.
-    if method == "roll_aligned":
+    # Roll alignment (and its formalised contract-ID sibling) both need
+    # one additional continuation (c14) so that today's c13 can be
+    # compared with yesterday's c14 on a roll date. The source workbook
+    # has known historical gaps in JKM c14. Failing explicitly is safer
+    # than propagating NaNs into VaR or silently dropping scenarios.
+    # Legacy naive fixtures are unaffected.
+    if method in ("roll_aligned", "contract_id"):
         missing = []
         for market, values in (("HH", hh_px), ("TTF", ttf_px), ("JKM", jkm_px)):
             bad_rows = np.flatnonzero(~np.isfinite(values).all(axis=1))
@@ -853,7 +873,7 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
                 missing.append(f"{market}: {len(bad_rows)} row(s), e.g. {sample}")
         if missing:
             raise ValueError(
-                "roll-aligned scenarios require complete c1..c14 history; "
+                f"{method} scenarios require complete c1..c14 history; "
                 + "; ".join(missing)
             )
 
@@ -865,6 +885,10 @@ def build_scenarios(tables, D, lookback: int = 500, method: str = "naive") -> Sc
         hh_ret = _roll_aligned_returns(hh_px, scen_dates, _is_month_roll)
         ttf_ret = _roll_aligned_returns(ttf_px, scen_dates, _is_month_roll)
         jkm_ret = _roll_aligned_returns(jkm_px, scen_dates, _is_jkm_roll)
+    elif method == "contract_id":
+        hh_ret = _contract_id_returns(hh_px, scen_dates, jkm=False)
+        ttf_ret = _contract_id_returns(ttf_px, scen_dates, jkm=False)
+        jkm_ret = _contract_id_returns(jkm_px, scen_dates, jkm=True)
     else:
         raise ValueError(f"unknown method {method!r}")
 
@@ -909,6 +933,88 @@ def _roll_aligned_returns(px: np.ndarray, dates: list, roll_fn) -> np.ndarray:
         else:
             yesterday = px[i, :k]
         out[i, :] = np.log(today / yesterday)
+    return out
+
+
+# ===========================================================================
+# R6 increment G.1 (plan sect 6.G.1, R6.4): contract-ID (delivery-month)
+# return labelling -- formalises _roll_aligned_returns()'s shift-by-one
+# heuristic above into an exact calendar lookup. Additive: `naive` and
+# `roll_aligned` above are byte-unchanged (see build_scenarios()'s own
+# per-method docstring paragraphs).
+# ===========================================================================
+
+
+def _delivery_month(F: pd.Timestamp, s: int, k: int, jkm: bool = False) -> pd.Timestamp:
+    """Calendar delivery month (first-of-month Timestamp) that column
+    c_k (1-based) of the HH/TTF strip (jkm=False) or the JKM strip
+    (jkm=True) prices, on a date whose own contract_calendar() is (F, s)
+    -- the exact inverse of _base_context()'s/_snap_month_prices()'s own
+    column-selection arithmetic, not a fresh convention.
+
+    HH/TTF: c_k prices load month F+(k-1) -- read straight off
+    _base_context()'s `hh_l = hh_row[f"c{month_index + 1}"]` (column
+    k = month_index+1 => month_index = k-1; HH/TTF have no L+1 shift,
+    unlike JKM).
+
+    JKM: c_k prices load-month-PLUS-ONE for load month L = F+month_index,
+    where `jkm_idx = month_index + 2 - s` (1-based) is _base_context()'s
+    own column selector. Solving for the delivery month as a function of
+    k = jkm_idx: month_index = k-2+s, delivery = _month_add(F,
+    month_index+1) = _month_add(F, k-1+s).
+    """
+    return _month_add(F, (k - 1) + (s if jkm else 0))
+
+
+def _contract_id_returns(px: np.ndarray, dates: list, jkm: bool = False) -> np.ndarray:
+    """px has >= N_STRIP_COLS+1 columns (the same 14-column buffer
+    _roll_aligned_returns() needs -- observed shifts between consecutive
+    trading days are always in {-1, 0, +1}, verified against the real
+    workbook's date gaps). Returns (len(dates)-1, N_STRIP_COLS): row i's
+    column k is today's (dates[i+1]'s) contract c_{k+1}'s log-return
+    against WHATEVER column of yesterday's (dates[i]'s) row carries the
+    SAME `_delivery_month()` label -- found by direct dict lookup across
+    yesterday's entire row, not assumed to sit at column k or k+1 the way
+    _roll_aligned_returns()'s roll_fn heuristic does.
+
+    This is not merely a different implementation style: it fixes a real
+    gap in the heuristic. On the one JKM transition where a calendar
+    month roll (F advances by one) and the day-15/16 tenor reset (s: 1
+    -> 0) occur on the SAME day-pair (i.e. yesterday was in the second
+    half of the month, today is in the first half of the NEXT month),
+    the two shifts cancel to a net ZERO -- but _is_jkm_roll() fires
+    anyway (it treats month-roll and tenor-reset as independent triggers,
+    each alone sufficient), so roll_aligned mis-shifts by one column on
+    that specific transition. This function never assumes a shift size;
+    it looks up the actual delivery month every time, so it gets that
+    transition right by construction (see
+    tests/test_risk_containment.py's contract-ID group for both the
+    plain month-roll case, where this AGREES with roll_aligned, and this
+    cancellation case, where it does not).
+
+    Raises ValueError (fail loud, matching build_scenarios()'s existing
+    roll_aligned completeness guard) if a required delivery month has no
+    matching column in the prior day's row -- never silently emits NaN
+    into VaR.
+    """
+    n = px.shape[0] - 1
+    k_out = N_STRIP_COLS
+    m = px.shape[1]
+    out = np.empty((n, k_out))
+    for i in range(n):
+        d_prev, d = dates[i], dates[i + 1]
+        F_prev, s_prev = contract_calendar(d_prev)
+        F, s = contract_calendar(d)
+        prev_map = {_delivery_month(F_prev, s_prev, k, jkm): px[i, k - 1] for k in range(1, m + 1)}
+        for k in range(1, k_out + 1):
+            label = _delivery_month(F, s, k, jkm)
+            if label not in prev_map:
+                raise ValueError(
+                    f"contract-ID return for delivery month {label.date()} (today's c{k} on {d.date()}) "
+                    f"has no matching column in {d_prev.date()}'s {m}-column row -- shift beyond the "
+                    "available buffer; investigate a data gap or widen the fetched column count"
+                )
+            out[i, k - 1] = np.log(px[i + 1, k - 1] / prev_map[label])
     return out
 
 
@@ -1468,6 +1574,147 @@ def _var_es(pnl: np.ndarray) -> tuple:
     return var95, var99, es95, es99, sd
 
 
+# ===========================================================================
+# R6 increment G.3 (plan sect 6.G.3, R6.11): VaR/ES bootstrap uncertainty
+# bands. A single-day P&L VaR/ES point estimate is itself an order
+# statistic of the scenario vector -- ES99 in particular averages only
+# ~1% of scenarios (5 points out of a 500-scenario set), so its point
+# estimate carries far more sampling noise than VaR95's. This section
+# quantifies that noise by bootstrap-resampling the SAME scenario P&L
+# vector (with replacement), never by drawing new scenarios or altering
+# the historical-simulation methodology itself.
+# ===========================================================================
+
+# Fixed, never wall-clock-derived (matches CHARTER_OVERLAY_SEED's own
+# "no wall-clock/Date.now-style nondeterminism" requirement) -- chosen as
+# this increment's implementation date so it is traceable, not because
+# the value is otherwise meaningful. Every bootstrap call with this seed
+# (the default) reproduces the SAME resamples, run to run, machine to
+# machine.
+BOOTSTRAP_SEED = 20260719
+
+# 1,000 resamples (plan sect 6.G.3's own suggested figure) -- enough for
+# a stable 5th/95th-percentile read on the VaR95/VaR99/ES95/ES99
+# bootstrap distributions without the resampling itself becoming the
+# backtest's bottleneck (vectorised: one (B, n) integer draw plus one
+# sort, not a B-iteration Python loop).
+BOOTSTRAP_N_RESAMPLES = 1000
+
+# 5th/95th percentile of the bootstrap distribution -- a 90% band, the
+# same "not the full range, not a single sigma" convention plan sect
+# 6.G.3's own "90% bands" wording specifies.
+BOOTSTRAP_LOWER_PCT = 5.0
+BOOTSTRAP_UPPER_PCT = 95.0
+
+
+@dataclass
+class VarBootstrapBands:
+    """One resampled uncertainty band per VaR/ES metric, plus the
+    effective-sample-size disclosure for the deep tail (plan sect
+    6.G.3's explicit ask: "make that noise visible, not hidden").
+    `n_tail95`/`n_tail99` are the SAME `max(int(n*0.05), 1)`/
+    `max(int(n*0.01), 1)` counts `_var_es()` itself averages over for
+    es95/es99 -- not a separately-derived number, so this disclosure can
+    never drift from what the point estimate actually averaged."""
+    n: int
+    n_resamples: int
+    seed: int
+    lower_pct: float
+    upper_pct: float
+    n_tail95: int
+    n_tail99: int
+    var95_lo: float
+    var95_hi: float
+    var99_lo: float
+    var99_hi: float
+    es95_lo: float
+    es95_hi: float
+    es99_lo: float
+    es99_hi: float
+
+
+def bootstrap_var_es(pnl: np.ndarray, n_resamples: int = BOOTSTRAP_N_RESAMPLES,
+                      seed: int = BOOTSTRAP_SEED, lower_pct: float = BOOTSTRAP_LOWER_PCT,
+                      upper_pct: float = BOOTSTRAP_UPPER_PCT) -> VarBootstrapBands:
+    """R6 increment G.3 (plan sect 6.G.3, R6.11): bootstrap-resample `pnl`
+    (WITH replacement, `n_resamples` draws of length `len(pnl)` each) and
+    recompute VaR95/VaR99/ES95/ES99 on every resample via the SAME index
+    convention `_var_es()` uses on the original vector (`i95 = int(n *
+    0.05)`, `i99 = int(n * 0.01)`, ES = mean of the worst
+    `max(i, 1)` outcomes) -- so a band here is directly comparable to,
+    and correctly brackets, the point estimate `_var_es(pnl)` itself
+    reports.
+
+    SEEDED (`np.random.default_rng(seed)`, default BOOTSTRAP_SEED) --
+    deterministic and reproducible: the same `pnl`/`seed`/`n_resamples`
+    always produce byte-identical bands, no wall-clock or
+    process-dependent randomness anywhere in this path.
+
+    Vectorised, not a Python loop over `n_resamples`: one (n_resamples,
+    n) integer draw (`rng.integers`), one gather (`pnl[idx]`), one sort
+    along axis 1 -- the percentile/ES reductions are then simple column
+    slices of the sorted resample matrix, reusing `_var_es()`'s own index
+    formulas rather than a second implementation of the VaR/ES
+    calculation.
+
+    Band = the `[lower_pct, upper_pct]` percentile of each metric's
+    `n_resamples` bootstrap values (default 5th/95th, a 90% band).
+    Deeper-tail metrics resample from fewer effective points (ES99 from
+    `n_tail99 = max(int(n*0.01), 1)`, ES95 from `n_tail95 = max(int(n*0.05),
+    1)`) and are therefore NOISIER -- the band should, and empirically
+    does (tests/test_risk_containment.py), widen from VaR95 through
+    ES99. `n_tail95`/`n_tail99` are surfaced on the returned dataclass so
+    a caller can disclose exactly how thin that tail is (e.g. "ES99
+    averages 5 scenarios out of 500") rather than silently reporting a
+    band without the sample-size context that explains its width.
+
+    Raises ValueError if `len(pnl) < 2` (nothing to resample)."""
+    pnl = np.asarray(pnl, dtype=float)
+    n = len(pnl)
+    if n < 2:
+        raise ValueError(f"bootstrap requires at least 2 scenarios, got {n}")
+
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_resamples, n))     # (B, n), with replacement
+    resampled = np.sort(pnl[idx], axis=1)                # (B, n), each row sorted ascending
+
+    i95 = int(n * 0.05)
+    i99 = int(n * 0.01)
+    n_tail95 = max(i95, 1)
+    n_tail99 = max(i99, 1)
+
+    var95s = resampled[:, i95]
+    var99s = resampled[:, i99]
+    es95s = resampled[:, :n_tail95].mean(axis=1)
+    es99s = resampled[:, :n_tail99].mean(axis=1)
+
+    def band(values: np.ndarray) -> tuple:
+        return float(np.percentile(values, lower_pct)), float(np.percentile(values, upper_pct))
+
+    var95_lo, var95_hi = band(var95s)
+    var99_lo, var99_hi = band(var99s)
+    es95_lo, es95_hi = band(es95s)
+    es99_lo, es99_hi = band(es99s)
+
+    return VarBootstrapBands(
+        n=n, n_resamples=n_resamples, seed=seed, lower_pct=lower_pct, upper_pct=upper_pct,
+        n_tail95=n_tail95, n_tail99=n_tail99,
+        var95_lo=var95_lo, var95_hi=var95_hi, var99_lo=var99_lo, var99_hi=var99_hi,
+        es95_lo=es95_lo, es95_hi=es95_hi, es99_lo=es99_lo, es99_hi=es99_hi,
+    )
+
+
+def bootstrap_var_result(r: "VarResult", n_resamples: int = BOOTSTRAP_N_RESAMPLES,
+                          seed: int = BOOTSTRAP_SEED, lower_pct: float = BOOTSTRAP_LOWER_PCT,
+                          upper_pct: float = BOOTSTRAP_UPPER_PCT) -> VarBootstrapBands:
+    """Convenience wrapper: bootstrap_var_es() on an already-computed
+    VarResult's own `pnl` (e.g. after apply_charter_overlay() has
+    already stacked its overlay on -- callers should bootstrap whatever
+    P&L vector the page's point-estimate metrics are ACTUALLY reading,
+    so the band matches what it's a band around)."""
+    return bootstrap_var_es(r.pnl, n_resamples=n_resamples, seed=seed, lower_pct=lower_pct, upper_pct=upper_pct)
+
+
 def historical_var(D, tables, params: Params, portfolio: str = "12cargo", month_index: int = 0,
                     basin: str = "Europe", lookback: int = 500, method: str = "naive",
                     scen: Optional[ScenarioSet] = None) -> VarResult:
@@ -1565,7 +1812,7 @@ def historical_var(D, tables, params: Params, portfolio: str = "12cargo", month_
 
 
 def historical_var_physical(D, tables, params: Params, portfolio: str = "single", month_index: int = 0,
-                             basin: str = "Europe", lookback: int = 500, method: str = "naive",
+                             basin: str = "Europe", lookback: int = 500, method: str = "contract_id",
                              scen: Optional[ScenarioSet] = None,
                              first_cargo_state: Optional[decision.FirstCargoState] = None) -> VarResult:
     """Physical-basis variant of historical_var() (R6 increment C.5, plan
@@ -1580,6 +1827,14 @@ def historical_var_physical(D, tables, params: Params, portfolio: str = "single"
     <= $0.01 (tests/test_physical_cashflows.py's zero-shock test, same
     R1-style construction: a zero-return ScenarioSet must reprice to
     ~$0 P&L against this function's own base).
+
+    `method` default is "contract_id" (R6 increment G.1, plan sect
+    6.G.1: "make the roll-safe/contract-ID method the default for the
+    physical basis"), UNLIKE historical_var()'s own default ("naive",
+    unchanged -- the frozen legacy path). Only takes effect when the
+    caller omits `scen`; every test and app.py call site in this repo
+    passes `scen=` explicitly, so this default change alone alters no
+    existing output -- it only changes what a NEW caller gets for free.
 
     portfolio: "single", "spread" or "programme" (R6 increment D, plan
     sect 6.D). "programme" prices the CURRENT committed one-vessel
@@ -2354,6 +2609,167 @@ def backtest_var(tables, params: Params, portfolio: str = "12cargo", lookback: i
 
     out = pd.DataFrame(rows)
     out.attrs["skipped_roll_pairs"] = skipped_roll_pairs
+    return out
+
+
+# ===========================================================================
+# R6 increment G.2 (plan sect 6.G.2, R6.10): same-cargo-through-time
+# backtest on cached coefficients. A NEW function/path -- backtest_var()
+# above (the interim roll-pair-skipping backtest) is UNTOUCHED, still
+# exactly what test_interim_backtest_skips_roll_pairs pins. That function
+# tracks "the near month" (month_index=0), which is a DIFFERENT physical
+# delivery month every time the near contract rolls -- its own reason for
+# needing a roll-pair skip. This function instead tracks ONE FIXED load
+# month's cargo through the whole window: there is no roll to skip
+# because the delivery month never changes -- month_index just counts
+# DOWN as D approaches `load_month`, contract-ID style (G.1).
+# ===========================================================================
+
+
+def same_cargo_backtest(tables, params: Params, load_month, basis: str = "legacy",
+                         basin: str = "Europe", lookback: int = 500, window_days: int = 250,
+                         alpha: float = 0.05, method: str = "contract_id",
+                         first_cargo_state: Optional[decision.FirstCargoState] = None,
+                         eua_live: bool = False) -> pd.DataFrame:
+    """Realised-vs-modelled P&L for ONE fixed load month's cargo, walked
+    across a historical window -- same row shape as backtest_var() (date,
+    next_date, var, realised_pnl, exception), so the SAME kupiec_test()
+    feeds off either one.
+
+    Cached-coefficient path (plan sect 2 -- the reason this scales to
+    hundreds/thousands of revaluations without a fresh physical re-run
+    each time): the quantity producer
+    (legacy_cargo_quantities()/physical_cargo_quantities(), reached via
+    legacy_cargo_cashflows()/physical_cargo_cashflows()) is keyed on
+    (Params field values, ..., the load month's calendar YEAR) --
+    and `load_month.year` is CONSTANT for the entire window by
+    construction (one fixed cargo), so every assembly call after the
+    first hits cashflows.py's Params-hash-keyed cache. Each day's own new
+    work is _snap_month_prices()'s cheap D-dependent assembly (snap four
+    tables, interpolate FX) plus array products
+    (CargoExposure.value()/value_matrix()) -- never a fresh
+    decision.py/physical.py voyage re-run. This is what makes ~hundreds
+    of revaluations fast (tests/test_risk_containment.py times this
+    directly) where re-deriving the physical quantities from scratch on
+    every date would not be.
+
+    `load_month`: any date-like value; only its (year, month) matter
+    (normalised to day=1) and it is held FIXED for every row -- contrast
+    backtest_var()'s "month_index=0", which re-anchors to a NEW calendar
+    month every roll.
+
+    A date D contributes a row only if its OWN month_index (`load_month`
+    expressed as an offset from D's own contract_calendar() F, i.e.
+    (load_month.year*12+load_month.month) - (F.year*12+F.month)) falls in
+    0..11 -- the same 12-month pricing-window bound
+    programme_leg_is_priceable() uses. Dates outside it (the cargo is
+    either too far in the future to be on the curve yet, or has already
+    aged past month 0) are skipped and counted in
+    `out.attrs["skipped_out_of_window"]` -- disclosed, not silently
+    dropped, matching backtest_var()'s `skipped_roll_pairs` convention. A
+    gap (an out-of-window date between two in-window ones) breaks the
+    realised-P&L chain there; no row spans across it.
+
+    `var`/`exception` (the "modelled" half): for day D, the SAME
+    CargoExposure already assembled for the realised leg is repriced
+    across a fresh `lookback`-day ScenarioSet built AT D (`method=`,
+    default "contract_id" -- G.1's formalised delivery-month alignment,
+    the method new work should default to per plan sect 6.G.1), via the
+    shared _prepare_scenario_price_arrays() helper (increment C.5) --
+    reusing that price-preparation code, not a third repricer -- but
+    sliced to JUST this cargo's one month_index column (unlike
+    historical_var()/historical_var_physical(), which always loop over
+    all 12 months even when only one is wanted). `alpha` selects VaR95
+    (0.05, default) or VaR99 (anything else) for `var`/`exception`,
+    matching backtest_var()'s own alpha convention exactly.
+
+    `basis="physical"`: exposures come from
+    cashflows.physical_cargo_cashflows()/physical_cargo_quantities()
+    instead, with `first_cargo_state`/`eua_live` forwarded verbatim to
+    every date's cargo (this tracks ONE committed cargo's whole life, not
+    a fresh "current cargo" recomputed each day, so the state selector
+    applies uniformly across the window -- unlike historical_var_physical(),
+    there is no per-call "current cargo" concept to special-case)."""
+    if basis not in ("legacy", "physical"):
+        raise ValueError(f"unknown basis {basis!r} (expected 'legacy' or 'physical')")
+    load_month = pd.Timestamp(load_month)
+    load_month = pd.Timestamp(year=load_month.year, month=load_month.month, day=1)
+
+    def month_index_at(D) -> int:
+        F, _ = contract_calendar(D)
+        return (load_month.year - F.year) * 12 + (load_month.month - F.month)
+
+    def build_exposure(D, mi) -> CargoExposure:
+        if basis == "legacy":
+            eu, asia = legacy_cargo_cashflows(D, tables, params, mi)
+            return eu if basin == "Europe" else asia
+        return physical_cargo_cashflows(D, tables, params, mi, basin, first_cargo_state, eua_live=eua_live)
+
+    inter = _intersection_dates(tables)
+    n = len(inter)
+    start = max(lookback + 1, n - window_days)
+
+    rows = []
+    out_of_window = 0
+    prev = None  # (D, month_index, exposure, value)
+    for i in range(start, n):
+        D = inter[i]
+        mi = month_index_at(D)
+        if not (0 <= mi < 12):
+            out_of_window += 1
+            prev = None
+            continue
+
+        exposure = build_exposure(D, mi)
+        val = exposure.value(exposure.base_prices)
+
+        if prev is not None:
+            prev_D, prev_mi, prev_exposure, prev_val = prev
+            realised = val - prev_val
+
+            scen = build_scenarios(tables, prev_D, lookback=lookback, method=method)
+            hh_row, ttf_row, jkm_row = snap(tables.hh, prev_D), snap(tables.ttf, prev_D), snap(tables.jkm, prev_D)
+            fx_row, ch_row = snap(tables.fx, prev_D), snap(tables.charter, prev_D)
+            base_hh = hh_row[[f"c{j}" for j in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+            base_ttf = ttf_row[[f"c{j}" for j in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+            base_jkm = jkm_row[[f"c{j}" for j in range(1, N_STRIP_COLS + 1)]].to_numpy(dtype=float)
+            base_spot, base_o6, base_o1 = float(fx_row["spot"]), float(fx_row["o6"]), float(fx_row["o1"])
+            charter = params.charter_override if params.charter_override is not None else float(ch_row["rate174"])
+
+            prep = _prepare_scenario_price_arrays(scen, prev_D, base_hh, base_ttf, base_jkm,
+                                                   base_spot, base_o6, base_o1)
+            n_scen = prep["n"]
+            charter_arr = np.full(n_scen, charter, dtype=float)
+            vlsfo_arr = _scenario_factor_array(n_scen, scen.vlsfo_ret, params.vlsfo_price)
+
+            if basin == "Europe":
+                prices = {RiskFactor.TTF: prep["ttf_L"][:, prev_mi], RiskFactor.FX: prep["fx_l"][:, prev_mi],
+                          RiskFactor.HH: prep["hh_L"][:, prev_mi], RiskFactor.CHARTER: charter_arr,
+                          RiskFactor.VLSFO: vlsfo_arr}
+                if RiskFactor.EUA in prev_exposure.base_prices:
+                    eua_table = getattr(tables, "eua", None)
+                    base_eua = float(snap(eua_table, prev_D)["price"]) if eua_table is not None else None
+                    if base_eua is not None and scen.eua_ret is not None:
+                        prices[RiskFactor.EUA] = _scenario_factor_array(n_scen, scen.eua_ret, base_eua)
+            else:
+                prices = {RiskFactor.JKM: prep["jkm_L1"][:, prev_mi], RiskFactor.HH: prep["hh_L"][:, prev_mi],
+                          RiskFactor.CHARTER: charter_arr, RiskFactor.VLSFO: vlsfo_arr}
+            _assert_finite_prices(prices, f"same-cargo backtest {prev_D.date()} scenario prices")
+
+            scen_vals = prev_exposure.value_matrix(prices)
+            pnl_vec = scen_vals - prev_val
+            var95, var99, es95, es99, sd = _var_es(pnl_vec)
+            var_level = var95 if abs(alpha - 0.05) < 1e-9 else var99
+
+            rows.append(dict(date=prev_D, next_date=D, month_index=prev_mi, var=var_level,
+                              realised_pnl=realised, exception=realised < var_level, method=method))
+
+        prev = (D, mi, exposure, val)
+
+    out = pd.DataFrame(rows)
+    out.attrs["skipped_out_of_window"] = out_of_window
+    out.attrs["load_month"] = load_month
+    out.attrs["basis"] = basis
     return out
 
 

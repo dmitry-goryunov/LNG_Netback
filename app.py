@@ -1715,13 +1715,34 @@ else:
                 "not yet priced under scenarios here (a data-window limit, not a modelling choice)."
             )
 
+    # R6 increment G.3 (plan sect 6.G.3, R6.11): bootstrap uncertainty
+    # bands beside the point estimates -- computed on `r.pnl` AS FINALLY
+    # DISPLAYED (i.e. after the charter-overlay stacking above, if it ran),
+    # so the band is a band around what the metrics actually show, not a
+    # stale pre-overlay number. Seeded (risk.BOOTSTRAP_SEED), 1,000
+    # resamples (risk.BOOTSTRAP_N_RESAMPLES) -- deterministic and cheap
+    # (vectorised, well under a second even at n=750 scenarios), so this
+    # runs unconditionally rather than behind a button.
+    bands = risk.bootstrap_var_result(r)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("VaR 95% (1d)", f"${r.var95:,.0f}")
+    m1.caption(f"90% band: \\${bands.var95_lo:,.0f} to \\${bands.var95_hi:,.0f}")
     m2.metric("VaR 99% (1d)", f"${r.var99:,.0f}")
+    m2.caption(f"90% band: \\${bands.var99_lo:,.0f} to \\${bands.var99_hi:,.0f}")
     m3.metric("Expected shortfall 95%", f"${r.es95:,.0f}")
+    m3.caption(f"90% band: \\${bands.es95_lo:,.0f} to \\${bands.es95_hi:,.0f}  |  tail n={bands.n_tail95}")
     m4.metric("Expected shortfall 99%", f"${r.es99:,.0f}")
+    m4.caption(f"90% band: \\${bands.es99_lo:,.0f} to \\${bands.es99_hi:,.0f}  |  tail n={bands.n_tail99}")
     st.caption(f"Daily sd: ${r.sd:,.0f}  |  n={r.n} scenarios  |  window {scen.dates[0].date()} to "
                f"{scen.dates[-1].date()}  |  method={method}")
+    st.caption(
+        f"Bootstrap uncertainty bands: {bands.n_resamples:,} resamples of the {bands.n}-scenario P&L "
+        f"vector (with replacement), seed={bands.seed}, band = [{bands.lower_pct:.0f}th, "
+        f"{bands.upper_pct:.0f}th] percentile of each resampled metric. ES99 averages only "
+        f"n_tail99={bands.n_tail99} scenario(s) out of {bands.n} (ES95: n_tail95={bands.n_tail95}) -- "
+        "the wider ES99 band above makes that thin-tail sampling noise visible rather than hiding it "
+        "behind a single point number."
+    )
 
     st.subheader("P&L histogram")
     hist_df = pd.DataFrame({"pnl": r.pnl})
